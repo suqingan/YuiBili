@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Typeface
 import android.os.Bundle
@@ -46,6 +47,7 @@ class FavoriteSearchActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Theme.applySystemBars(this)
+        LayoutMode.applyTabletOrientationIfEnabled(this)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -55,34 +57,30 @@ class FavoriteSearchActivity : Activity() {
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(6), dp(8), dp(12), dp(8))
+            setPadding(dp(Ds.Space.sm), dp(Ds.Space.sm), dp(Ds.Space.md), dp(Ds.Space.sm))
         }
-        val back = TextView(this).apply {
-            text = "‹"
-            textSize = 26f
-            gravity = Gravity.CENTER
-            setTextColor(COLOR_INK)
-            setPadding(dp(10), 0, dp(6), 0)
-            isClickable = true
-            setOnClickListener { finishWithAnim() }
-        }
-        bar.addView(back, LinearLayout.LayoutParams(dp(42), dp(42)))
+        val back = Ds.backIcon(this, COLOR_INK) { finishWithAnim() }
+        bar.addView(back, LinearLayout.LayoutParams(dp(40), dp(40)))
 
-        val field = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            background = rounded(COLOR_SOFT_FILL, dp(18))
-            setPadding(dp(12), dp(8), dp(10), dp(8))
+        val field = FrameLayout(this).apply {
+            background = Ds.pill(this@FavoriteSearchActivity, COLOR_SURFACE, Ds.colors.lineSoft)
         }
-        field.addView(SearchGlyph(this), LinearLayout.LayoutParams(dp(16), dp(16)).apply {
-            rightMargin = dp(8)
-        })
+        field.addView(
+            Ds.searchIcon(this, COLOR_MUTED, 1.8f),
+            FrameLayout.LayoutParams(dp(16), dp(16), Gravity.START or Gravity.CENTER_VERTICAL).apply {
+                leftMargin = dp(14)
+            }
+        )
         input = EditText(this).apply {
             hint = "搜索收藏夹内视频"
-            textSize = 15f
+            textSize = 14f
+            typeface = Ds.body()
+            gravity = Gravity.CENTER_VERTICAL
+            includeFontPadding = false
             setTextColor(COLOR_INK)
             setHintTextColor(COLOR_MUTED)
             background = null
+            setPadding(0, 0, dp(8), 0)
             isSingleLine = true
             imeOptions = EditorInfo.IME_ACTION_SEARCH
             setOnEditorActionListener { _, actionId, event ->
@@ -103,22 +101,38 @@ class FavoriteSearchActivity : Activity() {
                 }
             })
         }
-        field.addView(input, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        val clear = TextView(this).apply {
-            text = "×"
-            textSize = 18f
-            gravity = Gravity.CENTER
-            setTextColor(COLOR_MUTED)
-            setPadding(dp(8), 0, dp(2), 0)
+        field.addView(
+            input,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ).apply {
+                leftMargin = dp(14 + 16 + Ds.Space.sm)
+                rightMargin = dp(34)
+            }
+        )
+        val clear = FrameLayout(this).apply {
             visibility = View.GONE
             isClickable = true
+            isFocusable = true
+            contentDescription = "清空搜索词"
+            Ds.bindPressFeedback(this, 0.90f)
+            addView(
+                Ds.closeIcon(this@FavoriteSearchActivity, COLOR_MUTED, 1.7f),
+                FrameLayout.LayoutParams(dp(14), dp(14), Gravity.CENTER)
+            )
             setOnClickListener {
                 input.setText("")
                 input.requestFocus()
                 showIdle()
             }
         }
-        field.addView(clear, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(28)))
+        field.addView(
+            clear,
+            FrameLayout.LayoutParams(dp(28), dp(28), Gravity.END or Gravity.CENTER_VERTICAL).apply {
+                rightMargin = dp(6)
+            }
+        )
         input.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
@@ -126,11 +140,16 @@ class FavoriteSearchActivity : Activity() {
                 clear.visibility = if (s.isNullOrEmpty()) View.GONE else View.VISIBLE
             }
         })
-        bar.addView(field, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        bar.addView(
+            field,
+            LinearLayout.LayoutParams(0, dp(40), 1f).apply {
+                leftMargin = dp(4)
+            }
+        )
         root.addView(bar, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        root.addView(View(this).apply { setBackgroundColor(COLOR_BORDER) },
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)))
+        root.addView(View(this).apply { setBackgroundColor(Ds.colors.lineSoft) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, Ds.hairline(this)))
 
         val content = FrameLayout(this)
         stateView = TextView(this).apply {
@@ -152,8 +171,12 @@ class FavoriteSearchActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(14), dp(10), dp(14), dp(28))
         }
-        scroll.addView(listBox, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
+        scroll.addView(
+            LayoutMode.wrapCenteredForTablet(this, listBox, maxDp = 820),
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
         content.addView(scroll, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         root.addView(content, LinearLayout.LayoutParams(
@@ -231,8 +254,10 @@ class FavoriteSearchActivity : Activity() {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(8), 0, dp(8))
+            background = Ds.card(this@FavoriteSearchActivity, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.card)
+            setPadding(dp(10), dp(10), dp(12), dp(10))
             isClickable = true
+            isFocusable = true
             setOnClickListener {
                 startActivity(
                     Intent(this@FavoriteSearchActivity, VideoDetailActivity::class.java)
@@ -240,20 +265,53 @@ class FavoriteSearchActivity : Activity() {
                 )
             }
         }
+            val thumbBox = FrameLayout(this).apply {
+            Ds.clipRounded(this, Ds.Radius.chip)
+        }
         val thumb = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
-            background = rounded(COLOR_COVER, dp(8), COLOR_CARD_BORDER, 1)
-            clipToOutline = true
+            setBackgroundColor(COLOR_COVER)
         }
         if (video.cover.isNotBlank()) CoverLoader.load(thumb, video.cover + "@320w_180h.webp")
-        row.addView(thumb, LinearLayout.LayoutParams(dp(112), dp(63)))
+        thumbBox.addView(
+            thumb,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        val durationBadge = formatHistoryCoverBadge(null, video.duration)
+        if (durationBadge.isNotBlank()) {
+            thumbBox.addView(
+                TextView(this).apply {
+                    text = durationBadge
+                    textSize = 9.5f
+                    typeface = Ds.body(true)
+                    fontFeatureSettings = "tnum"
+                    setTextColor(Color.WHITE)
+                    background = rounded(0xA6000000.toInt(), dp(5))
+                    setPadding(dp(5), dp(2), dp(5), dp(2))
+                    includeFontPadding = false
+                },
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.BOTTOM or Gravity.END
+                ).apply {
+                    rightMargin = dp(4)
+                    bottomMargin = dp(4)
+                }
+            )
+        }
+        row.addView(thumbBox, LinearLayout.LayoutParams(dp(116), dp(66)))
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(10), 0, 0, 0)
+            setPadding(dp(12), 0, 0, 0)
         }
         body.addView(TextView(this).apply {
             text = video.title
             textSize = 14f
+            typeface = Ds.body(true)
             setTextColor(COLOR_INK)
             maxLines = 2
             ellipsize = android.text.TextUtils.TruncateAt.END
@@ -267,17 +325,26 @@ class FavoriteSearchActivity : Activity() {
         } else ""
         body.addView(TextView(this).apply {
             text = if (date.isBlank()) video.owner else "${video.owner} · $date"
-            textSize = 12f
+            textSize = 11.5f
+            typeface = Ds.body()
             setTextColor(COLOR_MUTED)
-            setPadding(0, dp(5), 0, 0)
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(0, dp(6), 0, 0)
         }, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ))
         row.addView(body, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        row.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(8) }
+        Ds.bindPressFeedback(row, 0.98f)
         return row
     }
 
     private fun showIdle() {
+        pendingSearch?.let { mainHandler.removeCallbacks(it) }
+        searchGeneration++
         currentKeyword = ""
         loading = false
         listBox.removeAllViews()

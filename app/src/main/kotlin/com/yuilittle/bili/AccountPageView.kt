@@ -9,7 +9,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.net.Uri
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
@@ -21,10 +20,11 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.text.TextUtils
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.Window
-import android.view.WindowManager
 import android.view.animation.PathInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -37,429 +37,703 @@ import com.google.zxing.EncodeHintType
 import com.google.zxing.common.BitMatrix
 import com.google.zxing.qrcode.QRCodeWriter
 import java.io.File
+import java.util.Locale
 
 /**
- * Account ("我的") page.
- *
- * Logged out: renders the native YuiBili login page (QR scan).
- * Logged in: shows a rounded profile card
- * with avatar, nickname, uid, coins, VIP badge, Bilibili level, following
- * and followers, plus a logout entry.
+ * 「我的」页面：
+ * - 未登录：极简扫码登录页（Logo + 二维码卡片 + 下载/刷新操作 + 外观切换）。
+ * - 已登录：精致资料卡（头像/昵称/UID/等级徽章 + 关注/粉丝/硬币）+ 外观（夜间模式圆形转场开关）+ 常用功能列表。
  */
 class AccountPageView(context: Context) : LinearLayout(context) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // ── containers ────────────────────────────────────────────────
+    // ── 页面容器 ──────────────────────────────────────────────────
     private val loginPage = LinearLayout(context)
     private val profilePage = LinearLayout(context)
-    private val qrContainer = LinearLayout(context)
 
-    // ── QR login views ────────────────────────────────────────────
+    // ── 扫码登录控件 ──────────────────────────────────────────────
     private val qrImage = ImageView(context)
     private val qrStatus = TextView(context)
     private var qrKey = ""
     private var qrPolling = false
+    private var active = false
+    private var entrancePlayed = false
+    private var qrRequestGeneration = 0
+    private var qrPollGeneration = 0
     private var qrBitmap: Bitmap? = null
     private var qrContent: String = ""
 
-    // ── profile card views ────────────────────────────────────────
+    // ── 资料卡片控件 ──────────────────────────────────────────────
     private val cardAvatar = RoundAvatar(context)
     private val cardName = TextView(context)
     private val cardUid = TextView(context)
     private val cardBadges = LinearLayout(context)
     private val cardFollowing = TextView(context)
     private val cardFollower = TextView(context)
-    private val aboutBadge = TextView(context)
-    private val updateBadgeListener: () -> Unit = { refreshAboutBadge() }
     private val cardCoins = TextView(context)
 
     init {
         orientation = VERTICAL
         setBackgroundColor(COLOR_BACKGROUND)
+        loginPage.visibility = View.VISIBLE
+        profilePage.visibility = View.GONE
 
-        // ── login page ──────────────────────────────────────────────
-        loginPage.orientation = VERTICAL
-        loginPage.setPadding(dp(28), dp(48), dp(28), dp(40))
+        buildLoginPage()
+        buildProfilePage()
 
-        loginPage.addView(ImageView(context).apply {
-            setImageResource(R.drawable.ic_logo_round)
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            contentDescription = "YuiBili"
-            // Soft rounded plate so the brand mark never reads as a raw square tile.
-            background = rounded(COLOR_CARD, dp(16), COLOR_CARD_BORDER, dp(1))
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-            clipToOutline = true
-            outlineProvider = object : android.view.ViewOutlineProvider() {
-                override fun getOutline(view: android.view.View, outline: android.graphics.Outline) {
-                    outline.setRoundRect(0, 0, view.width, view.height, dp(16).toFloat())
+        val scroll = ScrollView(context).apply {
+            isFillViewport = true
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isVerticalScrollBarEnabled = false
+        }
+        val content = FrameLayout(context)
+        content.addView(
+            loginPage,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
+        content.addView(
+            profilePage,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
+        scroll.addView(
+            content,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
+        addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+    }
+
+    /** 构造「外观适配」选择行：左侧图标与标题，右侧为可点击下拉胶囊（默认手机端，可切换平板端）。 */
+    private fun buildLayoutAdaptRow(): LinearLayout {
+        val c = Ds.colors
+        val valueLabel = TextView(context).apply {
+            text = LayoutMode.current.label
+            textSize = 13f
+            typeface = Ds.body(true)
+            includeFontPadding = false
+            setTextColor(COLOR_INK)
+        }
+        val dropdownAnchor = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = Ds.pill(context, c.surfaceRaised, c.lineSoft, Ds.hairline(context))
+            setPadding(dp(12), dp(6), dp(10), dp(6))
+            isClickable = true
+            isFocusable = true
+            Ds.bindPressFeedback(this, 0.94f)
+            addView(valueLabel, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
+            addView(
+                LayoutMode.dropdownChevronIcon(context, COLOR_MUTED),
+                LayoutParams(dp(14), dp(14)).apply { leftMargin = dp(4) }
+            )
+        }
+        val openDropdown = View.OnClickListener {
+            LayoutMode.showModeDropdown(context, dropdownAnchor) { picked ->
+                if (LayoutMode.setMode(context, picked)) {
+                    valueLabel.text = picked.label
+                    Toast.makeText(context, "已切换为${picked.label}外观", Toast.LENGTH_SHORT).show()
+                    (context as? Activity)?.let { act ->
+                        @Suppress("DEPRECATION")
+                        act.overridePendingTransition(0, 0)
+                        act.recreate()
+                    }
                 }
             }
-        }, LayoutParams(dp(72), dp(72)).apply {
+        }
+        dropdownAnchor.setOnClickListener(openDropdown)
+
+        val row = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(Ds.Space.lg), 0, dp(Ds.Space.lg), 0)
+            isClickable = true
+            isFocusable = true
+            setOnClickListener(openDropdown)
+            val iconHost = FrameLayout(context).apply {
+                background = Ds.card(context, COLOR_ROSE_SOFT, null, Ds.Radius.chip, 0)
+                addView(
+                    LayoutMode.deviceAdaptIcon(context, COLOR_ROSE),
+                    FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER)
+                )
+            }
+            addView(iconHost, LayoutParams(dp(34), dp(34)).apply { rightMargin = dp(Ds.Space.md) })
+            addView(TextView(context).apply {
+                text = "外观适配"
+                textSize = 15f
+                typeface = Ds.body(true)
+                setTextColor(COLOR_INK)
+            }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+            addView(dropdownAnchor, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
+        }
+        bindRowPress(row)
+        return row
+    }
+
+    /** 构造包含「夜间模式」与「外观适配」的统一外观卡片（登录态与游客态均可用）。 */
+    private fun buildAppearanceCard(): LinearLayout {
+        val darkSwitch = PillSwitch(context, Theme.isDark)
+        val appearanceCard = LinearLayout(context).apply {
+            orientation = VERTICAL
+            background = Ds.card(context, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.card)
+            setPadding(0, dp(2), 0, dp(2))
+        }
+        val darkRow = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(Ds.Space.lg), 0, dp(Ds.Space.lg), 0)
+            isClickable = true
+            isFocusable = true
+            addView(
+                iconChip(MenuIconView.MOON),
+                LayoutParams(dp(34), dp(34)).apply { rightMargin = dp(Ds.Space.md) }
+            )
+            addView(TextView(context).apply {
+                text = "夜间模式"
+                textSize = 15f
+                typeface = Ds.body(true)
+                setTextColor(COLOR_INK)
+            }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+            addView(darkSwitch, LayoutParams(dp(48), dp(28)))
+            setOnClickListener { toggleDarkMode(darkSwitch, darkSwitch) }
+            darkSwitch.setOnClickListener { toggleDarkMode(darkSwitch, darkSwitch) }
+        }
+        bindRowPress(darkRow)
+        appearanceCard.addView(darkRow, LayoutParams(LayoutParams.MATCH_PARENT, dp(56)))
+
+        // 细分割线 + 外观适配（手机端 / 平板端下拉切换）
+        appearanceCard.addView(
+            View(context).apply { setBackgroundColor(Ds.colors.lineSoft) },
+            LayoutParams(LayoutParams.MATCH_PARENT, Ds.hairline(context)).apply {
+                leftMargin = dp(Ds.Space.lg + 34 + Ds.Space.md)
+                rightMargin = dp(Ds.Space.lg)
+            }
+        )
+        appearanceCard.addView(buildLayoutAdaptRow(), LayoutParams(LayoutParams.MATCH_PARENT, dp(56)))
+        return appearanceCard
+    }
+
+    private fun buildLoginPage() {
+        loginPage.orientation = VERTICAL
+        loginPage.setPadding(dp(Ds.Space.lg), dp(Ds.Space.xl), dp(Ds.Space.lg), dp(96))
+
+        // 顶部主题开关小条，方便未登录时同样能切换夜间模式
+        val topAction = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+        }
+        val guestDarkSwitch = PillSwitch(context, Theme.isDark)
+        val guestToggleChip = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = Ds.pill(context, COLOR_CARD, Ds.colors.lineSoft)
+            setPadding(dp(12), dp(6), dp(8), dp(6))
+            isClickable = true
+            isFocusable = true
+            Ds.bindPressFeedback(this, 0.96f)
+            addView(
+                MenuIconView(context, MenuIconView.MOON, COLOR_ROSE),
+                LayoutParams(dp(16), dp(16)).apply { rightMargin = dp(6) }
+            )
+            addView(TextView(context).apply {
+                text = "夜间"
+                textSize = 12f
+                typeface = Ds.body(true)
+                setTextColor(COLOR_INK)
+            }, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
+                rightMargin = dp(8)
+            })
+            addView(guestDarkSwitch, LayoutParams(dp(40), dp(22)))
+            setOnClickListener { toggleDarkMode(guestDarkSwitch, guestDarkSwitch) }
+        }
+        topAction.addView(guestToggleChip)
+        loginPage.addView(topAction, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+
+        val heroCard = LinearLayout(context).apply {
+            orientation = VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            bottomMargin = dp(14)
-        })
-        loginPage.addView(TextView(context).apply {
-            text = "YuiBili登录"
-            textSize = 26f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            background = Ds.card(context, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.card)
+            setPadding(dp(Ds.Space.xl), dp(Ds.Space.xl), dp(Ds.Space.xl), dp(Ds.Space.xl))
+        }
+        heroCard.addView(ImageView(context).apply {
+            setImageResource(R.drawable.ic_logo_round)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            contentDescription = "YuiBili"
+            Ds.clipRounded(this, Ds.Radius.card)
+        }, LayoutParams(dp(56), dp(56)))
+
+        heroCard.addView(TextView(context).apply {
+            text = "YuiBili"
+            textSize = 22f
+            typeface = Ds.display(bold = true)
+            letterSpacing = -0.02f
             gravity = Gravity.CENTER
             setTextColor(COLOR_INK)
-        }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
-        loginPage.addView(TextView(context).apply {
-            text = "扫码登录"
-            textSize = 13f
+            includeFontPadding = false
+        }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(Ds.Space.md)
+        })
+
+        heroCard.addView(TextView(context).apply {
+            text = "哔哩哔哩 App 扫码登录"
+            textSize = 12.5f
+            typeface = Ds.body()
             gravity = Gravity.CENTER
             setTextColor(COLOR_MUTED)
         }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
-            topMargin = dp(8)
+            topMargin = dp(Ds.Space.xs)
         })
 
-        // QR panel.
-        qrContainer.orientation = VERTICAL
-        qrContainer.gravity = Gravity.CENTER_HORIZONTAL
-        qrContainer.setPadding(0, dp(30), 0, 0)
         val qrCard = FrameLayout(context).apply {
-            background = rounded(COLOR_CARD, dp(16), COLOR_CARD_BORDER, dp(1))
-            setPadding(dp(18), dp(18), dp(18), dp(18))
+            background = Ds.card(context, Color.WHITE, Ds.colors.lineSoft, Ds.Radius.control)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
         }
         qrImage.apply {
             scaleType = ImageView.ScaleType.FIT_XY
             setBackgroundColor(Color.WHITE)
             contentDescription = "登录二维码"
+            isLongClickable = true
+            setOnLongClickListener {
+                saveQrToGallery()
+                true
+            }
         }
-        qrCard.addView(qrImage, FrameLayout.LayoutParams(dp(212), dp(212)))
-        qrContainer.addView(qrCard, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
-        qrStatus.apply {
-            text = "请使用哔哩哔哩 App 扫码登录"
-            textSize = 12.5f
-            gravity = Gravity.CENTER
-            setTextColor(COLOR_MUTED)
-            setPadding(0, dp(16), 0, 0)
-        }
-        qrContainer.addView(qrStatus, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
-        // Hint: screenshots of on-screen QR often fail to scan on another phone.
-        qrContainer.addView(TextView(context).apply {
-            text = "截图可能扫不出来，建议下载后发给对方"
-            textSize = 11.5f
-            gravity = Gravity.CENTER
-            setTextColor(COLOR_MUTED)
-            setPadding(0, dp(10), 0, 0)
-        }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        qrCard.addView(qrImage, FrameLayout.LayoutParams(dp(188), dp(188)))
+        heroCard.addView(qrCard, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(Ds.Space.lg)
+        })
 
-        // Primary: download a high-res QR; secondary: refresh.
+        qrStatus.apply {
+            text = "正在生成二维码…"
+            textSize = 12.5f
+            typeface = Ds.body(true)
+            gravity = Gravity.CENTER
+            setTextColor(COLOR_MUTED)
+        }
+        heroCard.addView(qrStatus, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(Ds.Space.md)
+        })
+
         val qrActions = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, dp(14), 0, 0)
         }
         qrActions.addView(TextView(context).apply {
-            text = "下载二维码"
-            textSize = 14f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            text = "保存二维码"
+            textSize = 13.5f
+            typeface = Ds.body(true)
             gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            background = rounded(COLOR_ROSE, dp(22))
+            setTextColor(COLOR_ON_ROSE)
+            background = Ds.pill(context, COLOR_ROSE)
             isClickable = true
             isFocusable = true
-            setPadding(dp(22), dp(10), dp(22), dp(10))
+            setPadding(dp(20), dp(10), dp(20), dp(10))
+            Ds.bindPressFeedback(this, 0.96f)
             setOnClickListener { saveQrToGallery() }
         }, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
+
         qrActions.addView(TextView(context).apply {
             text = "刷新"
             textSize = 13.5f
+            typeface = Ds.body(true)
             gravity = Gravity.CENTER
-            setTextColor(COLOR_ROSE)
-            background = rounded(0x00000000.toInt(), dp(22), COLOR_ROSE, dp(1))
+            setTextColor(COLOR_INK)
+            background = Ds.pill(context, COLOR_SURFACE, Ds.colors.line)
             isClickable = true
             isFocusable = true
-            setPadding(dp(18), dp(9), dp(18), dp(9))
+            setPadding(dp(20), dp(10), dp(20), dp(10))
+            Ds.bindPressFeedback(this, 0.96f)
             setOnClickListener { startQrLogin() }
         }, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
-            leftMargin = dp(12)
+            leftMargin = dp(Ds.Space.md)
         })
-        qrContainer.addView(qrActions, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
+        heroCard.addView(qrActions, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(Ds.Space.lg)
+        })
 
-        // Long-press the QR itself also downloads — discoverable fallback.
-        qrImage.isLongClickable = true
-        qrImage.setOnLongClickListener {
-            saveQrToGallery()
-            true
+        val isTabletWide = LayoutMode.isWideScreen(context)
+        val guestMenu = buildMenuCard(includeFavorites = false)
+        val guestAppearance = buildAppearanceCard()
+        if (isTabletWide) {
+            // 平板宽屏游客态：直接占满右侧工作台（绝不用固定 960dp 硬写宽度，防止超出父容器左裁切）
+            loginPage.setPadding(dp(24), dp(22), dp(24), dp(32))
+            val split = LinearLayout(context).apply {
+                orientation = HORIZONTAL
+                gravity = Gravity.TOP
+            }
+            val rightCol = LinearLayout(context).apply { orientation = VERTICAL }
+            rightCol.addView(sectionLabel("外观"), sectionParams(0))
+            rightCol.addView(guestAppearance, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(Ds.Space.sm)
+            })
+            rightCol.addView(sectionLabel("更多"), sectionParams(Ds.Space.lg))
+            rightCol.addView(guestMenu, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(Ds.Space.sm)
+            })
+            split.addView(heroCard, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1.05f))
+            split.addView(rightCol, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f).apply {
+                leftMargin = dp(20)
+            })
+            loginPage.addView(split, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        } else {
+            loginPage.addView(heroCard, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(Ds.Space.md)
+            })
+            loginPage.addView(sectionLabel("外观"), sectionParams(Ds.Space.lg))
+            loginPage.addView(guestAppearance, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(Ds.Space.sm)
+            })
+            loginPage.addView(sectionLabel("更多"), sectionParams(Ds.Space.lg))
+            loginPage.addView(guestMenu, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(Ds.Space.sm)
+            })
         }
-        loginPage.addView(qrContainer, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+    }
 
-        // ── profile page ─────────────────────────────────────────────
+    private fun buildProfilePage() {
         profilePage.orientation = VERTICAL
-        profilePage.setPadding(dp(20), dp(28), dp(20), dp(40))
+        profilePage.setPadding(dp(Ds.Space.lg), dp(Ds.Space.lg), dp(Ds.Space.lg), dp(96))
 
-        // Rounded profile card.
+        // ── 个人信息卡片 ──────────────────────────────────────────
         val card = LinearLayout(context).apply {
             orientation = VERTICAL
-            background = rounded(COLOR_CARD, dp(18), COLOR_CARD_BORDER, dp(1))
-            setPadding(dp(20), dp(22), dp(20), dp(20))
+            background = Ds.card(context, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.card)
+            setPadding(dp(Ds.Space.lg), dp(Ds.Space.lg), dp(Ds.Space.lg), dp(Ds.Space.md))
         }
         val headRow = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        // No rectangular background: RoundAvatar draws its own circular placeholder.
-        headRow.addView(cardAvatar, LayoutParams(dp(60), dp(60)))
+        val openOwnSpace = View.OnClickListener {
+            val info = lastBoundProfile ?: BiliSessionStore.cachedProfile()
+            val uid = info?.uid ?: 0L
+            if (uid > 0L) {
+                SpaceActivity.open(
+                    context,
+                    uid,
+                    info?.uname.orEmpty(),
+                    info?.face.orEmpty()
+                )
+            }
+        }
+        val identityZone = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = true
+            isFocusable = true
+            contentDescription = "打开我的空间"
+            Ds.bindPressFeedback(this, 0.97f)
+            setOnClickListener(openOwnSpace)
+        }
+        identityZone.addView(cardAvatar, LayoutParams(dp(60), dp(60)))
+
         val nameBox = LinearLayout(context).apply {
             orientation = VERTICAL
-            setPadding(dp(14), 0, 0, 0)
+            setPadding(dp(14), 0, dp(8), 0)
         }
         cardName.apply {
-            textSize = 18f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            textSize = 19f
+            typeface = Ds.display(bold = true)
+            letterSpacing = -0.01f
             setTextColor(COLOR_INK)
             maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
         }
         nameBox.addView(cardName, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
-        cardUid.apply {
-            textSize = 12f
-            setTextColor(COLOR_MUTED)
-            setPadding(0, dp(4), 0, 0)
+
+        val metaRow = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(5), 0, 0)
         }
-        nameBox.addView(cardUid, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         cardBadges.apply {
             orientation = HORIZONTAL
-            setPadding(0, dp(8), 0, 0)
+            gravity = Gravity.CENTER_VERTICAL
         }
-        nameBox.addView(cardBadges, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
-        headRow.addView(nameBox, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
-        // Logout icon on the card's right side; confirm dialog is fully custom.
-        headRow.addView(LogoutIconView(context).apply {
+        metaRow.addView(cardBadges, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
+        cardUid.apply {
+            textSize = 11.5f
+            typeface = Ds.body()
+            setTextColor(COLOR_MUTED)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        metaRow.addView(cardUid, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
+            leftMargin = dp(8)
+        })
+        nameBox.addView(metaRow, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        identityZone.addView(nameBox, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+        headRow.addView(identityZone, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+
+        val logoutBtn = FrameLayout(context).apply {
+            background = Ds.circle(COLOR_SURFACE, Ds.colors.lineSoft, Ds.hairline(context))
+            isClickable = true
+            isFocusable = true
+            contentDescription = "退出登录"
+            Ds.bindPressFeedback(this, 0.90f)
             setOnClickListener { showLogoutConfirm() }
-        }, LayoutParams(dp(40), dp(40)))
+            addView(
+                LogoutIconView(context),
+                FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER)
+            )
+        }
+        headRow.addView(logoutBtn, LayoutParams(dp(38), dp(38)))
         card.addView(headRow, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
 
-        // Stat row: following / followers / coins.
-        card.addView(View(context).apply { setBackgroundColor(COLOR_BORDER) },
-            LayoutParams(LayoutParams.MATCH_PARENT, dp(1)).apply { topMargin = dp(18); bottomMargin = dp(14) })
+        // 统计数据条
+        card.addView(
+            View(context).apply { setBackgroundColor(Ds.colors.lineSoft) },
+            LayoutParams(LayoutParams.MATCH_PARENT, Ds.hairline(context)).apply {
+                topMargin = dp(16)
+                bottomMargin = dp(12)
+            }
+        )
         val statRow = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER
         }
         statRow.addView(buildStat("关注", cardFollowing), LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
-        statRow.addView(View(context).apply { setBackgroundColor(COLOR_BORDER) },
-            LayoutParams(dp(1), dp(30)))
+        statRow.addView(
+            View(context).apply { setBackgroundColor(Ds.colors.lineSoft) },
+            LayoutParams(Ds.hairline(context), dp(24))
+        )
         statRow.addView(buildStat("粉丝", cardFollower), LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
-        statRow.addView(View(context).apply { setBackgroundColor(COLOR_BORDER) },
-            LayoutParams(dp(1), dp(30)))
+        statRow.addView(
+            View(context).apply { setBackgroundColor(Ds.colors.lineSoft) },
+            LayoutParams(Ds.hairline(context), dp(24))
+        )
         statRow.addView(buildStat("硬币", cardCoins), LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
         card.addView(statRow, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         profilePage.addView(card, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
 
-        // ── Settings card: night mode pill switch ──────────────────
-        val settingsCard = LinearLayout(context).apply {
-            orientation = VERTICAL
-            background = rounded(COLOR_CARD, dp(18), COLOR_CARD_BORDER, dp(1))
-            setPadding(dp(18), dp(6), dp(18), dp(6))
-        }
-        val darkSwitch = PillSwitch(context, Theme.isDark)
-        fun applyDarkToggle(anchor: View) {
-            val next = !Theme.isDark
-            darkSwitch.toggle()
-            // Snapshot the current window so MainActivity can play a circular
-            // reveal/collapse from the switch after recreate.
-            val activity = context as? Activity
-            if (activity != null) {
-                try {
-                    val decor = activity.window.decorView
-                    // Capture content root only (not the full decor with status bar),
-                    // then convert the switch centre into content-local coordinates so
-                    // the circle does not start one status-bar height lower after recreate.
-                    val content = decor.findViewById<View>(android.R.id.content) ?: decor
-                    val switchLoc = IntArray(2)
-                    val contentLoc = IntArray(2)
-                    anchor.getLocationOnScreen(switchLoc)
-                    content.getLocationOnScreen(contentLoc)
-                    val cx = switchLoc[0] - contentLoc[0] + anchor.width / 2f
-                    val cy = switchLoc[1] - contentLoc[1] + anchor.height / 2f
-                    val bmp = android.graphics.Bitmap.createBitmap(
-                        content.width.coerceAtLeast(1),
-                        content.height.coerceAtLeast(1),
-                        android.graphics.Bitmap.Config.ARGB_8888
-                    )
-                    val c = Canvas(bmp)
-                    content.draw(c)
-                    // expand=true when turning dark on: night spreads from the switch.
-                    // expand=false when turning dark off: night collapses back into it.
-                    Theme.prepareCircularTransition(bmp, cx, cy, expand = next)
-                } catch (_: Exception) {
-                    // Fall through to a plain recreate if snapshot fails.
-                }
-            }
-            Theme.setDark(context, next)
-            activity?.overridePendingTransition(0, 0)
-            activity?.recreate()
-        }
-        settingsCard.addView(LinearLayout(context).apply {
-            orientation = HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(8), 0, dp(8))
-            addView(TextView(context).apply {
-                text = "夜间模式"
-                textSize = 15f
-                setTextColor(COLOR_INK)
-            }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
-            addView(darkSwitch, LayoutParams(dp(48), dp(28)))
-            // Whole row (including the switch) shares one handler so both the
-            // label and the pill actually flip the theme.
-            setOnClickListener { applyDarkToggle(darkSwitch) }
-            darkSwitch.setOnClickListener { applyDarkToggle(darkSwitch) }
-        }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
-        profilePage.addView(settingsCard, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
-            topMargin = dp(16)
-        })
+        // ── 外观卡片（夜间模式 + 外观适配下拉切换） & 内容与工具卡片 ──
+        val appearanceCard = buildAppearanceCard()
+        val menuCard = buildMenuCard(includeFavorites = true)
 
-        // ── Menu card: history / favorites / downloads / about ─────
+        if (LayoutMode.isWideScreen(context)) {
+            // 平板宽屏双栏仪表盘：直接 MATCH_PARENT 占满右侧主舞台，彻底修复左侧头像/图标被裁切的问题
+            profilePage.removeAllViews()
+            profilePage.setPadding(dp(24), dp(22), dp(24), dp(32))
+            val split = LinearLayout(context).apply {
+                orientation = HORIZONTAL
+                gravity = Gravity.TOP
+            }
+            val leftCol = LinearLayout(context).apply { orientation = VERTICAL }
+            leftCol.addView(card, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+            leftCol.addView(sectionLabel("外观"), sectionParams(Ds.Space.lg))
+            leftCol.addView(appearanceCard, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(Ds.Space.sm)
+            })
+
+            val rightCol = LinearLayout(context).apply { orientation = VERTICAL }
+            rightCol.addView(sectionLabel("内容与工具"), sectionParams(0))
+            rightCol.addView(menuCard, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(Ds.Space.sm)
+            })
+
+            split.addView(leftCol, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1.05f))
+            split.addView(rightCol, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f).apply {
+                leftMargin = dp(20)
+            })
+            profilePage.addView(split, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        } else {
+            profilePage.addView(sectionLabel("外观"), sectionParams())
+            profilePage.addView(appearanceCard, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(Ds.Space.sm)
+            })
+
+            profilePage.addView(sectionLabel("内容与工具"), sectionParams())
+            profilePage.addView(menuCard, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(Ds.Space.sm)
+            })
+        }
+    }
+
+    private fun buildMenuCard(includeFavorites: Boolean): LinearLayout {
         val menuCard = LinearLayout(context).apply {
             orientation = VERTICAL
-            background = rounded(COLOR_CARD, dp(18), COLOR_CARD_BORDER, dp(1))
-            setPadding(dp(6), dp(6), dp(6), dp(6))
+            background = Ds.card(context, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.card)
+            setPadding(0, dp(Ds.Space.xs), 0, dp(Ds.Space.xs))
         }
-        // 统一菜单行：自绘线条图标（同一批 stroke 风格），避免 Unicode 字符各有千秋。
-        // 行间分隔线单独取可见色（不动全局 COLOR_BORDER），保持 1dp 发丝级细度。
         fun addMenuDivider() {
-            menuCard.addView(View(context).apply {
-                setBackgroundColor(if (Theme.isDark) 0x3AFFFFFF.toInt() else 0x26000000.toInt())
-            },
-                LayoutParams(LayoutParams.MATCH_PARENT, dp(1)).apply {
-                    leftMargin = dp(48); rightMargin = dp(12)
-                })
+            menuCard.addView(
+                View(context).apply { setBackgroundColor(Ds.colors.lineSoft) },
+                LayoutParams(LayoutParams.MATCH_PARENT, Ds.hairline(context)).apply {
+                    leftMargin = dp(Ds.Space.lg + 34 + Ds.Space.md)
+                    rightMargin = dp(Ds.Space.lg)
+                }
+            )
         }
-        fun menuRow(iconKind: Int, label: String, extraEnd: View? = null, onClick: () -> Unit) {
-            menuCard.addView(LinearLayout(context).apply {
+        fun menuRow(iconKind: Int, label: String, onClick: () -> Unit) {
+            val row = LinearLayout(context).apply {
                 orientation = HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(12), dp(4), dp(12), dp(4))
+                setPadding(dp(Ds.Space.lg), 0, dp(Ds.Space.lg), 0)
                 isClickable = true
                 isFocusable = true
                 setOnClickListener { onClick() }
                 addView(
-                    MenuIconView(context, iconKind),
-                    LayoutParams(dp(22), dp(22)).apply { rightMargin = dp(10) }
+                    iconChip(iconKind),
+                    LayoutParams(dp(34), dp(34)).apply { rightMargin = dp(Ds.Space.md) }
                 )
                 addView(TextView(context).apply {
                     text = label
                     textSize = 15f
+                    typeface = Ds.body(true)
                     setTextColor(COLOR_INK)
                 }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
-                if (extraEnd != null) {
-                    addView(
-                        extraEnd,
-                        LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
-                            rightMargin = dp(8)
-                        }
-                    )
-                }
-                addView(TextView(context).apply {
-                    text = "›"
-                    textSize = 20f
-                    setTextColor(COLOR_MUTED)
-                }, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
-            }, LayoutParams(LayoutParams.MATCH_PARENT, dp(52)))
-        }
-        menuRow(MenuIconView.HISTORY, "历史记录") {
-            context.startActivity(Intent(context, ProfileSubActivity::class.java)
-                .putExtra(ProfileSubActivity.EXTRA_MODE, ProfileSubActivity.MODE_HISTORY))
-        }
-        addMenuDivider()
-        menuRow(MenuIconView.FAVORITE, "我的收藏") {
-            context.startActivity(Intent(context, ProfileSubActivity::class.java)
-                .putExtra(ProfileSubActivity.EXTRA_MODE, ProfileSubActivity.MODE_FAVORITES))
-        }
-        addMenuDivider()
-        menuRow(MenuIconView.SPONSOR, "赞助开发") {
-            context.startActivity(Intent(context, ProfileSubActivity::class.java)
-                .putExtra(ProfileSubActivity.EXTRA_MODE, ProfileSubActivity.MODE_SPONSOR))
-        }
-        addMenuDivider()
-        // Open QQ group feedback page in the system browser (no in-app WebView).
-        menuRow(MenuIconView.GROUP, "群聊反馈") {
-            try {
-                context.startActivity(
-                    Intent(
-                        Intent.ACTION_VIEW,
-                        Uri.parse(
-                            "https://qun.qq.com/universal-share/share?ac=1&authKey=mi%2F1NPMkv68IZY%2FjWTSovU4mgcq%2FLKGBcEe6VIdf7rn4cju57FyW2hDPVX43AEfU&busi_data=eyJncm91cENvZGUiOiIxMDk3MDQ3NzQ3IiwidG9rZW4iOiI1Q3Ewd1hyNTJKMzlzUjg2UmZsclJ6Z2h2aEJMbjZJcTZ2Wm1Pb0Nnc2U5eUlFM1AwcXFTSXd0SFhZNmxreER5IiwidWluIjoiMjQ3NjkxNjU3MyJ9&data=x4EWUUQal_zU_nMigagLWGY9vd7zwRepc7wSgc96xwz4YxcDhYENVMfmKbJsbp7elJ2Xm415Cv1inVohsQjyiQ&svctype=4&tempid=h5_group_info"
-                        )
-                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                addView(
+                    Ds.chevronRightIcon(context, Ds.colors.subtle, 1.7f),
+                    LayoutParams(dp(14), dp(14))
                 )
-            } catch (_: Exception) {
-                Toast.makeText(context, "无法打开链接，请检查是否安装浏览器", Toast.LENGTH_SHORT).show()
+            }
+            bindRowPress(row)
+            menuCard.addView(row, LayoutParams(LayoutParams.MATCH_PARENT, dp(56)))
+        }
+
+        menuRow(MenuIconView.HISTORY, "历史记录") {
+            openSubPage(ProfileSubActivity.MODE_HISTORY)
+        }
+        if (includeFavorites) {
+            addMenuDivider()
+            menuRow(MenuIconView.FAVORITE, "我的收藏") {
+                openSubPage(ProfileSubActivity.MODE_FAVORITES)
             }
         }
         addMenuDivider()
-        // About row with optional red bubble when a newer build is pending.
-        aboutBadge.apply {
-            text = "发现新版本"
-            textSize = 11f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            gravity = Gravity.CENTER
-            setTextColor(0xFFFFFFFF.toInt())
-            setPadding(dp(8), dp(3), dp(8), dp(3))
-            includeFontPadding = false
-            background = rounded(0xFFE53935.toInt(), dp(10))
-            visibility = View.GONE
+        menuRow(MenuIconView.DOWNLOADS, "下载管理") {
+            DownloadManagerActivity.open(context)
         }
-        menuRow(MenuIconView.ABOUT, "关于软件", extraEnd = aboutBadge) {
-            context.startActivity(Intent(context, ProfileSubActivity::class.java)
-                .putExtra(ProfileSubActivity.EXTRA_MODE, ProfileSubActivity.MODE_ABOUT))
+        addMenuDivider()
+        menuRow(MenuIconView.SPONSOR, "赞助开发") {
+            openSubPage(ProfileSubActivity.MODE_SPONSOR)
         }
-
-        profilePage.addView(menuCard, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
-            topMargin = dp(14)
-        })
-
-        // Root scroll container.
-        val scroll = ScrollView(context).apply {
-            isFillViewport = true
-            overScrollMode = View.OVER_SCROLL_NEVER
+        addMenuDivider()
+        menuRow(MenuIconView.ABOUT, "关于软件") {
+            openSubPage(ProfileSubActivity.MODE_ABOUT)
         }
-        val content = FrameLayout(context)
-        content.addView(loginPage, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
-        content.addView(profilePage, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
-        scroll.addView(content, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
-        addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
-
-        refresh()
+        return menuCard
     }
 
-
-    private fun refreshAboutBadge() {
-        val show = UpdateChecker.hasPendingUpdate(context)
-        aboutBadge.visibility = if (show) View.VISIBLE else View.GONE
+    private fun openSubPage(mode: String) {
+        context.startActivity(
+            Intent(context, ProfileSubActivity::class.java)
+                .putExtra(ProfileSubActivity.EXTRA_MODE, mode)
+        )
+        (context as? Activity)?.let {
+            @Suppress("DEPRECATION")
+            it.overridePendingTransition(R.anim.slide_in_right, R.anim.slide_out_left_soft)
+        }
     }
 
-    override fun onAttachedToWindow() {
-        super.onAttachedToWindow()
-        UpdateChecker.addListener(updateBadgeListener)
-        // Badge only reflects the live result of this process's open-time check
-        // (no sticky disk cache / no re-check on every tab switch).
-        refreshAboutBadge()
+    private fun iconChip(kind: Int): FrameLayout = FrameLayout(context).apply {
+        background = Ds.card(context, COLOR_ROSE_SOFT, null, Ds.Radius.chip, 0)
+        addView(
+            MenuIconView(context, kind, COLOR_ROSE),
+            FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER)
+        )
     }
+
+    private fun bindRowPress(row: View) {
+        row.setOnTouchListener { view, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> DsSpring.pressLift(view, true, 0.982f)
+                MotionEvent.ACTION_UP,
+                MotionEvent.ACTION_CANCEL -> DsSpring.pressLift(view, false, 0.982f)
+            }
+            false
+        }
+    }
+
+    /** 保留夜间模式的圆形揭示/收拢动画切换效果。 */
+    private fun toggleDarkMode(switchView: PillSwitch, anchor: View) {
+        val next = !Theme.isDark
+        switchView.toggle()
+        val activity = context as? Activity
+        if (activity != null) {
+            try {
+                val decor = activity.window.decorView
+                val content = decor.findViewById<View>(android.R.id.content) ?: decor
+                val switchLoc = IntArray(2)
+                val contentLoc = IntArray(2)
+                anchor.getLocationOnScreen(switchLoc)
+                content.getLocationOnScreen(contentLoc)
+                val cx = switchLoc[0] - contentLoc[0] + anchor.width / 2f
+                val cy = switchLoc[1] - contentLoc[1] + anchor.height / 2f
+                val bmp = Bitmap.createBitmap(
+                    content.width.coerceAtLeast(1),
+                    content.height.coerceAtLeast(1),
+                    Bitmap.Config.ARGB_8888
+                )
+                content.draw(Canvas(bmp))
+                Theme.prepareCircularTransition(bmp, cx, cy, expand = next)
+            } catch (_: Exception) {
+                // 截图失败时静默回退到普通 recreate
+            }
+        }
+        Theme.setDark(context, next)
+        @Suppress("DEPRECATION")
+        activity?.overridePendingTransition(0, 0)
+        activity?.recreate()
+    }
+
+    /** 首次无缓存时播放错峰入场；已有本地缓存秒出时保持静止避免闪烁。 */
+    private fun playEntrance() {
+        if (entrancePlayed) return
+        entrancePlayed = true
+        if (profileBound && BiliSessionStore.isLoggedIn()) return
+        val target = if (BiliSessionStore.isLoggedIn()) profilePage else loginPage
+        if (target.childCount == 0 || MotionTokens.isReduced(context)) return
+        for (index in 0 until target.childCount) {
+            DsSpring.enter(target.getChildAt(index), index)
+        }
+    }
+
+    private fun sectionLabel(text: String): TextView = TextView(context).apply {
+        this.text = text
+        textSize = 11f
+        typeface = Ds.body(true)
+        letterSpacing = 0.12f
+        setTextColor(Ds.colors.subtle)
+        includeFontPadding = false
+        setPadding(dp(4), 0, 0, 0)
+    }
+
+    private fun sectionParams(topDp: Int = Ds.Space.lg): LayoutParams = LayoutParams(
+        LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+    ).apply { topMargin = dp(topDp) }
 
     override fun onDetachedFromWindow() {
-        UpdateChecker.removeListener(updateBadgeListener)
-        stopQrPolling()
+        setActive(false)
         super.onDetachedFromWindow()
     }
 
-    // ── public refresh ────────────────────────────────────────────
+    fun setActive(value: Boolean) {
+        if (active == value) return
+        active = value
+        if (value) {
+            refresh(soft = true)
+            playEntrance()
+        } else {
+            qrRequestGeneration++
+            stopQrPolling()
+            profileGeneration++
+            profileInFlight = false
+        }
+    }
 
-    /**
-     * [soft]=true keeps the existing profile card on screen (used when
-     * returning from history/favorites or tab switches). Only a quiet
-     * background re-fetch runs, and only if the cache is stale — no
-     * "加载中…" flash that made the card look like it reloaded.
-     */
-    fun refresh(soft: Boolean = false) {
-        refreshAboutBadge()
+    // ── 刷新状态 ──────────────────────────────────────────────────
+
+    private fun refresh(soft: Boolean = false) {
+        if (!active) return
         BiliSessionStore.init(context)
         if (BiliSessionStore.isLoggedIn()) {
             stopQrPolling()
@@ -468,74 +742,72 @@ class AccountPageView(context: Context) : LinearLayout(context) {
             loadProfile(soft = soft && profileBound)
         } else {
             profileBound = false
+            lastBoundProfile = null
             lastProfileFace = ""
             loginPage.visibility = View.VISIBLE
             profilePage.visibility = View.GONE
-            // Only (re)generate the QR code when there is none yet; keeps the code
-            // stable while the user switches back and forth between tabs.
-            if (qrKey.isBlank() && qrImage.drawable == null) startQrLogin()
+            if (qrKey.isBlank()) startQrLogin() else startPolling()
         }
     }
 
-    // ── QR login ──────────────────────────────────────────────────
+    // ── 二维码登录 ────────────────────────────────────────────────
 
     private fun startQrLogin() {
+        if (!active) return
+        val gen = ++qrRequestGeneration
         stopQrPolling()
         qrImage.setImageDrawable(null)
+        qrBitmap = null
+        qrContent = ""
         qrKey = ""
         qrStatus.text = "正在生成二维码…"
         BiliLoginApi.generateQrCode { url, key, error ->
             mainHandler.post {
-                if (error != null || url == null || key == null) {
+                if (!active || gen != qrRequestGeneration) return@post
+                if (error != null || url.isNullOrBlank() || key.isNullOrBlank()) {
                     qrStatus.text = "二维码生成失败，点击刷新重试"
                     return@post
                 }
                 qrKey = key
-                renderQr(url)
-                qrStatus.text = "请使用哔哩哔哩 App 扫码登录"
-                startPolling()
+                if (renderQr(url)) {
+                    qrStatus.text = "等待扫码"
+                    startPolling()
+                }
             }
         }
     }
 
-    private fun renderQr(content: String) {
-        try {
+    private fun renderQr(content: String): Boolean {
+        return try {
             qrContent = content
-            val size = dp(212)
+            val size = dp(196)
             val bitmap = buildQrBitmap(content, size, marginModules = 2)
             qrBitmap = bitmap
             qrImage.setImageBitmap(bitmap)
-        } catch (error: Exception) {
+            true
+        } catch (_: Exception) {
             qrContent = ""
             qrBitmap = null
             qrStatus.text = "二维码生成失败，点击刷新重试"
+            false
         }
     }
 
-    /**
-     * Build a scan-friendly QR bitmap.
-     * Export uses a larger size + thicker quiet zone so another phone can scan
-     * the saved image more reliably than a screenshot of the on-screen tile.
-     */
     private fun buildQrBitmap(content: String, sizePx: Int, marginModules: Int = 2): Bitmap {
         val hints = mapOf(EncodeHintType.MARGIN to marginModules, EncodeHintType.CHARACTER_SET to "UTF-8")
         val matrix: BitMatrix = QRCodeWriter().encode(content, BarcodeFormat.QR_CODE, sizePx, sizePx, hints)
-        val bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
-        val black = Color.BLACK
-        val white = Color.WHITE
-        for (x in 0 until sizePx) {
-            for (y in 0 until sizePx) {
-                bitmap.setPixel(x, y, if (matrix.get(x, y)) black else white)
+        val pixels = IntArray(sizePx * sizePx)
+        for (y in 0 until sizePx) {
+            for (x in 0 until sizePx) {
+                pixels[y * sizePx + x] = if (matrix.get(x, y)) Color.BLACK else Color.WHITE
             }
         }
-        return bitmap
+        return Bitmap.createBitmap(pixels, sizePx, sizePx, Bitmap.Config.ARGB_8888)
     }
 
-    /** Saves a high-res QR into the system gallery (Pictures/YuiBili). */
     private fun saveQrToGallery() {
         val bitmap = try {
             if (qrContent.isNotBlank()) {
-                // 800px + larger quiet zone → easier for another phone to scan.
                 buildQrBitmap(qrContent, sizePx = 800, marginModules = 3)
             } else {
                 qrBitmap ?: (qrImage.drawable as? BitmapDrawable)?.bitmap
@@ -549,7 +821,6 @@ class AccountPageView(context: Context) : LinearLayout(context) {
         }
         val name = "YuiBili登录二维码_${System.currentTimeMillis()}.png"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // Scoped storage: no permission needed.
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, name)
                 put(MediaStore.Images.Media.MIME_TYPE, "image/png")
@@ -565,8 +836,8 @@ class AccountPageView(context: Context) : LinearLayout(context) {
                     values.clear()
                     values.put(MediaStore.Images.Media.IS_PENDING, 0)
                     context.contentResolver.update(uri, values, null, null)
-                    Toast.makeText(context, "已下载到相册（Pictures/YuiBili）", Toast.LENGTH_SHORT).show()
-                } catch (error: Exception) {
+                    Toast.makeText(context, "已保存到相册（Pictures/YuiBili）", Toast.LENGTH_SHORT).show()
+                } catch (_: Exception) {
                     context.contentResolver.delete(uri, null, null)
                     Toast.makeText(context, "保存失败，请重试", Toast.LENGTH_SHORT).show()
                 }
@@ -574,7 +845,6 @@ class AccountPageView(context: Context) : LinearLayout(context) {
                 Toast.makeText(context, "保存失败，请重试", Toast.LENGTH_SHORT).show()
             }
         } else {
-            // Legacy storage: needs WRITE_EXTERNAL_STORAGE.
             if (context.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 != PackageManager.PERMISSION_GRANTED
             ) {
@@ -584,7 +854,7 @@ class AccountPageView(context: Context) : LinearLayout(context) {
                         arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE),
                         0x51A1
                     )
-                    Toast.makeText(context, "请允许存储权限后再次点击下载", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "请允许存储权限后再次点击保存", Toast.LENGTH_SHORT).show()
                 } else {
                     Toast.makeText(context, "请在系统设置中授予存储权限后重试", Toast.LENGTH_SHORT).show()
                 }
@@ -599,26 +869,28 @@ class AccountPageView(context: Context) : LinearLayout(context) {
                 val file = File(dir, name)
                 file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
                 context.sendBroadcast(
-                    android.content.Intent(android.content.Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, android.net.Uri.fromFile(file))
+                    Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, android.net.Uri.fromFile(file))
                 )
-                Toast.makeText(context, "已下载到相册（Pictures/YuiBili）", Toast.LENGTH_SHORT).show()
-            } catch (error: Exception) {
+                Toast.makeText(context, "已保存到相册（Pictures/YuiBili）", Toast.LENGTH_SHORT).show()
+            } catch (_: Exception) {
                 Toast.makeText(context, "保存失败，请重试", Toast.LENGTH_SHORT).show()
             }
         }
     }
 
     private fun startPolling() {
-        if (qrPolling || qrKey.isBlank()) return
+        if (!active || qrPolling || qrKey.isBlank()) return
         qrPolling = true
         pollRunnable.run()
     }
 
     private val pollRunnable = object : Runnable {
         override fun run() {
-            if (!qrPolling || qrKey.isBlank()) return
+            if (!active || !qrPolling || qrKey.isBlank()) return
+            val generation = qrPollGeneration
             BiliLoginApi.pollQrCode(qrKey) { state, cookie ->
                 mainHandler.post {
+                    if (!active || !qrPolling || generation != qrPollGeneration) return@post
                     when (state) {
                         BiliLoginApi.QR_CONFIRMED -> {
                             stopQrPolling()
@@ -627,21 +899,19 @@ class AccountPageView(context: Context) : LinearLayout(context) {
                                 resetLoginPage()
                                 refresh()
                             } else {
-                                // 确认成功但 cookie 解析失败：提示刷新，不要卡死在“已扫码”
                                 qrStatus.text = "登录凭证获取失败，请刷新重试"
                             }
                         }
                         BiliLoginApi.QR_SCANNED -> {
-                            // 关键：扫码后必须继续轮询，否则用户确认后永远卡在「已扫码」
                             qrStatus.text = "已扫码，请在手机上确认"
                             if (qrPolling) mainHandler.postDelayed(this, 1200)
                         }
                         BiliLoginApi.QR_EXPIRED -> {
                             stopQrPolling()
+                            qrKey = ""
                             qrStatus.text = "二维码已过期，点击刷新"
                         }
                         BiliLoginApi.QR_FAILED -> {
-                            // 单次网络失败不终止，继续下一轮
                             if (qrPolling) mainHandler.postDelayed(this, 2000)
                         }
                         else -> {
@@ -654,45 +924,60 @@ class AccountPageView(context: Context) : LinearLayout(context) {
     }
 
     private fun stopQrPolling() {
+        qrPollGeneration++
         qrPolling = false
         mainHandler.removeCallbacks(pollRunnable)
     }
 
-    // ── profile ───────────────────────────────────────────────────
+    // ── 用户信息卡片 ──────────────────────────────────────────────
 
-    /** Guards against overlapping profile fetches (recreate + onResume race). */
     private var profileGeneration = 0
-    /** True once the card has been painted with real profile data. */
     private var profileBound = false
     private var lastProfileFace = ""
+    private var lastBoundProfile: BiliLoginApi.UserInfo? = null
     private var profileInFlight = false
     private var lastProfileFetchAt = 0L
 
+    init {
+        if (BiliSessionStore.isLoggedIn()) {
+            loginPage.visibility = View.GONE
+            profilePage.visibility = View.VISIBLE
+            BiliSessionStore.cachedProfile()?.let {
+                applyProfile(it, allowAvatarReload = true)
+                profileBound = true
+                lastProfileFetchAt = BiliSessionStore.cachedProfileAt()
+            }
+        }
+    }
+
+    fun syncCachedProfile(info: BiliLoginApi.UserInfo) {
+        if (!BiliSessionStore.isLoggedIn()) return
+        loginPage.visibility = View.GONE
+        profilePage.visibility = View.VISIBLE
+        lastProfileFetchAt = System.currentTimeMillis()
+        applyProfile(info, allowAvatarReload = true)
+        profileBound = true
+    }
+
     private fun loadProfile(soft: Boolean = false) {
         val now = System.currentTimeMillis()
-        // Soft path: if we already show a card and fetched recently, skip.
-        if (soft && profileBound && now - lastProfileFetchAt < 8_000L) return
+        if (soft && profileBound && now - lastProfileFetchAt < 60_000L) return
         if (profileInFlight && soft) return
 
-        // Night-mode recreate rebuilds this whole page; restore the last good
-        // snapshot instantly so avatar/name/stats do not flash "加载中…".
         var quiet = soft
         val cached = BiliSessionStore.cachedProfile()
         if (!profileBound && cached != null) {
             applyProfile(cached, allowAvatarReload = true)
             profileBound = true
             lastProfileFetchAt = BiliSessionStore.cachedProfileAt().takeIf { it > 0L } ?: now
-            // Night-mode recreate / quick revisit: keep painted card as-is.
-            // Skip network if the snapshot is still fresh.
             quiet = true
-            if (now - lastProfileFetchAt < 30_000L) {
+            if (now - lastProfileFetchAt < 60_000L) {
                 return
             }
         }
 
         val generation = ++profileGeneration
-        if (!quiet || !profileBound) {
-            // Hard load only (first paint with no cache / after logout-login).
+        if (!quiet && !profileBound) {
             cardName.text = "加载中…"
             cardUid.text = ""
             cardBadges.removeAllViews()
@@ -701,20 +986,31 @@ class AccountPageView(context: Context) : LinearLayout(context) {
             cardCoins.text = "—"
         }
         profileInFlight = true
-        lastProfileFetchAt = now
-        BiliLoginApi.fetchProfile(BiliSessionStore.cookie()) { info, error ->
+        val cookie = BiliSessionStore.cookie()
+        BiliLoginApi.fetchProfile(
+            cookie = cookie,
+            onBaseReady = { baseInfo ->
+                mainHandler.post {
+                    if (!active || generation != profileGeneration || cookie != BiliSessionStore.cookie()) return@post
+                    // 基本资料（头像/昵称/VIP/等级）就绪即先渲染，不干等统计接口
+                    if (!profileBound) {
+                        applyProfile(baseInfo, allowAvatarReload = true)
+                        profileBound = true
+                    }
+                }
+            }
+        ) { info, error ->
             mainHandler.post {
+                if (!active || generation != profileGeneration) return@post
                 profileInFlight = false
-                // A newer refresh already started; drop this stale response so
-                // badges are never appended twice on dark-mode recreate.
-                if (generation != profileGeneration) return@post
+                if (cookie != BiliSessionStore.cookie()) return@post
+                lastProfileFetchAt = System.currentTimeMillis()
                 if (info == null) {
                     if (!profileBound) {
                         cardBadges.removeAllViews()
                         cardName.text = "加载失败"
-                        cardUid.text = error ?: "点击退出后重新登录"
+                        cardUid.text = error ?: "请尝试重新登录"
                     }
-                    // Soft refresh failure: keep whatever is already on screen.
                     return@post
                 }
                 BiliSessionStore.cacheProfile(info)
@@ -724,97 +1020,132 @@ class AccountPageView(context: Context) : LinearLayout(context) {
         }
     }
 
-    /** Paint the profile card from a UserInfo snapshot without network. */
+    private fun loadAvatarWithRetry(faceUrl: String, attemptsLeft: Int) {
+        CoverLoader.load(
+            cardAvatar,
+            faceUrl,
+            cropThumb = false,
+            thumbEdge = 128,
+            priority = CoverLoader.PRIORITY_HIGH,
+            onFailure = {
+                if (attemptsLeft > 0 && lastProfileFace == faceUrl) {
+                    mainHandler.postDelayed({
+                        if (lastProfileFace == faceUrl) {
+                            loadAvatarWithRetry(faceUrl, attemptsLeft - 1)
+                        }
+                    }, 900L)
+                }
+            }
+        )
+    }
+
     private fun applyProfile(info: BiliLoginApi.UserInfo, allowAvatarReload: Boolean) {
         BiliSessionStore.setVip(info.vipStatus, info.vipType)
-        cardName.text = info.uname
-        cardUid.text = "UID: ${info.uid}"
+        val prev = lastBoundProfile
+        if (prev == null || prev.uname != info.uname) {
+            cardName.text = info.uname
+        }
+        if (prev == null || prev.uid != info.uid) {
+            cardUid.text = "UID ${info.uid}"
+        }
         val faceUrl = if (info.face.isNotBlank()) info.face + "@128w_128h.webp" else ""
-        if (allowAvatarReload && faceUrl.isNotBlank() && faceUrl != lastProfileFace) {
+        if ((allowAvatarReload || lastProfileFace.isBlank()) && faceUrl.isNotBlank() && faceUrl != lastProfileFace) {
             lastProfileFace = faceUrl
-            CoverLoader.load(cardAvatar, faceUrl)
-        } else if (faceUrl.isNotBlank() && lastProfileFace.isBlank()) {
-            lastProfileFace = faceUrl
-            CoverLoader.load(cardAvatar, faceUrl)
+            loadAvatarWithRetry(faceUrl, attemptsLeft = 2)
         }
-        cardBadges.removeAllViews()
-        if (info.vipStatus == 1 && info.vipType >= 1) {
-            cardBadges.addView(badge("大会员", COLOR_ROSE, COLOR_ROSE_SOFT))
+        if (prev == null || prev.vipStatus != info.vipStatus || prev.vipType != info.vipType || prev.level != info.level) {
+            cardBadges.removeAllViews()
+            if (info.vipStatus == 1 && info.vipType >= 1) {
+                cardBadges.addView(badge("大会员", COLOR_ROSE, COLOR_ROSE_SOFT))
+            }
+            cardBadges.addView(badge("LV${info.level}", COLOR_MUTED, COLOR_SOFT_FILL).apply {
+                if (cardBadges.childCount > 0) {
+                    layoutParams = LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
+                        leftMargin = dp(6)
+                    }
+                }
+            })
         }
-        val levelColor = when (info.level) {
-            in 0..3 -> 0xFF8A7F84.toInt()
-            in 4..5 -> 0xFFE95786.toInt()
-            else -> 0xFFF0A63C.toInt()
+        if (prev == null || prev.following != info.following) {
+            cardFollowing.text = formatCount(info.following)
         }
-        cardBadges.addView(badge("LV${info.level}", 0xFFFFFFFF.toInt(), levelColor))
-        cardFollowing.text = formatCount(info.following)
-        cardFollower.text = formatCount(info.follower)
-        cardCoins.text = if (info.coins > 0) {
-            if (info.coins == info.coins.toLong().toDouble()) "${info.coins.toLong()}" else String.format("%.1f", info.coins)
-        } else "0"
+        if (prev == null || prev.follower != info.follower) {
+            cardFollower.text = formatCount(info.follower)
+        }
+        val formattedCoins = formatCoins(info.coins)
+        val prevCoins = prev?.let { formatCoins(it.coins) }
+        if (prev == null || prevCoins != formattedCoins) {
+            cardCoins.text = formattedCoins
+        }
+        lastBoundProfile = info
     }
+
+    private fun formatCoins(coins: Double): String = if (coins > 0) {
+        if (coins == coins.toLong().toDouble()) "${coins.toLong()}" else String.format(Locale.US, "%.1f", coins)
+    } else "0"
 
     private fun badge(text: String, textColor: Int, fill: Int): TextView = TextView(context).apply {
         this.text = text
-        textSize = 10.5f
-        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        textSize = 10f
+        typeface = Ds.body(true)
         setTextColor(textColor)
-        background = rounded(fill, dp(8))
-        setPadding(dp(8), dp(3), dp(8), dp(3))
+        background = rounded(fill, dp(6))
+        setPadding(dp(7), dp(2), dp(7), dp(2))
+        includeFontPadding = false
     }
 
     private fun buildStat(label: String, valueView: TextView): LinearLayout =
         LinearLayout(context).apply {
             orientation = VERTICAL
             gravity = Gravity.CENTER
+            setPadding(0, dp(4), 0, dp(4))
             valueView.apply {
                 textSize = 16f
-                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                typeface = Ds.display(bold = true)
                 setTextColor(COLOR_INK)
+                includeFontPadding = false
             }
             addView(valueView, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
             addView(TextView(context).apply {
                 text = label
                 textSize = 11f
+                typeface = Ds.body()
                 setTextColor(COLOR_MUTED)
-                setPadding(0, dp(3), 0, 0)
+                includeFontPadding = false
+                setPadding(0, dp(4), 0, 0)
             }, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
         }
 
     private fun formatCount(count: Int): String = when {
-        count >= 10000 -> String.format("%.1f万", count / 10000.0)
-        count >= 1000 -> String.format("%.1f千", count / 1000.0)
+        count >= 10000 -> String.format(Locale.CHINA, "%.1f万", count / 10000.0)
+        count >= 1000 -> String.format(Locale.CHINA, "%.1f千", count / 1000.0)
         else -> count.toString()
     }
 
-    // ── helpers ───────────────────────────────────────────────────
-
-    /** Custom logout confirmation dialog (not the system AlertDialog). */
     private fun showLogoutConfirm() {
         val dialog = Dialog(context)
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
         dialog.setCancelable(true)
         dialog.setCanceledOnTouchOutside(true)
         dialog.window?.setBackgroundDrawable(ColorDrawable(0x00000000))
-        val density = resources.displayMetrics.density
         val panel = LinearLayout(context).apply {
             orientation = VERTICAL
-            background = rounded(COLOR_BACKGROUND, dp(20), COLOR_CARD_BORDER, dp(1))
+            background = Ds.card(context, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.dialog)
             setPadding(dp(22), dp(22), dp(22), dp(18))
         }
         panel.addView(TextView(context).apply {
             text = "退出登录"
             textSize = 17f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            typeface = Ds.display(bold = true)
             setTextColor(COLOR_INK)
-        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         panel.addView(TextView(context).apply {
-            text = "退出后本机的登录凭证将被清除，\n下次需要重新扫码登录。确定退出吗？"
-            textSize = 13f
+            text = "将清除本机登录凭证，确定退出？"
+            textSize = 13.5f
+            typeface = Ds.body()
             setTextColor(COLOR_MUTED)
-            setLineSpacing(dp(4).toFloat(), 1f)
             setPadding(0, dp(10), 0, 0)
-        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         val buttons = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.END
@@ -823,44 +1154,53 @@ class AccountPageView(context: Context) : LinearLayout(context) {
         buttons.addView(TextView(context).apply {
             text = "取消"
             textSize = 14f
+            typeface = Ds.body(true)
             gravity = Gravity.CENTER
             setTextColor(COLOR_MUTED)
-            setPadding(dp(22), dp(9), dp(22), dp(9))
+            background = Ds.pill(context, COLOR_SURFACE, Ds.colors.lineSoft)
+            setPadding(dp(20), dp(9), dp(20), dp(9))
+            Ds.bindPressFeedback(this, 0.95f)
             setOnClickListener { dialog.dismiss() }
-        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
         buttons.addView(TextView(context).apply {
             text = "退出"
             textSize = 14f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            typeface = Ds.body(true)
             gravity = Gravity.CENTER
-            setTextColor(0xFFFFFFFF.toInt())
-            background = rounded(COLOR_ROSE, dp(16))
-            setPadding(dp(26), dp(9), dp(26), dp(9))
+            setTextColor(COLOR_ON_ROSE)
+            background = Ds.pill(context, COLOR_ROSE)
+            setPadding(dp(20), dp(9), dp(20), dp(9))
+            Ds.bindPressFeedback(this, 0.95f)
             setOnClickListener {
                 dialog.dismiss()
                 BiliSessionStore.clear(context)
                 resetLoginPage()
                 refresh()
             }
-        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-            leftMargin = dp(12)
+        }, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
+            leftMargin = dp(10)
         })
-        panel.addView(buttons, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        panel.addView(buttons, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         dialog.setContentView(panel)
         dialog.show()
-        dialog.window?.setLayout(
-            resources.displayMetrics.widthPixels - dp(48),
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        )
+        LayoutMode.applyDialogWidth(dialog, context, maxTabletDp = 420)
     }
 
     private fun resetLoginPage() {
+        qrRequestGeneration++
+        profileGeneration++
+        profileInFlight = false
+        profileBound = false
+        lastBoundProfile = null
+        lastProfileFace = ""
+        cardAvatar.setImageDrawable(null)
         stopQrPolling()
         qrImage.setImageDrawable(null)
+        qrBitmap = null
+        qrContent = ""
         qrKey = ""
     }
 
-    /** ImageView that draws its drawable clipped to a circle (avatar). */
     private class RoundAvatar(context: Context) : ImageView(context) {
         private val clipPath = Path()
         private val placeholderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -870,7 +1210,6 @@ class AccountPageView(context: Context) : LinearLayout(context) {
         override fun onDraw(canvas: Canvas) {
             if (width <= 0 || height <= 0) return
             val radius = width.coerceAtMost(height) / 2f
-            // Circular placeholder so dark mode never shows a square halo.
             placeholderPaint.color = COLOR_COVER
             canvas.drawCircle(width / 2f, height / 2f, radius, placeholderPaint)
             val drawable = drawable ?: return
@@ -884,26 +1223,28 @@ class AccountPageView(context: Context) : LinearLayout(context) {
         }
     }
 
-    /**
-     * 我的页菜单统一图标：同一套 stroke 线条风格，按 kind 绘制不同语义。
-     * 0 历史时钟 1 收藏星 2 赞助心 3 群聊气泡 4 关于 i。
-     */
-    private class MenuIconView(context: Context, private val kind: Int) : View(context) {
+    private class MenuIconView(
+        context: Context,
+        private val kind: Int,
+        private val iconColor: Int = COLOR_ROSE
+    ) : View(context) {
         companion object {
             const val HISTORY = 0
             const val FAVORITE = 1
             const val SPONSOR = 2
-            const val GROUP = 3
             const val ABOUT = 4
+            const val DOWNLOADS = 5
+            const val MOON = 6
         }
+
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = COLOR_ROSE
+            color = iconColor
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
             strokeJoin = Paint.Join.ROUND
         }
         private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = COLOR_ROSE
+            color = iconColor
             style = Paint.Style.FILL
         }
         private val density: Float = resources.displayMetrics.density
@@ -912,19 +1253,17 @@ class AccountPageView(context: Context) : LinearLayout(context) {
         override fun onDraw(canvas: Canvas) {
             val cx = width / 2f
             val cy = height / 2f
-            paint.strokeWidth = dpf(1.7f)
+            paint.strokeWidth = dpf(1.75f)
             when (kind) {
                 HISTORY -> {
-                    // 时钟：圆环 + 时针分针
-                    val r = dpf(8f)
+                    val r = dpf(7.5f)
                     canvas.drawCircle(cx, cy, r, paint)
-                    canvas.drawLine(cx, cy, cx, cy - dpf(4.5f), paint)
-                    canvas.drawLine(cx, cy, cx + dpf(3.8f), cy + dpf(1.5f), paint)
+                    canvas.drawLine(cx, cy, cx, cy - dpf(4.2f), paint)
+                    canvas.drawLine(cx, cy, cx + dpf(3.4f), cy + dpf(1.4f), paint)
                 }
                 FAVORITE -> {
-                    // 空心五角星（线条风格，与其他 stroke 图标一致）
-                    val outer = dpf(8.2f)
-                    val inner = outer * 0.42f
+                    val outer = dpf(7.8f)
+                    val inner = outer * 0.43f
                     val path = Path()
                     for (i in 0 until 5) {
                         val aOut = Math.toRadians((-90 + i * 72).toDouble())
@@ -940,49 +1279,48 @@ class AccountPageView(context: Context) : LinearLayout(context) {
                     canvas.drawPath(path, paint)
                 }
                 SPONSOR -> {
-                    // 心形轮廓
                     val path = Path()
-                    val top = cy - dpf(3.2f)
-                    path.moveTo(cx, cy + dpf(6.5f))
+                    val top = cy - dpf(3f)
+                    path.moveTo(cx, cy + dpf(6.2f))
                     path.cubicTo(
-                        cx - dpf(10f), cy + dpf(0.5f),
-                        cx - dpf(9.5f), top - dpf(3.5f),
-                        cx, top + dpf(1.5f)
+                        cx - dpf(9.4f), cy + dpf(0.4f),
+                        cx - dpf(8.8f), top - dpf(3.2f),
+                        cx, top + dpf(1.4f)
                     )
                     path.cubicTo(
-                        cx + dpf(9.5f), top - dpf(3.5f),
-                        cx + dpf(10f), cy + dpf(0.5f),
-                        cx, cy + dpf(6.5f)
+                        cx + dpf(8.8f), top - dpf(3.2f),
+                        cx + dpf(9.4f), cy + dpf(0.4f),
+                        cx, cy + dpf(6.2f)
                     )
                     path.close()
                     canvas.drawPath(path, paint)
                 }
-                GROUP -> {
-                    // 双人剪影（两个圆头 + 肩弧）
-                    canvas.drawCircle(cx - dpf(3.5f), cy - dpf(3.2f), dpf(3.2f), paint)
-                    canvas.drawCircle(cx + dpf(4.2f), cy - dpf(2.2f), dpf(2.6f), paint)
-                    val left = Path().apply {
-                        moveTo(cx - dpf(9f), cy + dpf(6.5f))
-                        quadTo(cx - dpf(3.5f), cy + dpf(1.2f), cx + dpf(1.5f), cy + dpf(6.5f))
-                    }
-                    val right = Path().apply {
-                        moveTo(cx + dpf(0.5f), cy + dpf(6.5f))
-                        quadTo(cx + dpf(4.5f), cy + dpf(2.2f), cx + dpf(8.8f), cy + dpf(6.5f))
-                    }
-                    canvas.drawPath(left, paint)
-                    canvas.drawPath(right, paint)
-                }
                 ABOUT -> {
-                    // 圆圈 + 中心 i（点 + 竖线）
-                    canvas.drawCircle(cx, cy, dpf(8.2f), paint)
-                    canvas.drawCircle(cx, cy - dpf(3.6f), dpf(1.15f), fill)
-                    canvas.drawLine(cx, cy - dpf(1.1f), cx, cy + dpf(4.2f), paint)
+                    canvas.drawCircle(cx, cy, dpf(7.6f), paint)
+                    canvas.drawCircle(cx, cy - dpf(3.2f), dpf(1.1f), fill)
+                    canvas.drawLine(cx, cy - dpf(0.8f), cx, cy + dpf(3.8f), paint)
+                }
+                DOWNLOADS -> {
+                    canvas.drawLine(cx, cy - dpf(6.8f), cx, cy + dpf(1.2f), paint)
+                    val arrow = dpf(3.5f)
+                    canvas.drawLine(cx - arrow, cy + dpf(1.2f) - arrow, cx, cy + dpf(1.2f), paint)
+                    canvas.drawLine(cx + arrow, cy + dpf(1.2f) - arrow, cx, cy + dpf(1.2f), paint)
+                    canvas.drawLine(cx - dpf(7.0f), cy + dpf(3.0f), cx - dpf(7.0f), cy + dpf(6.8f), paint)
+                    canvas.drawLine(cx + dpf(7.0f), cy + dpf(3.0f), cx + dpf(7.0f), cy + dpf(6.8f), paint)
+                    canvas.drawLine(cx - dpf(7.0f), cy + dpf(6.8f), cx + dpf(7.0f), cy + dpf(6.8f), paint)
+                }
+                MOON -> {
+                    val path = Path()
+                    val r = dpf(7.2f)
+                    path.addArc(cx - r, cy - r, cx + r, cy + r, 40f, 240f)
+                    path.quadTo(cx - dpf(1.5f), cy - dpf(0.5f), cx + r * 0.77f, cy + r * 0.64f)
+                    path.close()
+                    canvas.drawPath(path, paint)
                 }
             }
         }
     }
 
-    /** Self-drawn logout icon: door + outward arrow. */
     private class LogoutIconView(context: Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = COLOR_MUTED
@@ -993,32 +1331,36 @@ class AccountPageView(context: Context) : LinearLayout(context) {
         private val density: Float = resources.displayMetrics.density
         private val dpf: (Float) -> Float = { it * density }
 
-        init {
-            isClickable = true
-            isFocusable = true
-            contentDescription = "退出登录"
-        }
-
         override fun onDraw(canvas: Canvas) {
             val cx = width / 2f
             val cy = height / 2f
-            paint.strokeWidth = dpf(1.8f)
-            // Door frame (left 60%).
-            val left = cx - dpf(9f)
-            val top = cy - dpf(8f)
-            val right = cx + dpf(2f)
-            val bottom = cy + dpf(8f)
-            canvas.drawRoundRect(left, top, right, bottom, dpf(2f), dpf(2f), paint)
-            // Outward arrow from door to the right.
-            val startX = right
-            val midY = cy
-            canvas.drawLine(startX, midY, startX + dpf(10f), midY, paint)
-            canvas.drawLine(startX + dpf(5.5f), midY - dpf(4.5f), startX + dpf(10f), midY, paint)
-            canvas.drawLine(startX + dpf(5.5f), midY + dpf(4.5f), startX + dpf(10f), midY, paint)
+            paint.strokeWidth = dpf(1.75f)
+            val left = cx - dpf(7f)
+            val top = cy - dpf(6.5f)
+            val right = cx + dpf(1f)
+            val bottom = cy + dpf(6.5f)
+            val r = dpf(2.2f)
+            val door = Path().apply {
+                moveTo(right, top + dpf(1.8f))
+                lineTo(right, top + r)
+                quadTo(right, top, right - r, top)
+                lineTo(left + r, top)
+                quadTo(left, top, left, top + r)
+                lineTo(left, bottom - r)
+                quadTo(left, bottom, left + r, bottom)
+                lineTo(right - r, bottom)
+                quadTo(right, bottom, right, bottom - r)
+                lineTo(right, bottom - dpf(1.8f))
+            }
+            canvas.drawPath(door, paint)
+            val startX = cx - dpf(1f)
+            val endX = cx + dpf(8f)
+            canvas.drawLine(startX, cy, endX, cy, paint)
+            canvas.drawLine(endX - dpf(3.2f), cy - dpf(3.2f), endX, cy, paint)
+            canvas.drawLine(endX - dpf(3.2f), cy + dpf(3.2f), endX, cy, paint)
         }
     }
 
-    /** Self-drawn pill switch for the night mode row. */
     private class PillSwitch(context: Context, initial: Boolean) : View(context) {
         var isOn: Boolean = initial
             private set
@@ -1029,8 +1371,6 @@ class AccountPageView(context: Context) : LinearLayout(context) {
         private var animator: ValueAnimator? = null
 
         init {
-            // Clicks are owned by the parent row / explicit setOnClickListener so
-            // the pill never swallows the gesture without flipping the theme.
             isClickable = false
             isFocusable = false
         }
@@ -1039,6 +1379,11 @@ class AccountPageView(context: Context) : LinearLayout(context) {
             val target = !isOn
             isOn = target
             animator?.cancel()
+            if (MotionTokens.isReduced(context)) {
+                progress = if (target) 1f else 0f
+                invalidate()
+                return
+            }
             val start = progress
             animator = ValueAnimator.ofFloat(start, if (target) 1f else 0f).apply {
                 duration = 220L
@@ -1054,12 +1399,16 @@ class AccountPageView(context: Context) : LinearLayout(context) {
         override fun onDraw(canvas: Canvas) {
             val h = height.toFloat()
             val w = width.toFloat()
-            val trackColor = mixColor(COLOR_SWITCH_TRACK_OFF, COLOR_ROSE, progress)
-            paint.color = trackColor
-            canvas.drawRoundRect(0f, 0f, w, h, h / 2f, h / 2f, paint)
-            val knobSize = h - dpf(5f)
-            val knobX = dpf(2.5f) + (w - knobSize - dpf(5f)) * progress
-            paint.color = 0xFFFFFFFF.toInt()
+            val c = Ds.colors
+            val r = h / 2f
+            paint.style = Paint.Style.FILL
+            paint.color = mixColor(c.line, c.accent, progress)
+            canvas.drawRoundRect(0f, 0f, w, h, r, r, paint)
+
+            val pad = dpf(3f)
+            val knobSize = h - pad * 2f
+            val knobX = pad + (w - knobSize - pad * 2f) * progress
+            paint.color = Color.WHITE
             canvas.drawCircle(knobX + knobSize / 2f, h / 2f, knobSize / 2f, paint)
         }
 

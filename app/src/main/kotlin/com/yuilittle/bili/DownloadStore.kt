@@ -15,24 +15,30 @@ import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
+import android.util.Log
 import android.webkit.MimeTypeMap
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.io.RandomAccessFile
-import java.net.HttpURLConnection
-import java.net.URL
 import java.util.Locale
-import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import okhttp3.OkHttpClient
+import okhttp3.Response
 
 /**
- * 本地下载中心：任务队列 + 单worker串行下载 + 断点续传 + 持久化。
+ * 本地下载队列与断点续传。
  *
  * 视频采用 B 站 DASH 流（fnval=4048）：视频轨(.m4s)与音频轨(.m4s)各自按
  * initialization/index 区间分三段下载并拼回原文件布局，随后生成指向本地文件的
@@ -55,6 +61,46 @@ object DownloadManager {
     /** 正在“进行中”Tab 展示的状态集合（排队/下载/暂停/失败）。 */
     val ACTIVE_STATES = setOf(STATE_QUEUED, STATE_RUNNING, STATE_PAUSED, STATE_FAILED)
 
+    enum class SeasonSortOrder { DEFAULT, OLDEST_FIRST, NEWEST_FIRST }
+
+    enum class LocalPlayMode {
+        SEASON_SEQUENCE,
+        SHUFFLE,
+        LIST_LOOP,
+        SINGLE_LOOP;
+
+        fun label(): String = when (this) {
+            SEASON_SEQUENCE -> "顺序播放"
+            SHUFFLE -> "随机播放"
+            LIST_LOOP -> "列表循环"
+            SINGLE_LOOP -> "单集循环"
+        }
+
+        fun nextMode(): LocalPlayMode = when (this) {
+            SEASON_SEQUENCE -> SHUFFLE
+            SHUFFLE -> LIST_LOOP
+            LIST_LOOP -> SINGLE_LOOP
+            SINGLE_LOOP -> SEASON_SEQUENCE
+        }
+
+        /** 本地合集播放页仅提供顺序播放、单集循环与随机播放三档。 */
+        fun nextSeasonMode(): LocalPlayMode = when (this) {
+            SEASON_SEQUENCE -> SINGLE_LOOP
+            SINGLE_LOOP -> SHUFFLE
+            else -> SEASON_SEQUENCE
+        }
+    }
+
+    data class StorageBreakdown(
+        val deviceTotalBytes: Long,
+        val deviceFreeBytes: Long,
+        val deviceUsedBytes: Long,
+        val downloadsBytes: Long,
+        val appOtherBytes: Long,
+        val appTotalBytes: Long,
+        val otherUsedBytes: Long
+    )
+
     class Task {
         var id: Long = 0L
         var type: Int = TYPE_VIDEO
@@ -70,13 +116,40 @@ object DownloadManager {
         var groupTitle: String = ""
         var groupCoverUrl: String = ""
         var episodeNo: Int = 0
+        /** 分集或视频发布时间戳（秒），0 表示未知。 */
+        var publishedAt: Long = 0L
         var quality: Int = 0
         var qualityLabel: String = ""
         var durationMs: Long = 0L
-        var state: Int = STATE_QUEUED
-        var bytesDone: Long = 0L
-        var bytesTotal: Long = 0L
-        var speedBytes: Long = 0L
+        @Volatile var state: Int = STATE_QUEUED
+        @Volatile var bytesDone: Long = 0L
+        @Volatile var bytesTotal: Long = 0L
+        @Volatile var speedBytes: Long = 0L
+        private var speedSampleAt = 0L
+        private var speedSampleBytes = 0L
+
+        internal fun sampleSpeed() {
+            val now = SystemClock.elapsedRealtime()
+            val bytes = bytesDone
+            if (speedSampleAt == 0L) {
+                speedSampleAt = now
+                speedSampleBytes = bytes
+                return
+            }
+            val elapsed = now - speedSampleAt
+            if (elapsed >= 1000L) {
+                speedBytes = (bytes - speedSampleBytes).coerceAtLeast(0L) * 1000L / elapsed
+                speedSampleAt = now
+                speedSampleBytes = bytes
+            }
+        }
+
+        internal fun resetSpeed() {
+            speedSampleAt = 0L
+            speedSampleBytes = 0L
+            speedBytes = 0L
+        }
+
         var error: String = ""
         var createdAt: Long = 0L
         var finishedAt: Long = 0L
@@ -87,18 +160,23 @@ object DownloadManager {
         /** 纯音频任务：本地音频文件路径。 */
         var audioPath: String = ""
         /** 单文件流(durl)任务：各分片本地路径（多于1个时用 ConcatenatingMediaSource）。 */
-        var singlePaths: MutableList<String> = mutableListOf()
-        /** 已导出到公共媒体库的文件（"相对目录|文件名"），删除任务时同步清理相册副本。 */
-        var galleryExports: MutableList<String> = mutableListOf()
+        val singlePaths = CopyOnWriteArrayList<String>()
+        val galleryExports = CopyOnWriteArrayList<String>()
         /** 下载中置 true；暂停/删除时置 true 让 worker 快速退出。 */
         @Volatile var cancelRequested: Boolean = false
         /** 是否正在被 worker 执行。 */
         @Volatile var running: Boolean = false
+        @Volatile var activeCall: okhttp3.Call? = null
 
-        fun playable(): Boolean =
-            (mpdPath.isNotBlank() && File(mpdPath).exists()) ||
-                (audioPath.isNotBlank() && File(audioPath).exists()) ||
-                singlePaths.any { File(it).exists() }
+        fun playable(): Boolean {
+            if (state != STATE_COMPLETED) return false
+            return when {
+                mpdPath.isNotBlank() -> File(mpdPath).exists()
+                audioPath.isNotBlank() -> File(audioPath).exists()
+                singlePaths.isNotEmpty() -> singlePaths.all { File(it).exists() }
+                else -> false
+            }
+        }
     }
 
     private var appContext: Context? = null
@@ -108,53 +186,58 @@ object DownloadManager {
     private val galleryIo = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "YuiBiliGalleryExport").apply { isDaemon = true }
     }
+    private val taskIo = java.util.concurrent.ThreadPoolExecutor(
+        1, 1, 15L, java.util.concurrent.TimeUnit.SECONDS, java.util.concurrent.LinkedBlockingQueue()
+    ).apply { allowCoreThreadTimeOut(true) }
+    private var writePending = false
+    private var writerScheduled = false
 
     private val lock = java.lang.Object()
     private val tasks = LinkedHashMap<Long, Task>()
-    private val queue = ConcurrentLinkedQueue<Long>()
+    private val queue = LinkedHashSet<Long>()
     private val listeners = CopyOnWriteArrayList<(List<Task>) -> Unit>()
+    private val main: Handler by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { Handler(Looper.getMainLooper()) }
+    private val deliveryPosted = AtomicBoolean()
+    private val deliverUpdates = Runnable {
+        deliveryPosted.set(false)
+        if (listeners.isNotEmpty()) {
+            val current = snapshot()
+            listeners.forEach { it(current) }
+        }
+    }
     private val idSeq = AtomicLong(System.currentTimeMillis())
     private val workers = Array(3) { index ->
-        Thread({ workerLoop() }.also { }, "YuiBiliDownloader-$index").apply { isDaemon = true }
+        Thread(::workerLoop, "YuiBiliDownloader-$index").apply { isDaemon = true }
     }
     private var workersStarted = false
 
-    private var lastNotifyAt = 0L
+    private val lastNotifyAt = AtomicLong(0L)
+    private val galleryWork = AtomicInteger()
     private var downloadDir: File? = null
-    private var foregroundStarted = false
     private var notificationManager: NotificationManager? = null
 
     private const val NOTIFICATION_CHANNEL_ID = "yuibili_downloads"
     private const val NOTIFICATION_ID = 0x5942
-    private const val ACTION_OPEN_DOWNLOADS = "com.yuilittle.bili.OPEN_DOWNLOADS"
-
     /** 下载目录（供 UI 统计占用、清理残留等）。 */
     fun downloadDir(): File? = downloadDir
 
     fun init(context: Context) {
-        if (initialized) {
-            updateDownloadNotification()
-            return
-        }
-        synchronized(lock) {
+        if (initialized) return
+        val hasPendingTransfers = synchronized(lock) {
             if (initialized) return
-            appContext = context.applicationContext
-            downloadDir = File(appContext!!.filesDir, "downloads").apply { mkdirs() }
-            notificationManager = appContext!!.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val application = context.applicationContext
+            BiliSessionStore.init(application)
+            appContext = application
+            downloadDir = File(application.filesDir, "downloads").apply { mkdirs() }
+            notificationManager = application.getSystemService(NotificationManager::class.java)
             createNotificationChannel()
             load()
             initialized = true
+            queue.isNotEmpty()
         }
-        // 普通 Activity 进程不能调用 startForeground；通知由 DownloadManager 托管。
-        // 真正的 Service 入口会在用户开始下载时启动并接管同一份队列。
-        updateDownloadNotification()
-        if (!workersStarted) {
-            synchronized(lock) {
-                if (!workersStarted) {
-                    workers.forEach { it.start() }
-                    workersStarted = true
-                }
-            }
+        if (hasPendingTransfers) {
+            if (context !is DownloadService) startDownloadService(context)
+            kick()
         }
     }
 
@@ -193,6 +276,7 @@ object DownloadManager {
                 this.quality = quality; qualityLabel = label
                 this.groupId = groupId; this.groupTitle = groupTitle
                 this.groupCoverUrl = groupCoverUrl; this.episodeNo = episodeNo
+                publishedAt = item.publishedAt
                 durationMs = item.duration * 1000L
                 state = STATE_QUEUED; createdAt = System.currentTimeMillis()
             }
@@ -212,6 +296,7 @@ object DownloadManager {
         episodeNo: Int = 0
     ) {
         init(context)
+        if (item.charge) return
         synchronized(lock) {
             val existing = tasks.values.firstOrNull {
                 it.type == TYPE_AUDIO && it.bvid == item.bvid && it.cid == item.cid && it.state != STATE_COMPLETED
@@ -225,6 +310,7 @@ object DownloadManager {
                 qualityLabel = "仅音频"
                 this.groupId = groupId; this.groupTitle = groupTitle
                 this.groupCoverUrl = groupCoverUrl; this.episodeNo = episodeNo
+                publishedAt = item.publishedAt
                 durationMs = item.duration * 1000L
                 state = STATE_QUEUED; createdAt = System.currentTimeMillis()
             }
@@ -340,93 +426,282 @@ object DownloadManager {
         notifyListeners()
     }
 
-    /** 删除整个合集：该 groupId 下所有任务及其已下载文件。 */
-    fun deleteGroup(groupId: String) {
-        if (groupId.isBlank()) return
-        val ids = synchronized(lock) {
-            tasks.values.filter { it.groupId == groupId }.map { it.id }
-        }
-        ids.forEach { delete(it) }
-    }
-
     fun pause(id: Long) {
-        val t = task(id) ?: return
-        synchronized(t) {
-            if (t.state != STATE_RUNNING && t.state != STATE_QUEUED) return
-            t.cancelRequested = true
-            if (t.state == STATE_QUEUED) {
-                t.state = STATE_PAUSED
+        var callToCancel: okhttp3.Call? = null
+        synchronized(lock) {
+            val task = tasks[id] ?: return
+            synchronized(task) {
+                if (task.state != STATE_RUNNING && task.state != STATE_QUEUED) return
+                task.cancelRequested = true
+                callToCancel = task.activeCall
+                if (task.state == STATE_QUEUED) {
+                    task.state = STATE_PAUSED
+                    queue.remove(id)
+                }
+                saveLocked()
             }
         }
+        callToCancel?.cancel()
         notifyListeners()
     }
 
-    fun resume(id: Long) {
-        val t = task(id) ?: return
-        synchronized(t) {
-            if (t.state != STATE_PAUSED) return
-            t.state = STATE_QUEUED
-            t.cancelRequested = false
-            t.error = ""
-        }
-        notifyListeners()
-        appContext?.let { startDownloadService(it) }
-        kick()
-    }
+    fun resume(id: Long) = requeue(id, STATE_PAUSED)
 
-    fun retry(id: Long) {
-        val t = task(id) ?: return
-        synchronized(t) {
-            if (t.state != STATE_FAILED) return
-            t.state = STATE_QUEUED
-            t.cancelRequested = false
-            t.error = ""
-        }
-        notifyListeners()
-        appContext?.let { startDownloadService(it) }
-        kick()
-    }
+    fun retry(id: Long) = requeue(id, STATE_FAILED)
 
-    fun delete(id: Long) {
-        val t = task(id) ?: return
-        synchronized(t) { t.cancelRequested = true }
+    private fun requeue(id: Long, previousState: Int) {
         synchronized(lock) {
-            tasks.remove(id)
-            queue.remove(id)
+            val task = tasks[id] ?: return
+            synchronized(task) {
+                if (task.state != previousState) return
+                task.state = STATE_QUEUED
+                task.cancelRequested = false
+                task.error = ""
+            }
+            queue.add(id)
             saveLocked()
         }
-        val dir = downloadDir
-        if (dir != null) {
-            (listOf(t.mpdPath, t.audioPath) + t.singlePaths + t.coverPath)
-                .filter { it.isNotBlank() }
-                .forEach { path -> runCatching { File(path).delete() } }
-            // 顺带清理该任务的任何残留文件
-            runCatching { dir.listFiles()?.filter { it.name.startsWith("${t.id}_") }?.forEach { it.delete() } }
-        }
-        // 同步删除已导出到相册（Pictures/YuiBili、Movies/YuiBili）的公共副本
-        deleteGalleryExports(t)
         notifyListeners()
-        maybeGuideStoragePermission()
+        appContext?.let(::startDownloadService)
+        kick()
     }
 
-    fun clearFinished() {
+    fun delete(id: Long) = deleteMany(listOf(id))
+
+    fun deleteMany(ids: List<Long>) {
+        val idleTasks = ArrayList<Task>()
+        val callsToCancel = ArrayList<okhttp3.Call>()
         synchronized(lock) {
-            val ids = tasks.values.filter { it.state == STATE_COMPLETED }.map { it.id }
-            val dir = downloadDir
-            ids.forEach { id ->
-                val t = tasks.remove(id)
+            var changed = false
+            for (id in ids) {
+                val task = tasks.remove(id) ?: continue
                 queue.remove(id)
-                if (dir != null && t != null) {
-                    (listOf(t.mpdPath, t.audioPath) + t.singlePaths + t.coverPath)
-                        .filter { it.isNotBlank() }
-                        .forEach { path -> runCatching { File(path).delete() } }
-                    runCatching { dir.listFiles()?.filter { it.name.startsWith("${id}_") }?.forEach { it.delete() } }
-                    deleteGalleryExports(t)
+                synchronized(task) {
+                    task.cancelRequested = true
+                    task.activeCall?.let(callsToCancel::add)
+                    if (!task.running) idleTasks.add(task)
+                }
+                changed = true
+            }
+            if (!changed) return
+            saveLocked()
+            if (idleTasks.isNotEmpty()) cleanRemovedTasks(idleTasks)
+        }
+        callsToCancel.forEach { it.cancel() }
+        notifyListeners()
+    }
+
+    private fun cleanRemovedTasks(removed: List<Task>) {
+        galleryWork.incrementAndGet()
+        taskIo.execute {
+            galleryIo.execute {
+                try {
+                    val ids = removed.mapTo(HashSet()) { it.id }
+                    downloadDir?.listFiles()?.forEach { file ->
+                        val id = file.name.substringBefore('_').removeSuffix(".mpd").toLongOrNull()
+                        if (id != null && id in ids) file.delete()
+                    }
+                    removed.forEach(::deleteGalleryExports)
+                } finally {
+                    galleryWork.decrementAndGet()
+                    notifyListeners()
                 }
             }
-            saveLocked()
         }
-        notifyListeners()
+    }
+
+    /** 清空某个已完成/未完成任务在下载目录下的关联媒体文件但保留任务（暂未用）。 */
+    fun computeDownloadProgress(bytesDone: Long, bytesTotal: Long): Float =
+        if (bytesTotal > 0L) (bytesDone.toFloat() / bytesTotal).coerceIn(0f, 1f) else 0f
+
+    /** 计算本软件真实物理磁盘占用与设备空间拆分（不含系统其它应用）。 */
+    fun measureStorageBreakdown(context: Context): StorageBreakdown {
+        init(context)
+        val app = context.applicationContext
+        val (total, used, free) = try {
+            val dir = Environment.getDataDirectory()
+            val stat = android.os.StatFs(dir.path)
+            val block = stat.blockSizeLong
+            val t = stat.blockCountLong * block
+            val f = stat.availableBlocksLong * block
+            Triple(t, (t - f).coerceAtLeast(0L), f)
+        } catch (_: Throwable) {
+            Triple(0L, 0L, 0L)
+        }
+        val dlDir = downloadDir
+        refreshTaskDiskBytesMap()
+        val downloadsBytes = computeDirectoryBytes(dlDir)
+        val dataBytes = computeDirectoryBytes(File(app.applicationInfo.dataDir))
+        val cacheBytes = computeDirectoryBytes(app.externalCacheDir)
+        val extFilesBytes = computeDirectoryBytes(app.getExternalFilesDir(null))
+        val apkBytes = listOfNotNull(app.applicationInfo.sourceDir)
+            .plus(app.applicationInfo.splitSourceDirs?.toList() ?: emptyList())
+            .filter { it.isNotBlank() }
+            .sumOf { p -> File(p).takeIf { it.exists() }?.length() ?: 0L }
+        val rawAppTotal = (dataBytes + cacheBytes + extFilesBytes + apkBytes).coerceAtLeast(downloadsBytes)
+        val appOtherBytes = (rawAppTotal - downloadsBytes).coerceAtLeast(0L)
+        val otherUsedBytes = (used - rawAppTotal).coerceAtLeast(0L)
+        return StorageBreakdown(
+            deviceTotalBytes = total,
+            deviceFreeBytes = free,
+            deviceUsedBytes = used,
+            downloadsBytes = downloadsBytes,
+            appOtherBytes = appOtherBytes,
+            appTotalBytes = rawAppTotal,
+            otherUsedBytes = otherUsedBytes
+        )
+    }
+
+    private fun computeDirectoryBytes(dir: File?): Long {
+        if (dir == null || !dir.exists()) return 0L
+        return runCatching {
+            dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+        }.getOrDefault(0L)
+    }
+
+    /** 后台单次聚合扫描下载目录（taskId -> 实际磁盘字节），避免主线程逐卡 listFiles。 */
+    @Volatile
+    private var cachedTaskDiskMap: Map<Long, Long> = emptyMap()
+
+    fun refreshTaskDiskBytesMap(): Map<Long, Long> {
+        val dir = downloadDir
+        if (dir == null || !dir.exists()) {
+            cachedTaskDiskMap = emptyMap()
+            return emptyMap()
+        }
+        val map = HashMap<Long, Long>()
+        dir.listFiles()?.forEach { file ->
+            if (!file.isFile) return@forEach
+            val id = file.name.substringBefore('_').removeSuffix(".mpd").toLongOrNull() ?: return@forEach
+            map[id] = (map[id] ?: 0L) + file.length()
+        }
+        cachedTaskDiskMap = map
+        return map
+    }
+
+    /** 读取单任务实际磁盘占用（O(1) 命中后台聚合缓存，零主线程目录遍历）。 */
+    fun taskDiskBytes(task: Task): Long {
+        cachedTaskDiskMap[task.id]?.takeIf { it > 0L }?.let { return it }
+        return when {
+            task.bytesTotal > 0L && task.state == STATE_COMPLETED -> task.bytesTotal
+            task.bytesDone > 0L -> task.bytesDone
+            else -> 0L
+        }
+    }
+
+    /** 判断某批已完成任务所属合集/排序。 */
+    fun sortEpisodes(episodes: List<UgcEpisode>, order: SeasonSortOrder): List<UgcEpisode> = when (order) {
+        SeasonSortOrder.DEFAULT -> episodes
+        SeasonSortOrder.OLDEST_FIRST -> episodes.withIndex()
+            .sortedWith(
+                compareBy<IndexedValue<UgcEpisode>> {
+                    if (it.value.publishedAt > 0L) it.value.publishedAt else Long.MAX_VALUE
+                }.thenBy { it.index }
+            ).map { it.value }
+        SeasonSortOrder.NEWEST_FIRST -> episodes.withIndex()
+            .sortedWith(
+                compareByDescending<IndexedValue<UgcEpisode>> {
+                    if (it.value.publishedAt > 0L) it.value.publishedAt else Long.MIN_VALUE
+                }.thenBy { it.index }
+            ).map { it.value }
+    }
+
+    /** 本地已下载合集内分集排序。 */
+    fun sortTasks(tasks: List<Task>, order: SeasonSortOrder): List<Task> = when (order) {
+        SeasonSortOrder.DEFAULT -> tasks.sortedWith(
+            compareBy<Task> { if (it.episodeNo > 0) it.episodeNo else Int.MAX_VALUE }
+                .thenBy { it.createdAt }
+        )
+        SeasonSortOrder.OLDEST_FIRST -> tasks.sortedWith(
+            compareBy<Task> {
+                val ts = if (it.publishedAt > 0L) it.publishedAt else it.createdAt / 1000L
+                ts
+            }.thenBy { if (it.episodeNo > 0) it.episodeNo else Int.MAX_VALUE }
+        )
+        SeasonSortOrder.NEWEST_FIRST -> tasks.sortedWith(
+            compareByDescending<Task> {
+                val ts = if (it.publishedAt > 0L) it.publishedAt else it.createdAt / 1000L
+                ts
+            }.thenBy { if (it.episodeNo > 0) it.episodeNo else Int.MAX_VALUE }
+        )
+    }
+
+    /** 离线合集下一集调度（支持顺序播放、随机播放、列表循环、单集循环）。 */
+    fun resolveNextPlayableTaskId(
+        playlist: List<Task>,
+        currentTaskId: Long,
+        mode: LocalPlayMode,
+        randomIndexProvider: (Int) -> Int = { size -> kotlin.random.Random.nextInt(size) }
+    ): Long? {
+        if (playlist.isEmpty()) return null
+        val curIdx = playlist.indexOfFirst { it.id == currentTaskId }
+        if (curIdx < 0) return playlist.first().id
+        return when (mode) {
+            LocalPlayMode.SINGLE_LOOP -> playlist[curIdx].id
+            LocalPlayMode.SEASON_SEQUENCE -> playlist.getOrNull(curIdx + 1)?.id
+            LocalPlayMode.LIST_LOOP -> playlist[(curIdx + 1) % playlist.size].id
+            LocalPlayMode.SHUFFLE -> {
+                if (playlist.size == 1) playlist[0].id
+                else {
+                    val candidates = playlist.filter { it.id != currentTaskId }
+                    val pick = randomIndexProvider(candidates.size).coerceIn(0, candidates.lastIndex)
+                    candidates[pick].id
+                }
+            }
+        }
+    }
+
+    /** 离线合集上一集调度（单集循环/顺序/列表循环退回上一集，随机也优先历史/上一项）。 */
+    fun resolvePrevPlayableTaskId(
+        playlist: List<Task>,
+        currentTaskId: Long,
+        mode: LocalPlayMode
+    ): Long? {
+        if (playlist.isEmpty()) return null
+        val curIdx = playlist.indexOfFirst { it.id == currentTaskId }
+        if (curIdx < 0) return playlist.first().id
+        return when (mode) {
+            LocalPlayMode.SINGLE_LOOP -> playlist[curIdx].id
+            LocalPlayMode.SEASON_SEQUENCE -> if (curIdx > 0) playlist[curIdx - 1].id else null
+            LocalPlayMode.LIST_LOOP, LocalPlayMode.SHUFFLE ->
+                playlist[(curIdx - 1 + playlist.size) % playlist.size].id
+        }
+    }
+
+    /** 查询指定任务同一合集+同类型的全部任务（用于离线播放页合集列表）。 */
+    fun siblingTasksForPlayback(task: Task): List<Task> {
+        if (task.groupId.isBlank()) return emptyList()
+        val snap = snapshot()
+        return sortTasks(
+            snap.filter { it.groupId == task.groupId && it.type == task.type && it.playable() },
+            SeasonSortOrder.DEFAULT
+        )
+    }
+
+    /** 音乐播放器的随机下一曲解析：仅在多首时尽量避开当前曲目。 */
+    fun mergeAudioPlaylist(currentIds: List<Long>, addedIds: List<Long>): List<Long> {
+        val result = ArrayList<Long>(currentIds.size + addedIds.size)
+        val seen = HashSet<Long>()
+        for (id in currentIds) {
+            if (id > 0L && seen.add(id)) result.add(id)
+        }
+        for (id in addedIds) {
+            if (id > 0L && seen.add(id)) result.add(id)
+        }
+        return result
+    }
+
+    /** 基于任务 ID 列表过滤当前仍存在且可播的纯音频任务，并保持有序去重。 */
+    fun resolveSavedAudioPlaylist(savedIds: List<Long>, allTasks: List<Task>): List<Task> {
+        val byId = allTasks.associateBy { it.id }
+        val result = ArrayList<Task>(savedIds.size)
+        val seen = HashSet<Long>()
+        for (id in savedIds) {
+            if (!seen.add(id)) continue
+            val t = byId[id] ?: continue
+            if (t.type == TYPE_AUDIO && t.playable()) result.add(t)
+        }
+        return result
     }
 
     // ── 内部：队列调度 ──────────────────────────────────────────
@@ -449,42 +724,41 @@ object DownloadManager {
 
     private fun workerLoop() {
         while (true) {
-            val next = nextTaskId()
-            if (next == null) {
-                synchronized(lock) {
-                    try { lock.wait(1500L) } catch (_: InterruptedException) { }
+            val task = synchronized(lock) {
+                var next = claimTaskLocked()
+                while (next == null) {
+                    lock.wait()
+                    next = claimTaskLocked()
                 }
-                continue
+                next
             }
-            val t = task(next) ?: continue
-            var skip = false
-            synchronized(t) {
-                if (t.state != STATE_QUEUED || t.running) {
-                    skip = true
-                } else {
-                    t.state = STATE_RUNNING
-                    t.running = true
-                    t.cancelRequested = false
-                }
-            }
-            if (skip) continue
-            notifyListeners()
             try {
-                execute(t)
-            } catch (_: Throwable) {
+                notifyListeners()
+                execute(task)
+            } finally {
+                synchronized(lock) {
+                    task.running = false
+                    if (task.state != STATE_QUEUED) queue.remove(task.id)
+                    if (queue.isNotEmpty()) lock.notifyAll()
+                    if (tasks[task.id] !== task) cleanRemovedTasks(listOf(task))
+                }
+                notifyListeners()
             }
-            synchronized(t) {
-                t.running = false
-                t.cancelRequested = false
-            }
-            notifyListeners()
         }
     }
 
-    private fun nextTaskId(): Long? {
+    private fun claimTaskLocked(): Task? {
         for (id in queue) {
-            val t = task(id) ?: continue
-            if (t.state == STATE_QUEUED && !t.running) return id
+            val task = tasks[id] ?: continue
+            synchronized(task) {
+                if (task.state == STATE_QUEUED && !task.running) {
+                    task.cancelRequested = false
+                    task.resetSpeed()
+                    task.running = true
+                    task.state = STATE_RUNNING
+                    return task
+                }
+            }
         }
         return null
     }
@@ -504,7 +778,7 @@ object DownloadManager {
             synchronized(t) {
                 if (t.state == STATE_RUNNING) t.state = STATE_PAUSED
             }
-            t.resumeOffset = mediaOffsetOf(t)
+            t.resetSpeed()
             t.cancelRequested = false
             save()
             notifyListeners()
@@ -524,7 +798,7 @@ object DownloadManager {
         save(); notifyListeners()
         downloadFullResume(listOf(url), out, t) { done ->
             t.bytesDone = done
-            t.speedBytes = SpeedCounter.tick(t.bytesDone)
+            t.sampleSpeed()
             if (t.bytesTotal > 0L) maybeNotify()
         }
         t.bytesDone = out.length()
@@ -543,7 +817,7 @@ object DownloadManager {
         save(); notifyListeners()
         downloadFullResume(listOf(url), out, t) { done ->
             t.bytesDone = done
-            t.speedBytes = SpeedCounter.tick(t.bytesDone)
+            t.sampleSpeed()
             if (t.bytesTotal > 0L) maybeNotify()
         }
         t.bytesDone = out.length()
@@ -552,11 +826,21 @@ object DownloadManager {
     }
 
     private fun runAudio(t: Task, dir: File) {
+        // 第一步：封面（失败不阻塞音频本体，用于下载管理与本地播放器封面展示）
+        if (t.coverPath.isBlank() && t.coverUrl.isNotBlank()) {
+            runCatching {
+                val ext = t.coverUrl.substringAfterLast('.', "jpg").substringBefore('?')
+                    .takeIf { it.length in 2..5 } ?: "jpg"
+                val cover = File(dir, "${t.id}_cover.$ext")
+                downloadFullQuiet(t.coverUrl, cover)
+                t.coverPath = cover.absolutePath
+            }
+        }
         checkNotCancelled(t)
         t.qualityLabel = "仅音频"
         save(); notifyListeners()
         // 防下错：cid 缺失时 B 站播放接口会返回该 bvid 默认分集（主视频）的流，导致合集分集音频静默下错
-        if (t.cid <= 0L && t.bvid.isNotBlank()) {
+        if (t.cid <= 0L || t.bvid.isBlank()) {
             fail(t, "音频任务缺少分集标识，请删除后重新添加")
             return
         }
@@ -571,7 +855,7 @@ object DownloadManager {
         save(); notifyListeners()
         downloadFullResume(listOf(audio.url) + audio.backups, out, t) { done ->
             t.bytesDone = done
-            t.speedBytes = SpeedCounter.tick(t.bytesDone)
+            t.sampleSpeed()
             maybeNotify()
         }
         t.bytesDone = out.length()
@@ -620,7 +904,7 @@ object DownloadManager {
                 downloadFullResume(urls, segFile, t, base = segDone) { done ->
                     // done 已含 base（前序分片字节），即累计已下载字节
                     t.bytesDone = done
-                    t.speedBytes = SpeedCounter.tick(t.bytesDone)
+                    t.sampleSpeed()
                     maybeNotify()
                 }
                 segDone += segFile.length()
@@ -647,7 +931,7 @@ object DownloadManager {
         save(); notifyListeners()
         downloadFullResume(listOf(video.url) + video.backups, videoFile, t) { done ->
             t.bytesDone = done
-            t.speedBytes = SpeedCounter.tick(t.bytesDone)
+            t.sampleSpeed()
             maybeNotify()
         }
 
@@ -656,7 +940,7 @@ object DownloadManager {
             downloadFullResume(listOf(audio.url) + audio.backups, audioFile, t, base = videoDone) { done ->
                 // done 已含 base（视频轨字节），即累计已下载字节
                 t.bytesDone = done
-                t.speedBytes = SpeedCounter.tick(t.bytesDone)
+                t.sampleSpeed()
                 maybeNotify()
             }
         }
@@ -703,13 +987,25 @@ object DownloadManager {
         var result: BiliPlayUrl.DashStream? = null
         var err: String? = null
         val quality = if (t.type == TYPE_AUDIO) BiliPlayUrl.QUALITY_720 else t.quality
-        BiliPlayUrl.fetchPlayUrl(t.bvid, t.cid, quality) { stream, error ->
+        if (t.bvid.isBlank() || t.cid <= 0L) {
+            fail(t, "任务缺少分集标识，请删除后重新添加")
+            return null
+        }
+        val request = BiliPlayUrl.fetchPlayUrl(t.bvid, t.cid, quality, forDownload = true) { stream, error ->
             result = stream
             err = error
             latch.countDown()
         }
-        val finished = try { latch.await(25L, java.util.concurrent.TimeUnit.SECONDS) } catch (_: InterruptedException) { false }
-        if (!finished) { fail(t, "获取视频流超时"); return null }
+        val limit = SystemClock.elapsedRealtime() + 30_000L
+        while (!latch.await(300L, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+            if (t.cancelRequested || SystemClock.elapsedRealtime() >= limit) {
+                request.cancel()
+                checkNotCancelled(t)
+                fail(t, "获取视频流超时")
+                return null
+            }
+        }
+        checkNotCancelled(t)
         if (result == null) { fail(t, err ?: "获取视频流失败"); return null }
         return result
     }
@@ -736,146 +1032,10 @@ object DownloadManager {
         else -> 3
     }
 
-    // ── 内部：区间下载 ──────────────────────────────────────────
-
-    private class RangeParts(val initStart: Long, val initEnd: Long, val indexStart: Long, val indexEnd: Long) {
-        val mediaStart: Long get() = initEnd + 1
-        val mediaEnd: Long get() = indexStart - 1
-        val total: Long get() = indexEnd + 1
-        val initLen: Long get() = initEnd - initStart + 1
-        val indexLen: Long get() = indexEnd - indexStart + 1
-        val mediaLen: Long get() = (mediaEnd - mediaStart + 1).coerceAtLeast(0L)
-    }
-
-    private fun rangeParts(initRange: String, indexRange: String): RangeParts {
-        fun parse(range: String): Pair<Long, Long> {
-            val s = range.substringBefore('-').trim().toLongOrNull() ?: 0L
-            val e = range.substringAfter('-', "").trim().toLongOrNull() ?: s
-            return s to e
-        }
-        val (is0, ie0) = parse(initRange)
-        val (xs, xe) = parse(indexRange)
-        // B 站 m4s：init 从 0 开始；若服务端给出的 init 起点不是 0，则整体按相对值处理
-        val shift = is0
-        return RangeParts(0L, ie0 - shift, xs - shift, xe - shift)
-    }
-
     private class CancelledException : Exception()
 
     private fun checkNotCancelled(t: Task) {
         if (t.cancelRequested) throw CancelledException()
-    }
-
-    /** 按三段（init / media / index）顺序写入，天然还原原文件布局；媒体段支持断点续传。 */
-    private fun downloadDashParts(
-        url: String,
-        backups: List<String>,
-        parts: RangeParts,
-        out: File,
-        t: Task
-    ) {
-        val urls = (listOf(url) + backups).filter { it.isNotBlank() }
-        if (urls.isEmpty()) { fail(t, "下载地址为空"); return }
-
-        // 文件已完整（如上次中断在音频轨、视频轨已完成）：整段跳过，避免重写 init 截断损坏
-        if (out.exists() && out.length() >= parts.total) {
-            t.resumeOffset = parts.mediaLen
-            t.bytesDone = (t.bytesDone).coerceAtLeast(parts.total)
-            return
-        }
-
-        val mediaOffset = t.resumeOffset.coerceIn(0L, parts.mediaLen)
-        // init + index 每次都重下（很小），媒体段从断点继续
-
-        // init
-        checkNotCancelled(t)
-        writeRange(urls, parts.initStart, parts.initEnd, out, append = false, t) { done ->
-            t.bytesDone = parts.initLen + parts.indexLen + mediaOffset + done
-            t.speedBytes = SpeedCounter.tick(t.bytesDone)
-            maybeNotify()
-        }
-        // media（断点续传）
-        if (mediaOffset < parts.mediaLen) {
-            checkNotCancelled(t)
-            val start = parts.mediaStart + mediaOffset
-            writeRange(urls, start, parts.mediaEnd, out, append = true, t) { done ->
-                t.bytesDone = parts.initLen + parts.indexLen + mediaOffset + done
-                t.speedBytes = SpeedCounter.tick(t.bytesDone)
-                maybeNotify()
-            }
-            t.resumeOffset = parts.mediaLen
-        }
-        // index
-        checkNotCancelled(t)
-        writeRange(urls, parts.indexStart, parts.indexEnd, out, append = true, t) { done ->
-            t.bytesDone = parts.initLen + parts.indexLen + parts.mediaLen + done
-            t.speedBytes = SpeedCounter.tick(t.bytesDone)
-            maybeNotify()
-        }
-    }
-
-    private fun writeRange(
-        urls: List<String>,
-        start: Long,
-        end: Long,
-        out: File,
-        append: Boolean,
-        t: Task,
-        onProgress: (Long) -> Unit
-    ) {
-        var lastError: Exception? = null
-        for (url in urls) {
-            try {
-                val connection = open(url, start, end)
-                try {
-                    val code = connection.responseCode
-                    requireMediaStream(connection, code)
-                    val stream = connection.inputStream
-                    val fos = FileOutputStream(out, append)
-                    try {
-                        val expected = (end - start + 1).coerceAtLeast(0L)
-                        var written = 0L
-                        val buf = ByteArray(256 * 1024)
-                        while (written < expected) {
-                            checkNotCancelled(t)
-                            val n = stream.read(buf)
-                            if (n < 0) break
-                            if (n > 0) {
-                                fos.write(buf, 0, n)
-                                written += n
-                                if (written % (4 * 1024 * 1024) == 0L) onProgress(written)
-                            }
-                        }
-                        fos.flush()
-                        // 媒体段被截断（如 CDN 返回了错误页/半截流）时必须视为失败并切换备用节点
-                        if (written < expected) {
-                            throw IllegalStateException("响应被截断（$written/$expected 字节）")
-                        }
-                        onProgress(written)
-                        return
-                    } finally {
-                        fos.close()
-                    }
-                } finally {
-                    connection.disconnect()
-                }
-            } catch (c: CancelledException) {
-                throw c
-            } catch (e: Exception) {
-                lastError = e
-            }
-        }
-        throw lastError ?: IllegalStateException("无可用下载地址")
-    }
-
-    /** 整体下载（封面 / 无区间流的兜底 / 单文件流）。 */
-    private fun downloadFull(url: String, out: File, t: Task) {
-        downloadFullQuiet(url, out) { done ->
-            t.bytesDone = done
-            t.speedBytes = SpeedCounter.tick(t.bytesDone)
-            if (t.bytesTotal > 0L) maybeNotify()
-        }
-        checkNotCancelled(t)
     }
 
     /**
@@ -912,6 +1072,16 @@ object DownloadManager {
         }
     }
 
+    // 长媒体流必须显式清除从 BiliHttp.client 继承的 28 秒整次 callTimeout，
+    // 否则大视频持续下载到 28 秒会被 OkHttp 强行中断；仅保留 connect/read 超时 + 暂停真实 Call 取消。
+    private val downloadClient: OkHttpClient = BiliHttp.client.newBuilder()
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .callTimeout(0, TimeUnit.MILLISECONDS)
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
+
     private fun downloadFullResume(
         urls: List<String>,
         out: File,
@@ -921,26 +1091,60 @@ object DownloadManager {
         onProgress: ((Long) -> Unit)? = null
     ) {
         var lastError: Exception? = null
+        val anonCookie = BiliPlayUrl.buvidCookie()
         for (u in urls.filter { it.isNotBlank() }) {
             try {
                 discardCorruptedPart(out)
                 val start = if (out.exists()) out.length() else 0L
-                val connection = open(u, start, null)
-                try {
-                    val code = connection.responseCode
-                    requireMediaStream(connection, code)
-                    val append = code == 206 && start > 0L
-                    val stream = connection.inputStream
-                    val total = connection.contentLengthLong
-                    if (total >= 0L) {
-                        // 206 = 断点续传（总大小 = 已下载 + 本次内容）；200 = 从头下载（即完整大小）
-                        val full = if (append) start + total else total
-                        val absolute = base + full
-                        if (absolute > 0L && absolute != t.bytesTotal) {
+                executeMediaGet(u, start, null, anonCookie, task = t).use { response ->
+                    val code = response.code
+                    if (code == 416 && start > 0L) {
+                        val rangeSpec = MediaTransportPolicy.parseContentRange(response.header("Content-Range"))
+                        if (rangeSpec != null && rangeSpec.isUnsatisfiable && rangeSpec.total == start) {
+                            val absolute = base + start
+                            if (absolute > 0L && absolute != t.bytesTotal) {
+                                t.bytesTotal = absolute
+                                save(); notifyListeners()
+                            }
+                            onProgress?.invoke(absolute)
+                            return
+                        }
+                        out.delete()
+                        throw IllegalStateException("续传偏移越界（HTTP 416），已重置分片")
+                    }
+                    requireMediaResponse(response, code)
+                    val body = response.body ?: throw IOException("媒体响应体为空")
+                    val append = if (code == 206 && start > 0L) {
+                        val contentRange = MediaTransportPolicy.parseContentRange(response.header("Content-Range"))
+                            ?: throw IllegalStateException("206 续传缺少合法 Content-Range")
+                        if (!contentRange.isSatisfiableRange || contentRange.start != start) {
+                            throw IllegalStateException("206 续传偏移不匹配（期待 $start，实际 ${contentRange.start}）")
+                        }
+                        if (contentRange.total != null && contentRange.total < start) {
+                            throw IllegalStateException("206 总长度小于本地已写偏移")
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                    val contentRange = if (append) {
+                        MediaTransportPolicy.parseContentRange(response.header("Content-Range"))
+                    } else null
+                    val bodyLength = body.contentLength()
+                    val fullLength = when {
+                        append && contentRange?.total != null -> contentRange.total
+                        append && bodyLength >= 0L -> start + bodyLength
+                        !append && bodyLength >= 0L -> bodyLength
+                        else -> -1L
+                    }
+                    if (fullLength > 0L) {
+                        val absolute = base + fullLength
+                        if (absolute != t.bytesTotal) {
                             t.bytesTotal = absolute
                             save(); notifyListeners()
                         }
                     }
+                    val stream = body.byteStream()
                     val fos = FileOutputStream(out, append)
                     try {
                         val buf = ByteArray(256 * 1024)
@@ -952,23 +1156,20 @@ object DownloadManager {
                             if (n > 0) {
                                 fos.write(buf, 0, n)
                                 written += n
-                                // 进度回调传「base + 断点前字节 + 本次写入」= 累计已下载字节，
-                                // 暂停/中断后恢复时进度从断点继续，而不是从 0 重新开始
-                                // （200 覆盖从头下载时 written 本身就是累计，无需加 start）
                                 onProgress?.invoke(if (append) base + start + written else base + written)
                             }
                         }
                         fos.flush()
-                        // 服务端声明了长度但实际没有收满（错误页/半截流）→ 失败并换节点
-                        if (total >= 0L && written < total) {
-                            throw IllegalStateException("响应被截断（$written/$total 字节）")
+                        if (bodyLength >= 0L && written < bodyLength) {
+                            throw IllegalStateException("响应被截断（$written/$bodyLength 字节）")
+                        }
+                        if (append && contentRange?.total != null && start + written != contentRange.total) {
+                            throw IllegalStateException("续传总字节不一致（${start + written}/${contentRange.total}）")
                         }
                         return
                     } finally {
                         fos.close()
                     }
-                } finally {
-                    connection.disconnect()
                 }
             } catch (c: CancelledException) {
                 throw c
@@ -981,12 +1182,13 @@ object DownloadManager {
 
     private fun downloadFullQuiet(url: String, out: File, onProgress: ((Long) -> Unit)? = null) {
         discardCorruptedPart(out)
-        val connection = open(url, null, null)
-        try {
-            val code = connection.responseCode
-            requireMediaStream(connection, code)
-            val total = connection.contentLengthLong
-            val input = connection.inputStream
+        val anonCookie = BiliPlayUrl.buvidCookie()
+        executeMediaGet(url, null, null, anonCookie).use { response ->
+            val code = response.code
+            requireMediaResponse(response, code)
+            val body = response.body ?: throw IOException("媒体响应体为空")
+            val total = body.contentLength()
+            val input = body.byteStream()
             val fos = FileOutputStream(out)
             try {
                 val buf = ByteArray(256 * 1024)
@@ -1007,92 +1209,80 @@ object DownloadManager {
             } finally {
                 fos.close()
             }
-        } finally {
-            connection.disconnect()
         }
+    }
+
+    private fun executeMediaGet(
+        url: String,
+        start: Long?,
+        end: Long?,
+        anonymousCookie: String,
+        task: Task? = null
+    ): Response {
+        val range = if (start != null) {
+            if (end != null) "bytes=$start-$end" else "bytes=$start-"
+        } else {
+            null
+        }
+        return MediaTransportPolicy.executeWithSafeRedirects(
+            client = downloadClient,
+            initialUrl = url,
+            anonymousCookie = anonymousCookie,
+            rangeHeader = range,
+            onCallCreated = { call ->
+                if (task != null) {
+                    task.activeCall = call
+                    if (task.cancelRequested) call.cancel()
+                }
+            }
+        )
     }
 
     /**
      * 校验媒体响应：非 2xx（403/416/503 等）或返回 HTML/JSON 错误页时直接抛异常，
      * 由上层切换到备用 CDN 节点。这是「下载到十几 KB 假完成」问题的关键防线。
      */
-    private fun requireMediaStream(connection: HttpURLConnection, code: Int) {
+    private fun requireMediaResponse(response: Response, code: Int) {
         if (code !in 200..299) {
             throw IllegalStateException("媒体服务器响应异常（HTTP $code）")
         }
-        val type = connection.contentType?.substringBefore(';')?.trim()?.lowercase(Locale.US).orEmpty()
+        val type = response.header("Content-Type")
+            ?.substringBefore(';')
+            ?.trim()
+            ?.lowercase(Locale.US)
+            .orEmpty()
         if (type.contains("text/html") || type.contains("application/json") || type.contains("text/plain")) {
             throw IllegalStateException("媒体服务器返回了非媒体内容（HTTP $code）")
         }
     }
 
-    private fun open(url: String, start: Long?, end: Long?): HttpURLConnection {
-        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 12_000
-            readTimeout = 30_000
-            requestMethod = "GET"
-            setRequestProperty("User-Agent", CDN_USER_AGENT)
-            setRequestProperty("Referer", "https://www.bilibili.com/")
-            setRequestProperty("Origin", "https://www.bilibili.com")
-            setRequestProperty("Accept", "*/*")
-            // CDN 需要与 playurl 一致的 PC 平台签名校验：带上 buvid3 + 登录 Cookie
-            // （BiliTools 同款做法：全程 PC UA + 完整 Cookie，实测 CDN 200）
-            val cdnCookie = buildString {
-                val buvid = BiliPlayUrl.buvidCookie()
-                val session = BiliSessionStore.cookie()
-                if (buvid.isNotBlank()) append(buvid)
-                if (session.isNotBlank()) {
-                    if (isNotEmpty()) append("; ")
-                    append(session)
-                }
-            }
-            if (cdnCookie.isNotBlank()) setRequestProperty("Cookie", cdnCookie)
-            if (start != null) {
-                setRequestProperty("Range", if (end != null) "bytes=$start-$end" else "bytes=$start-")
-            }
-            instanceFollowRedirects = true
-        }
-        return connection
-    }
-
-    private object SpeedCounter {
-        @Volatile var lastMark = 0L
-        @Volatile var lastBytes = 0L
-        @Volatile var speed = 0L
-        @Synchronized fun tick(bytes: Long): Long {
-            val now = System.currentTimeMillis()
-            if (lastMark == 0L) { lastMark = now; lastBytes = bytes; speed = 0L; return speed }
-            val dt = (now - lastMark).coerceAtLeast(1L)
-            if (dt >= 1000L) {
-                speed = ((bytes - lastBytes) * 1000L / dt).coerceAtLeast(0L)
-                lastMark = now
-                lastBytes = bytes
-            }
-            return speed
-        }
-        @Synchronized fun reset() { lastMark = 0L; lastBytes = 0L; speed = 0L }
-    }
-
-    private fun mediaOffsetOf(t: Task): Long = t.resumeOffset
-
     // ── 内部：状态落库 ──────────────────────────────────────────
 
     private fun complete(t: Task) {
         synchronized(t) {
-            if (t.state == STATE_RUNNING) {
-                t.state = STATE_COMPLETED
-                t.finishedAt = System.currentTimeMillis()
-                t.error = ""
-                t.resumeOffset = 0L
+            checkNotCancelled(t)
+            if (t.state != STATE_RUNNING) return
+            t.state = STATE_COMPLETED
+            t.finishedAt = System.currentTimeMillis()
+            t.error = ""
+            t.resumeOffset = 0L
+        }
+        t.resetSpeed()
+        save()
+        if (t.type == TYPE_VIDEO) scheduleGalleryWork { exportToGallery(t) }
+        notifyListeners()
+    }
+
+    private fun scheduleGalleryWork(work: () -> Unit) {
+        galleryWork.incrementAndGet()
+        galleryIo.execute {
+            try {
+                work()
+            } finally {
+                galleryWork.decrementAndGet()
+                notifyListeners()
             }
         }
-        SpeedCounter.reset()
-        save()
-        notifyListeners()
-        // 完成后再把产物导出到公共媒体库，让系统相册/文件管理器可见。
-        // 私有目录(Android/data/...)不会被媒体扫描，导出失败不影响下载结果。
-        // 异步执行：mp4 合并是重 IO，阻塞下载 worker 会让后续任务看起来「卡住」。
-        galleryIo.execute { exportToGallery(t) }
     }
 
     private fun fail(t: Task, message: String) {
@@ -1103,7 +1293,7 @@ object DownloadManager {
                 t.finishedAt = System.currentTimeMillis()
             }
         }
-        SpeedCounter.reset()
+        t.resetSpeed()
         save()
         notifyListeners()
     }
@@ -1126,8 +1316,7 @@ object DownloadManager {
         if (t.type == TYPE_COVER && t.coverPath.isNotBlank()) {
             val cover = File(t.coverPath)
             if (cover.exists() && cover.length() > 0L) {
-                exportToMediaStore(ctx, cover, "Pictures/YuiBili", t.title, false)
-                recordGalleryExport(t, "Pictures/YuiBili", t.title, cover.extension)
+                exportToMediaStore(ctx, t, cover, "Pictures/YuiBili", false)
             }
         }
         if (t.type == TYPE_AUDIO || t.type == TYPE_COVER || t.type == TYPE_COMMENT) return
@@ -1139,50 +1328,33 @@ object DownloadManager {
             val a = File(dir, "${t.id}_audio.m4s")
             if (v.exists() && v.length() > 0L) {
                 val merged = File(dir, "${t.id}_merged.mp4")
-                if (mergeDashToMp4(v, if (a.exists() && a.length() > 0L) a else null, merged) &&
-                    merged.exists() && merged.length() > 0L) {
-                    // 合并耗时较长，期间任务可能已被删除：不再导出，避免相册残留副本
-                    if (synchronized(lock) { !tasks.containsKey(t.id) }) {
-                        runCatching { merged.delete() }
-                        return
+                try {
+                    if (mergeDashToMp4(v, a.takeIf { it.length() > 0L }, merged)) {
+                        exportToMediaStore(ctx, t, merged, "Movies/YuiBili", true)
                     }
-                    exportToMediaStore(ctx, merged, "Movies/YuiBili", t.title, true)
-                    recordGalleryExport(t, "Movies/YuiBili", t.title, "mp4")
-                    runCatching { merged.delete() }
+                } finally {
+                    merged.delete()
                 }
             }
         } else {
             // 单文件 / 分段流：整段 mp4 直接导出
             val single = t.singlePaths.firstOrNull { it.endsWith(".mp4") && File(it).exists() }
             if (single != null) {
-                if (synchronized(lock) { !tasks.containsKey(t.id) }) return
-                exportToMediaStore(ctx, File(single), "Movies/YuiBili", t.title, true)
-                recordGalleryExport(t, "Movies/YuiBili", t.title, "mp4")
+                exportToMediaStore(ctx, t, File(single), "Movies/YuiBili", true)
             }
         }
     }
 
-    /** 记录一次相册导出，删除任务时据此清理公共媒体库副本。 */
-    private fun recordGalleryExport(t: Task, relativeDir: String, title: String, ext: String) {
-        val display = sanitizeFileName(title.ifBlank { "video" }) + ".${ext.lowercase(Locale.ROOT)}"
-        synchronized(t) {
-            val entry = "$relativeDir|$display"
-            if (entry !in t.galleryExports) t.galleryExports.add(entry)
-        }
-        save()
-    }
-
-    /** 把本地文件写入公共媒体库；文件名按任务标题命名，重名时系统自动加序号。 */
-    private fun exportToMediaStore(ctx: Context, src: File, relativeDir: String, title: String, isVideo: Boolean) {
-        runCatching {
-            if (!src.exists() || src.length() == 0L) return
+    private fun exportToMediaStore(ctx: Context, task: Task, src: File, relativeDir: String, isVideo: Boolean) {
+        if (task.cancelRequested || src.length() == 0L) return
+        try {
             val ext = src.extension.lowercase(Locale.ROOT).ifBlank { if (isVideo) "mp4" else "jpg" }
             val mime = if (isVideo) {
                 "video/mp4"
             } else {
                 MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "image/jpeg"
             }
-            val display = sanitizeFileName(title.ifBlank { src.nameWithoutExtension }) + ".$ext"
+            val display = sanitizeFileName(task.title.ifBlank { src.nameWithoutExtension }) + ".$ext"
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val collection = if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI
                                  else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
@@ -1192,48 +1364,66 @@ object DownloadManager {
                     put(MediaStore.MediaColumns.RELATIVE_PATH, relativeDir)
                     put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
-                val uri = ctx.contentResolver.insert(collection, values) ?: return
-                ctx.contentResolver.openOutputStream(uri)?.use { out ->
-                    src.inputStream().use { it.copyTo(out) }
+                val resolver = ctx.contentResolver
+                val uri = resolver.insert(collection, values) ?: return
+                var published = false
+                try {
+                    val output = resolver.openOutputStream(uri) ?: return
+                    output.use { out -> src.inputStream().use { it.copyTo(out) } }
+                    if (task.cancelRequested) return
+                    values.clear()
+                    values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    published = resolver.update(uri, values, null, null) > 0
+                    if (published) task.galleryExports.addIfAbsent(uri.toString())
+                } finally {
+                    if (!published) resolver.delete(uri, null, null)
                 }
-                values.clear()
-                values.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                ctx.contentResolver.update(uri, values, null, null)
             } else {
                 val pubDir = Environment.getExternalStoragePublicDirectory(
                     if (isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES)
-                val target = File(File(pubDir, "YuiBili"), display).apply {
-                    parentFile?.mkdirs()
+                val folder = File(pubDir, "YuiBili").apply { mkdirs() }
+                val base = display.substringBeforeLast('.')
+                var target = File(folder, display)
+                var suffix = 1
+                while (true) {
+                    if (task.cancelRequested) return
+                    if (target.createNewFile()) break
+                    target = File(folder, "$base (${suffix++}).$ext")
                 }
-                src.inputStream().use { i -> target.outputStream().use { o -> i.copyTo(o) } }
-                android.media.MediaScannerConnection.scanFile(
-                    ctx, arrayOf(target.absolutePath), arrayOf(mime), null)
+                var published = false
+                try {
+                    src.inputStream().use { input -> target.outputStream().use { input.copyTo(it) } }
+                    if (task.cancelRequested) return
+                    android.media.MediaScannerConnection.scanFile(ctx, arrayOf(target.absolutePath), arrayOf(mime), null)
+                    task.galleryExports.addIfAbsent(Uri.fromFile(target).toString())
+                    published = true
+                } finally {
+                    if (!published) target.delete()
+                }
             }
+            save()
+        } catch (error: java.io.IOException) {
+            Log.w("Downloads", "Unable to export downloaded media", error)
+        } catch (error: SecurityException) {
+            Log.w("Downloads", "Export permission denied", error)
         }
     }
 
     private fun sanitizeFileName(name: String): String =
         name.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().take(80).ifBlank { "video" }
 
-    /** 删除任务时同步清理已导出到公共媒体库/相册的副本（含重名时系统自动加序号的变体）。 */
+    /** 按导出记录清理相册副本。 */
     private fun deleteGalleryExports(t: Task) {
         val ctx = appContext ?: return
-        val entries = synchronized(t) { t.galleryExports.toList() }
-        entries.forEach { entry ->
-            val sep = entry.indexOf('|')
-            if (sep <= 0) return@forEach
-            deleteMediaEntry(ctx, entry.substring(0, sep), entry.substring(sep + 1))
-        }
-        // 兜底：旧版本任务没有导出记录，按当前标题尽力清理（含 " (1)" 序号变体）
-        if (entries.isEmpty()) {
-            val base = sanitizeFileName(t.title.ifBlank { "video" })
-            if (t.coverPath.isNotBlank()) {
-                val ext = t.coverPath.substringAfterLast('.', "jpg").lowercase(Locale.ROOT)
-                    .takeIf { it.length in 2..5 } ?: "jpg"
-                deleteMediaEntry(ctx, "Pictures/YuiBili", "$base.$ext")
-            }
-            if (t.type == TYPE_VIDEO) {
-                deleteMediaEntry(ctx, "Movies/YuiBili", "$base.mp4")
+        for (entry in t.galleryExports) {
+            try {
+                when {
+                    entry.startsWith("content://media/") -> ctx.contentResolver.delete(Uri.parse(entry), null, null)
+                    entry.startsWith("file://") -> Uri.parse(entry).path?.let { File(it).delete() }
+                    '|' in entry -> deleteMediaEntry(ctx, entry.substringBefore('|'), entry.substringAfter('|'))
+                }
+            } catch (error: SecurityException) {
+                Log.w("Downloads", "Unable to delete the exported media", error)
             }
         }
     }
@@ -1276,50 +1466,7 @@ object DownloadManager {
                 File(File(pubDir, "YuiBili"), display).delete()
             }
         }
-        // 物理删除（含系统回收站 .trashed-* 变体）：仅在已授予「所有文件访问」权限时执行。
-        // 部分国产 ROM 的 MediaStore 删除只删条目、把物理文件改名 .trashed-<时间戳>-<原名> 留在原地，
-        // 没有该权限 App 无法触碰公共目录，删除后会残留可见文件。
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()) {
-            runCatching {
-                val pubDir = Environment.getExternalStoragePublicDirectory(
-                    if (relativeDir.startsWith("Movies")) Environment.DIRECTORY_MOVIES
-                    else Environment.DIRECTORY_PICTURES)
-                val parent = File(pubDir, "YuiBili")
-                val base = display.substringBeforeLast('.', display)
-                val ext = display.substringAfterLast('.', "")
-                parent.listFiles()?.forEach { f ->
-                    val n = f.name
-                    // 去掉系统回收站前缀 .trashed-<时间戳>-
-                    val stripped = n.removePrefix(".trashed-")
-                        .substringAfter('-', n.removePrefix(".trashed-"))
-                    val clean = if (n.startsWith(".trashed-")) stripped else n
-                    if (clean == display || clean == "$base.$ext" ||
-                        clean.startsWith("$base ") || clean.startsWith("$base（封面")) {
-                        runCatching { f.delete() }
-                    }
-                }
-            }
-        }
-    }
-
-    /** 删除后检查：若相册副本无法彻底删除（未授予所有文件访问权限），引导一次去授权。 */
-    private fun maybeGuideStoragePermission() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
-        val ctx = appContext ?: return
-        if (Environment.isExternalStorageManager()) return
-        val prefs = ctx.getSharedPreferences("yuibili_prefs", android.content.Context.MODE_PRIVATE)
-        if (prefs.getBoolean("storage_permission_guided", false)) return
-        prefs.edit().putBoolean("storage_permission_guided", true).apply()
-        runCatching {
-            android.widget.Toast.makeText(
-                ctx, "未授予「所有文件访问」权限，相册副本将无法彻底删除", android.widget.Toast.LENGTH_LONG
-            ).show()
-            val intent = android.content.Intent(
-                android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                android.net.Uri.parse("package:${ctx.packageName}")
-            ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-            ctx.startActivity(intent)
-        }
+        // 物理删除（旧系统公共目录或有权限时）已移除 MANAGE_EXTERNAL_STORAGE 依赖。
     }
 
     /** 用 MediaMuxer 把 DASH 的视频轨/音频轨混流成单个有声 mp4（B 站整段 m4s 是完整 MP4）。 */
@@ -1366,7 +1513,7 @@ object DownloadManager {
                     vInfo.size = ev.readSampleData(vBuf, 0)
                     if (vInfo.size < 0) { vPending = false } else {
                         vInfo.presentationTimeUs = ev.sampleTime
-                        vInfo.flags = ev.sampleFlags
+                        vInfo.flags = muxSampleFlags(ev.sampleFlags)
                         mux.writeSampleData(mv, vBuf, vInfo)
                         ev.advance()
                     }
@@ -1375,7 +1522,7 @@ object DownloadManager {
                     aInfo.size = ea!!.readSampleData(aBuf, 0)
                     if (aInfo.size < 0) { aPending = false } else {
                         aInfo.presentationTimeUs = ea!!.sampleTime
-                        aInfo.flags = ea!!.sampleFlags
+                        aInfo.flags = muxSampleFlags(ea!!.sampleFlags)
                         mux.writeSampleData(ma, aBuf, aInfo)
                         ea!!.advance()
                     }
@@ -1394,18 +1541,25 @@ object DownloadManager {
         }
     }
 
-    private fun maybeNotify() {
-        val now = System.currentTimeMillis()
-        if (now - lastNotifyAt >= 250L) {
-            lastNotifyAt = now
-            notifyListeners()
+    private fun muxSampleFlags(extractorFlags: Int): Int {
+        var flags = 0
+        if ((extractorFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+            flags = flags or MediaCodec.BUFFER_FLAG_KEY_FRAME
         }
+        if ((extractorFlags and MediaExtractor.SAMPLE_FLAG_PARTIAL_FRAME) != 0) {
+            flags = flags or MediaCodec.BUFFER_FLAG_PARTIAL_FRAME
+        }
+        return flags
+    }
+
+    private fun maybeNotify() {
+        val previous = lastNotifyAt.get()
+        val now = SystemClock.elapsedRealtime()
+        if (now - previous >= 250L && lastNotifyAt.compareAndSet(previous, now)) notifyListeners()
     }
 
     private fun notifyListeners() {
-        val snapshot = snapshot()
-        updateDownloadNotification()
-        listeners.forEach { it(snapshot) }
+        if (listeners.isNotEmpty() && deliveryPosted.compareAndSet(false, true)) main.post(deliverUpdates)
     }
 
     // ── 后台通知/保活 ─────────────────────────────────────────
@@ -1418,13 +1572,41 @@ object DownloadManager {
             } else {
                 context.startService(intent)
             }
-        } catch (_: Throwable) {
-            // 通知权限/厂商后台策略不允许时，队列仍由进程内 worker 继续执行。
+        } catch (error: IllegalStateException) {
+            Log.w("Downloads", "Unable to start foreground download service", error)
+        } catch (error: SecurityException) {
+            Log.w("Downloads", "Foreground download service permission denied", error)
         }
     }
 
     /** 在独立前台服务中托管同一 DownloadManager 单例，避免 Activity 退出后进程被回收。 */
     class DownloadService : Service() {
+        private val main = Handler(Looper.getMainLooper())
+        private var lastStartId = 0
+        @Volatile private var observing = false
+        private val updatePosted = AtomicBoolean()
+        private val reconcile = Runnable {
+            updatePosted.set(false)
+            if (!observing || lastStartId == 0) return@Runnable
+            val active = snapshot().filter { it.running || it.state == STATE_QUEUED }
+            val writing = synchronized(lock) { writerScheduled }
+            if (active.isEmpty() && galleryWork.get() == 0 && !writing) {
+                if (stopSelfResult(lastStartId)) {
+                    if (Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_REMOVE)
+                    else @Suppress("DEPRECATION") stopForeground(true)
+                }
+            } else if (active.isNotEmpty()) {
+                buildDownloadNotification(active)?.let { notificationManager?.notify(NOTIFICATION_ID, it) }
+            } else {
+                notificationManager?.notify(NOTIFICATION_ID, emptyServiceNotification(this))
+            }
+        }
+        private fun scheduleUpdate() {
+            if (observing && updatePosted.compareAndSet(false, true)) main.post(reconcile)
+        }
+
+        private val listener: (List<Task>) -> Unit = { scheduleUpdate() }
+
         override fun onCreate() {
             super.onCreate()
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -1438,12 +1620,21 @@ object DownloadManager {
                 startForeground(NOTIFICATION_ID, notification)
             }
             DownloadManager.init(this)
-            updateDownloadNotification()
+            observing = true
+            addListener(listener)
         }
 
         override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-            DownloadManager.init(this)
+            lastStartId = startId
+            scheduleUpdate()
             return START_STICKY
+        }
+
+        override fun onDestroy() {
+            observing = false
+            removeListener(listener)
+            main.removeCallbacks(reconcile)
+            super.onDestroy()
         }
 
         override fun onBind(intent: Intent?) = null
@@ -1481,9 +1672,8 @@ object DownloadManager {
 
     private fun notificationIntent(): PendingIntent? {
         val ctx = appContext ?: return null
-        val intent = Intent(ctx, MainActivity::class.java).apply {
-            action = ACTION_OPEN_DOWNLOADS
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        val intent = Intent(ctx, DownloadManagerActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         return PendingIntent.getActivity(
             ctx, 0, intent,
@@ -1492,16 +1682,9 @@ object DownloadManager {
         )
     }
 
-    private fun activeDownloadTasks(): List<Task> = synchronized(lock) {
-        tasks.values.filter { it.type == TYPE_VIDEO || it.type == TYPE_AUDIO }
-            .filter { it.state == STATE_RUNNING || it.state == STATE_QUEUED || it.state == STATE_PAUSED }
-    }
-
-    private fun buildDownloadNotification(): Notification? {
+    private fun buildDownloadNotification(active: List<Task>): Notification? {
         val ctx = appContext ?: return null
-        val active = activeDownloadTasks()
         val running = active.filter { it.state == STATE_RUNNING }
-        if (active.isEmpty()) return null
         val totalDone = active.sumOf { it.bytesDone.coerceAtLeast(0L) }
         val total = active.sumOf { it.bytesTotal.takeIf { b -> b > 0L } ?: 0L }
         val title = when {
@@ -1533,42 +1716,6 @@ object DownloadManager {
         return builder.build()
     }
 
-    private fun startForegroundKeepAlive() {
-        val ctx = appContext ?: return
-        if (foregroundStarted) return
-        val notification = buildDownloadNotification() ?: return
-        if (ctx is Service) {
-            ctx.startForeground(NOTIFICATION_ID, notification)
-            foregroundStarted = true
-        } else {
-            notificationManager?.notify(NOTIFICATION_ID, notification)
-        }
-    }
-
-    private fun updateDownloadNotification() {
-        val active = activeDownloadTasks()
-        val manager = notificationManager ?: return
-        if (active.isEmpty()) {
-            if (foregroundStarted && appContext is Service) {
-                (appContext as Service).stopForeground(Service.STOP_FOREGROUND_DETACH)
-                foregroundStarted = false
-            }
-            manager.cancel(NOTIFICATION_ID)
-            return
-        }
-        val notification = buildDownloadNotification() ?: return
-        if (appContext is Service) {
-            if (!foregroundStarted) {
-                (appContext as Service).startForeground(NOTIFICATION_ID, notification)
-                foregroundStarted = true
-            } else {
-                (appContext as Service).startForeground(NOTIFICATION_ID, notification)
-            }
-        } else {
-            manager.notify(NOTIFICATION_ID, notification)
-        }
-    }
-
     private fun formatBytesForNotification(bytes: Long): String = when {
         bytes >= 1024L * 1024 * 1024 -> String.format(Locale.US, "%.1fGB", bytes / 1024f / 1024f / 1024f)
         bytes >= 1024L * 1024 -> String.format(Locale.US, "%.1fMB", bytes / 1024f / 1024f)
@@ -1582,19 +1729,51 @@ object DownloadManager {
     }
 
     private fun saveLocked() {
+        writePending = true
+        if (writerScheduled) return
+        writerScheduled = true
+        taskIo.execute(::persistTaskChanges)
+    }
+
+    private fun persistTaskChanges() {
+        while (true) {
+            val snapshot = synchronized(lock) {
+                if (writePending) {
+                    writePending = false
+                    JSONArray().apply { tasks.values.forEach { put(toJson(it)) } }
+                } else {
+                    writerScheduled = false
+                    null
+                }
+            }
+            if (snapshot == null) break
+            persistTaskSnapshot(snapshot)
+        }
+        notifyListeners()
+    }
+
+    private fun persistTaskSnapshot(snapshot: JSONArray) {
         val dir = downloadDir ?: return
-        val file = File(dir, "tasks.json")
-        val arr = JSONArray()
-        tasks.values.forEach { t -> arr.put(toJson(t)) }
-        runCatching { file.writeText(JSONObject().put("tasks", arr).toString()) }
+        val file = android.util.AtomicFile(File(dir, "tasks.json"))
+        try {
+            val output = file.startWrite()
+            try {
+                output.write(JSONObject().put("tasks", snapshot).toString().toByteArray(Charsets.UTF_8))
+                file.finishWrite(output)
+            } catch (error: java.io.IOException) {
+                file.failWrite(output)
+                throw error
+            }
+        } catch (error: java.io.IOException) {
+            Log.w("Downloads", "Unable to persist downloads", error)
+        }
     }
 
     private fun load() {
         val dir = downloadDir ?: return
-        val file = File(dir, "tasks.json")
-        if (!file.exists()) return
-        runCatching {
-            val arr = JSONObject(file.readText()).optJSONArray("tasks") ?: return
+        val file = android.util.AtomicFile(File(dir, "tasks.json"))
+        try {
+            val arr = JSONObject(file.readFully().toString(Charsets.UTF_8)).optJSONArray("tasks") ?: return
             for (i in 0 until arr.length()) {
                 val t = fromJson(arr.getJSONObject(i))
                 tasks[t.id] = t
@@ -1606,6 +1785,12 @@ object DownloadManager {
                     if (t.state == STATE_QUEUED) queue.add(t.id)
                 }
             }
+        } catch (_: java.io.FileNotFoundException) {
+            return
+        } catch (error: java.io.IOException) {
+            Log.w("Downloads", "Unable to read downloads", error)
+        } catch (error: org.json.JSONException) {
+            Log.w("Downloads", "Invalid download tasks", error)
         }
     }
 
@@ -1616,6 +1801,7 @@ object DownloadManager {
         put("coverUrl", t.coverUrl); put("coverPath", t.coverPath)
         put("groupId", t.groupId); put("groupTitle", t.groupTitle)
         put("groupCoverUrl", t.groupCoverUrl); put("episodeNo", t.episodeNo)
+        put("publishedAt", t.publishedAt)
         put("quality", t.quality); put("qualityLabel", t.qualityLabel)
         put("durationMs", t.durationMs)
         put("state", t.state)
@@ -1623,6 +1809,7 @@ object DownloadManager {
         put("error", t.error)
         put("createdAt", t.createdAt); put("finishedAt", t.finishedAt)
         put("resumeOffset", t.resumeOffset)
+        put("cancelRequested", t.cancelRequested)
         put("mpdPath", t.mpdPath); put("audioPath", t.audioPath)
         put("singlePaths", JSONArray(t.singlePaths))
         put("galleryExports", JSONArray(t.galleryExports))
@@ -1635,6 +1822,7 @@ object DownloadManager {
         coverUrl = o.optString("coverUrl"); coverPath = o.optString("coverPath")
         groupId = o.optString("groupId"); groupTitle = o.optString("groupTitle")
         groupCoverUrl = o.optString("groupCoverUrl"); episodeNo = o.optInt("episodeNo")
+        publishedAt = o.optLong("publishedAt", 0L)
         quality = o.optInt("quality"); qualityLabel = o.optString("qualityLabel")
         durationMs = o.optLong("durationMs")
         state = o.optInt("state")
@@ -1642,6 +1830,7 @@ object DownloadManager {
         error = o.optString("error")
         createdAt = o.optLong("createdAt"); finishedAt = o.optLong("finishedAt")
         resumeOffset = o.optLong("resumeOffset")
+        cancelRequested = o.optBoolean("cancelRequested")
         mpdPath = o.optString("mpdPath"); audioPath = o.optString("audioPath")
         val paths = o.optJSONArray("singlePaths")
         if (paths != null) for (i in 0 until paths.length()) singlePaths.add(paths.optString(i))

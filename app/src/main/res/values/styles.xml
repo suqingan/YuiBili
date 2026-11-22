@@ -6,10 +6,18 @@
         <item name="android:windowNoTitle">true</item>
         <item name="android:windowActionModeOverlay">true</item>
         <item name="android:windowBackground">@color/window_background</item>
-        <item name="android:colorAccent">#EF488B</item>
+        <item name="android:colorAccent">#E25582</item>
         <item name="android:statusBarColor">@color/window_background</item>
         <item name="android:navigationBarColor">@color/window_background</item>
         <item name="android:windowLightStatusBar">true</item>
-        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+
+    <!-- 视频/番剧播放页专属主题：windowBackground 与系统栏默认纯黑，
+         彻底防止退出全屏瞬间 DecorView 或导航栏/状态栏按浅色窗底闪一帧白条。 -->
+    <style name="PlayerActivityTheme" parent="AppTheme">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:statusBarColor">@android:color/black</item>
+        <item name="android:navigationBarColor">@android:color/black</item>
+        <item name="android:windowLightStatusBar">false</item>
     </style>
 </resources>

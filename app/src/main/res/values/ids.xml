@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item name="cover_request_binding" type="id" />
+    <item name="spring_tag_property" type="id" />
+    <item name="ds_spring_scale_x" type="id" />
+    <item name="ds_spring_scale_y" type="id" />
+    <item name="ds_spring_tx" type="id" />
+    <item name="ds_spring_ty" type="id" />
+    <item name="comment_title_bind_tag" type="id" />
+</resources>

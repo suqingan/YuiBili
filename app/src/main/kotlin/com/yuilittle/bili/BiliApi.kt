@@ -2,22 +2,23 @@ package com.yuilittle.bili
 
 import android.os.Handler
 import android.os.Looper
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
+import java.io.IOException
 import java.net.URLEncoder
+import java.util.Locale
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
-/**
- * Small, dependency-free client for the public, read-only web endpoints used by
- * the MVP. Authentication, signing, write actions and media URL extraction are
- * intentionally out of scope.
- */
 data class VideoItem(
     val bvid: String,
     val title: String,
@@ -34,6 +35,10 @@ data class VideoItem(
     val ownerAvatar: String = "",
     /** Total comment count (detail stat.reply / search review), 0 when unknown. */
     val replyCount: Long = 0L,
+    /** Danmaku count (stat.danmaku / rcmd stat.danmaku), 0 when unknown. */
+    val danmakuCount: Long = 0L,
+    /** Recommendation reason badge from feed API (e.g. "2万点赞"). */
+    val rcmdReason: String = "",
     /** Like count (detail stat.like), 0 when unknown. */
     val likes: Long = 0L,
     /** Whether the signed-in account already liked this video (req_user.like). */
@@ -46,8 +51,16 @@ data class VideoItem(
     /** 视频所属合集；仅详情接口(view)返回 ugc_season 时非空，无合集为 null。 */
     val season: UgcSeason? = null,
     /** 是否充电（付费）视频：仅接受接口明确给出的专属/付费标记，不以流时长比例猜测。 */
-    val charge: Boolean = false
+    val charge: Boolean = false,
+    /** 历史记录观看进度（秒）：-1 表示已看完，0 表示未记录或刚开头，>0 为已观看秒数。 */
+    val watchProgressSec: Long = 0L
 )
+
+/** 判断评论/回复作者是否为视频 UP 主（服务端标记优先，其次按 mid 匹配）。 */
+internal fun isCommentFromUp(comment: VideoComment, videoOwnerMid: Long): Boolean {
+    if (comment.isUp) return true
+    return videoOwnerMid > 0L && comment.userMid == videoOwnerMid
+}
 
 /** A single comment (top-level or in-floor) from the reply/main endpoint. */
 data class VideoComment(
@@ -57,6 +70,10 @@ data class VideoComment(
     val content: String,
     val likes: Long,
     val publishedAt: Long,
+    /** 评论作者 mid（来自 reply.mid / reply.member.mid）。 */
+    val userMid: Long = 0L,
+    /** IP 属地（来自 reply.reply_control.location，如 "浙江"，可能为空）。 */
+    val location: String = "",
     /** Official Bilibili emote images inside the message: placeholder name -> image URL. */
     val emotes: Map<String, String> = emptyMap(),
     /** User-uploaded comment images (pictures array) with intrinsic size. */
@@ -65,8 +82,14 @@ data class VideoComment(
     val replies: List<VideoComment> = emptyList(),
     /** Total count of sub replies (rcount); 0 means no replies at all. */
     val replyCount: Long = 0L,
+    /** 评论里的跳转链接（B 站富文本）：显示文案 → 目标 URL。 */
+    val jumpLinks: Map<String, String> = emptyMap(),
     /** Whether the signed-in account already liked this comment (action == 1). */
-    val liked: Boolean = false
+    val liked: Boolean = false,
+    /** Whether this comment is pinned at the top by the UP主 (data.top.upper / data.top_replies). */
+    val isPinned: Boolean = false,
+    /** Whether this comment author is the video's UP主 (matched by data.upper.mid or reply.reply_control.is_up_flag). */
+    val isUp: Boolean = false
 )
 
 /** A user-uploaded comment image with its intrinsic width/height in pixels. */
@@ -80,7 +103,13 @@ data class CommentPicture(
 data class FavoriteFolder(
     val id: Long,
     val name: String,
-    val count: Long
+    val count: Long,
+    /** 创建者昵称（来自 upper.name），可能为空。 */
+    val owner: String = "",
+    /** 是否公开（attr 为 0 表示公开，非 0 为私密）。 */
+    val isPublic: Boolean = true,
+    /** 收藏夹自定义封面 URL，为空表示未设置。 */
+    val cover: String = ""
 )
 
 /** 合集（ugc_season）中的一集，来自 view 接口 data.ugc_season.sections[].episodes[]。 */
@@ -92,8 +121,12 @@ data class UgcEpisode(
     val duration: Int,
     /** 分集独立封面；接口未给（如多P pages 形态）时为空串，由调用方回退主视频封面。 */
     val cover: String = "",
+    /** 分集发布时间戳（秒，来自 ugc_season.episodes[].arc.pubdate / ctime），0 表示未知（如多P）。 */
+    val publishedAt: Long = 0L,
     /** 分集本身是否带有明确的付费/充电专属标记。 */
-    val charge: Boolean = false
+    val charge: Boolean = false,
+    /** UP 主昵称（收藏夹队列列表需要展示）。 */
+    val owner: String = ""
 )
 
 /** 视频所属合集（来自 view 接口 data.ugc_season）；episodes 按接口顺序展平。 */
@@ -104,6 +137,53 @@ data class UgcSeason(
     val episodes: List<UgcEpisode>,
     /** true 表示同一 BV 的 pages 多 P，不是跨 BV 的 ugc_season。 */
     val isMultiPage: Boolean = false
+)
+
+/**
+ * PGC 条目（番剧/电影/国创/纪录片等），来自搜索 media_bangumi / media_ft。
+ * seasonType 与 B 站 show_season_type 一致：1 番剧 2 电影 3 纪录片 4 国创 5 电视剧 7 综艺。
+ */
+data class PgcMedia(
+    val mediaId: Long,
+    val seasonId: Long,
+    val title: String,
+    val cover: String,
+    val seasonType: Int,
+    val typeName: String,
+    val score: String = "",
+    val epCount: Int = 0,
+    val areas: String = "",
+    val desc: String = ""
+)
+
+/** PGC 分集，来自 pgc/view/web/season 的 episodes[]；duration 单位是毫秒。 */
+data class PgcEpisode(
+    val epId: Long,
+    val cid: Long,
+    val aid: Long,
+    val bvid: String,
+    val title: String,
+    val durationMs: Long,
+    val cover: String = "",
+    val badge: String = "",
+    /** 1 表示预告/花絮，不是正片。 */
+    val sectionType: Int = 0
+)
+
+/** PGC 同系列其他季/版本，来自 pgc/view/web/season 的 seasons[]。 */
+data class PgcSeasonRef(
+    val seasonId: Long,
+    val title: String,
+    val badge: String = ""
+)
+
+/** PGC 详情（season 接口），episodes 仅含正片与可播条目。 */
+data class PgcSeasonDetail(
+    val media: PgcMedia,
+    val evaluate: String,
+    val episodes: List<PgcEpisode>,
+    val isFinish: Boolean,
+    val seasons: List<PgcSeasonRef> = emptyList()
 )
 
 /** One downloadable quality entry (qn + label + required privilege). */
@@ -120,8 +200,71 @@ data class FeedPage(
     val endReached: Boolean
 )
 
+internal object BiliHttp {
+    val client = OkHttpClient.Builder()
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .callTimeout(28, TimeUnit.SECONDS)
+        .followRedirects(false)
+        .build()
+
+    val mediaClient = client.newBuilder()
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .build()
+
+    fun request(address: String): Request.Builder = Request.Builder().url(address)
+        .header("User-Agent", NETWORK_USER_AGENT)
+        .header("Referer", "https://www.bilibili.com/")
+        .header("Accept", "application/json, text/plain, */*")
+
+    fun json(response: Response): JSONObject {
+        val body = response.body?.string().orEmpty()
+        if (body.isBlank()) throw IOException("网络请求没有返回内容（HTTP ${response.code}）")
+        return JSONObject(body)
+    }
+}
+
+internal class BiliRequest {
+    @Volatile var cancelled = false
+        private set
+    private var call: Call? = null
+    private var cancelHook: (() -> Unit)? = null
+
+    @Synchronized
+    fun onCancel(hook: () -> Unit) {
+        if (cancelled) {
+            hook()
+        } else {
+            cancelHook = hook
+        }
+    }
+
+    @Synchronized
+    fun attach(next: Call): Boolean {
+        if (cancelled) return false
+        call = next
+        return true
+    }
+
+    @Synchronized
+    fun detach(completed: Call) {
+        if (call === completed) call = null
+    }
+
+    @Synchronized
+    fun cancel() {
+        cancelled = true
+        call?.cancel()
+        call = null
+        val hook = cancelHook
+        cancelHook = null
+        hook?.invoke()
+    }
+}
+
 object BiliApi {
-    private const val PAGE_SIZE = 12
+    private const val PAGE_SIZE = FeedPagingPolicy.PAGE_SIZE
     private const val RECOMMEND_URL = "https://api.bilibili.com/x/web-interface/index/top/feed/rcmd?y_num=$PAGE_SIZE&fresh_type=3&feed_version=V8&ps=$PAGE_SIZE"
     private const val POPULAR_URL = "https://api.bilibili.com/x/web-interface/popular?ps=$PAGE_SIZE"
     private const val DETAIL_URL = "https://api.bilibili.com/x/web-interface/view?bvid="
@@ -130,7 +273,7 @@ object BiliApi {
     private const val FINGERPRINT_URL = "https://api.bilibili.com/x/frontend/finger/spi"
     private const val MAX_NETWORK_QUEUE = 16
     private const val MAX_SEARCH_QUEUE = 8
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val mainHandler by lazy(LazyThreadSafetyMode.NONE) { Handler(Looper.getMainLooper()) }
     private val networkWorkers = ThreadPoolExecutor(
         3,
         3,
@@ -138,6 +281,11 @@ object BiliApi {
         TimeUnit.SECONDS,
         LinkedBlockingQueue<Runnable>(MAX_NETWORK_QUEUE),
         ThreadPoolExecutor.AbortPolicy()
+    ).apply { allowCoreThreadTimeOut(true) }
+    // 收藏夹封面元数据走独立池，避免被主请求队列（3 线程 + 16 有界队列）拒绝。
+    private val folderMetaWorkers = ThreadPoolExecutor(
+        2, 2, 20L, TimeUnit.SECONDS,
+        LinkedBlockingQueue<Runnable>(128), ThreadPoolExecutor.AbortPolicy()
     ).apply { allowCoreThreadTimeOut(true) }
     // Suggestions and searches share one serial lane. A submitted search can no
     // longer race an in-flight suggestion and trip Bilibili's anonymous rate limit.
@@ -149,6 +297,11 @@ object BiliApi {
         LinkedBlockingQueue<Runnable>(MAX_SEARCH_QUEUE),
         ThreadPoolExecutor.AbortPolicy()
     ).apply { allowCoreThreadTimeOut(true) }
+    // PGC 搜索走独立池，避免被 UGC 搜索/联想词的单线程队列阻塞或 AbortPolicy 拒绝。
+    private val pgcSearchWorkers = ThreadPoolExecutor(
+        2, 2, 20L, TimeUnit.SECONDS,
+        LinkedBlockingQueue<Runnable>(64), ThreadPoolExecutor.AbortPolicy()
+    ).apply { allowCoreThreadTimeOut(true) }
     private val suggestionGeneration = AtomicInteger(0)
     @Volatile private var anonymousSearchCookie = ""
 
@@ -157,15 +310,15 @@ object BiliApi {
         suggestionGeneration.incrementAndGet()
     }
 
-    fun fetchRecommend(page: Int = 1, refreshToken: Long = 0L, callback: (FeedPage?, String?) -> Unit) {
-        // refreshToken is a harmless cache-buster: it never signs, authenticates or changes platform access.
-        requestFeed("$RECOMMEND_URL&pn=${page.coerceAtLeast(1)}&fresh_idx=${page.coerceAtLeast(1)}&_=${if (refreshToken > 0) refreshToken else System.currentTimeMillis()}", callback) { root ->
+    fun fetchRecommend(page: Int, token: Long, callback: (FeedPage?, String?) -> Unit): Call {
+        val index = page.coerceAtLeast(1)
+        return requestFeed("$RECOMMEND_URL&pn=$index&fresh_idx=$index&_=$token", callback) { root ->
             root.optJSONObject("data")?.optJSONArray("item")
         }
     }
 
-    fun fetchPopular(page: Int = 1, refreshToken: Long = 0L, callback: (FeedPage?, String?) -> Unit) {
-        requestFeed("$POPULAR_URL&pn=${page.coerceAtLeast(1)}&_=${if (refreshToken > 0) refreshToken else System.currentTimeMillis()}", callback) { root ->
+    fun fetchPopular(page: Int, token: Long, callback: (FeedPage?, String?) -> Unit): Call {
+        return requestFeed("$POPULAR_URL&pn=${page.coerceAtLeast(1)}&_=$token", callback, checkNoMore = true) { root ->
             root.optJSONObject("data")?.optJSONArray("list")
         }
     }
@@ -178,7 +331,8 @@ object BiliApi {
         ) {
             if (requestGeneration != suggestionGeneration.get()) return@executeSearch
             try {
-                val root = getJson(SUGGEST_URL + encoded, searchHeaders())
+                val anon = ensureAnonymousSearchCookie()
+                val root = searchJson(SUGGEST_URL + encoded, anon)
                 ensureSuccess(root)
                 if (requestGeneration != suggestionGeneration.get()) return@executeSearch
                 val tags = root.optJSONObject("result")?.optJSONArray("tag") ?: JSONArray()
@@ -206,8 +360,8 @@ object BiliApi {
             var lastError: Exception? = null
             repeat(2) { attempt ->
                 try {
-                    ensureAnonymousSearchCookie()
-                    val root = getJson(params.toString(), searchHeaders())
+                    val anon = ensureAnonymousSearchCookie()
+                    val root = searchJson(params.toString(), anon)
                     ensureSuccess(root)
                     val array = root.optJSONObject("data")?.optJSONArray("result") ?: JSONArray()
                     val videos = ArrayList<VideoItem>()
@@ -231,42 +385,224 @@ object BiliApi {
         }
     }
 
-    fun fetchDetail(bvid: String, aid: Long = 0L, callback: (VideoItem?, List<VideoPart>, String?) -> Unit) {
-        executeNetwork(
-            onRejected = { mainHandler.post { callback(null, emptyList(), "操作过快，请稍后再试") } }
-        ) {
+    /**
+     * PGC 搜索（番剧 media_bangumi / 影视 media_ft），WBI 签名 + 匿名 buvid3。
+     * 与 UGC 搜索共用匿名 cookie 与限流通道，签名参数走项目统一的 BiliWbiSign。
+     */
+    fun searchPgc(keyword: String, searchType: String, callback: (List<PgcMedia>?, String?) -> Unit) {
+        try {
+            pgcSearchWorkers.execute {
             var lastError: Exception? = null
-            // Prefer bvid; fall back to aid (search results occasionally carry an aid
-            // that resolves while the bvid path is rejected).
-            val attempts = buildList {
-                if (bvid.isNotBlank()) add(DETAIL_URL + URLEncoder.encode(bvid, "UTF-8"))
-                if (aid > 0L) add("https://api.bilibili.com/x/web-interface/view?aid=$aid")
-            }
-            for (attempt in attempts) {
+            repeat(2) { attempt ->
                 try {
-                    val root = getJson(attempt)
+                    val anon = ensureAnonymousSearchCookie()
+                    val url = "https://api.bilibili.com/x/web-interface/search/type" +
+                        "?search_type=" + URLEncoder.encode(searchType, "UTF-8") +
+                        "&keyword=" + URLEncoder.encode(keyword, "UTF-8") + "&page=1"
+                    val root = searchJson(url, anon)
                     ensureSuccess(root)
-                    val data = root.optJSONObject("data") ?: throw IllegalStateException("未返回视频信息")
-                    val video = videoFromJson(data)
-                    val pages = data.optJSONArray("pages") ?: JSONArray()
-                    val parts = ArrayList<VideoPart>()
-                    for (index in 0 until pages.length()) {
-                        val page = pages.optJSONObject(index) ?: continue
-                        parts += VideoPart(
-                            page.optInt("page", index + 1),
-                            page.optString("part").ifBlank { "第 ${index + 1} P" },
-                            page.optLong("cid"),
-                            page.optInt("duration")
+                    val data = root.optJSONObject("data")
+                        ?: throw IllegalStateException("搜索响应缺少数据")
+                    // 风控验证码响应：HTTP 200 + code=0 但 data 只带 v_voucher 凭证，
+                    // 必须在取列表前显式识别，否则会被当成“成功但 0 条”而静默无结果。
+                    val classified = classifySearchOutcome(data)
+                    when (classified) {
+                        SearchOutcome.GAIA_VERIFICATION ->
+                            throw IllegalStateException("v_voucher:${data.optString("v_voucher")}")
+                        SearchOutcome.EMPTY -> {
+                            mainHandler.post { callback(emptyList(), null) }
+                            return@execute
+                        }
+                        SearchOutcome.HAS_RESULT -> {}
+                    }
+                    val array = data.optJSONArray("result") ?: JSONArray()
+                    android.util.Log.d("YuiPgc", "searchPgc $searchType kw=$keyword code=${root.optInt("code")} result=${array.length()}")
+                    val list = ArrayList<PgcMedia>()
+                    for (i in 0 until array.length()) {
+                        val item = array.optJSONObject(i) ?: continue
+                        val seasonId = item.optLong("season_id", 0L)
+                        if (seasonId <= 0L) continue
+                        val type = item.optInt("season_type", item.optInt("media_type", 0))
+                        val scoreObj = item.optJSONObject("media_score")
+                        val score = scoreObj?.optDouble("score", 0.0)?.takeIf { it > 0 }
+                            ?.let { String.format(Locale.ROOT, "%.1f", it) }.orEmpty()
+                        val desc = cleanHtml(item.optString("desc"))
+                        list += PgcMedia(
+                            mediaId = item.optLong("media_id", 0L),
+                            seasonId = seasonId,
+                            title = cleanHtml(item.optString("title")).ifBlank { "未命名" },
+                            cover = normalizeUrl(item.optString("cover")),
+                            seasonType = type,
+                            typeName = typeNameOf(type).ifBlank { item.optString("season_type_name") },
+                            score = score,
+                            epCount = item.optInt("ep_size", 0),
+                            areas = item.optString("areas"),
+                            desc = desc
                         )
                     }
-                    mainHandler.post { callback(video, parts, null) }
-                    return@executeNetwork
+                    mainHandler.post { callback(list, null) }
+                    return@execute
                 } catch (error: Exception) {
                     lastError = error
+                    android.util.Log.w("YuiPgc", "searchPgc $searchType ERROR ${error.message}")
+                    if (attempt == 0 && isRequestBanned(error)) {
+                        anonymousSearchCookie = ""
+                        Thread.sleep(650L)
+                    } else {
+                        mainHandler.post { callback(null, readableError(error)) }
+                        return@execute
+                    }
                 }
             }
-            mainHandler.post { callback(null, emptyList(), readableError(lastError ?: IllegalStateException("无法获取视频信息"))) }
+            mainHandler.post { callback(null, readableError(lastError ?: IllegalStateException("搜索暂不可用"))) }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            mainHandler.post { callback(null, "PGC 搜索排队已满") }
         }
+    }
+
+    private fun typeNameOf(type: Int): String = when (type) {
+        1 -> "番剧"
+        2 -> "电影"
+        3 -> "纪录片"
+        4 -> "国创"
+        5 -> "电视剧"
+        7 -> "综艺"
+        else -> ""
+    }
+
+    /** PGC season 详情：返回体在 result 而非 data；episodes 的 duration 单位为毫秒。 */
+    fun fetchPgcSeason(seasonId: Long, callback: (PgcSeasonDetail?, String?) -> Unit) {
+        if (seasonId <= 0L) { callback(null, "剧集不存在"); return }
+        executeNetwork(onRejected = { mainHandler.post { callback(null, "操作过快，请稍后再试") } }) {
+            try {
+                val root = getJson(
+                    "https://api.bilibili.com/pgc/view/web/season?season_id=$seasonId",
+                    mapOf("Cookie" to BiliSessionStore.cookie())
+                )
+                ensureSuccess(root)
+                val r = root.optJSONObject("result") ?: run {
+                    mainHandler.post { callback(null, "剧集不存在") }
+                    return@executeNetwork
+                }
+                val type = r.optInt("type", r.optInt("show_season_type", 0))
+                val scoreObj = r.optJSONObject("rating")
+                val score = scoreObj?.optDouble("score", 0.0)?.takeIf { it > 0 }
+                    ?.let { String.format(Locale.ROOT, "%.1f", it) }.orEmpty()
+                val styles = (r.optJSONArray("styles")?.let { arr ->
+                    (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
+                }.orEmpty()).joinToString(" / ")
+                val media = PgcMedia(
+                    mediaId = r.optLong("media_id", 0L),
+                    seasonId = r.optLong("season_id", seasonId),
+                    title = r.optString("season_title").ifBlank { r.optString("title") },
+                    cover = normalizeUrl(r.optString("cover")),
+                    seasonType = type,
+                    typeName = typeNameOf(type),
+                    score = score,
+                    epCount = r.optJSONArray("episodes")?.length() ?: 0,
+                    areas = styles,
+                    desc = r.optString("evaluate")
+                )
+                val eps = ArrayList<PgcEpisode>()
+                val epArray = r.optJSONArray("episodes") ?: JSONArray()
+                for (i in 0 until epArray.length()) {
+                    val e = epArray.optJSONObject(i) ?: continue
+                    val cid = e.optLong("cid", 0L)
+                    if (cid <= 0L) continue
+                    eps += PgcEpisode(
+                        // PGC 接口通常用 id 表示分集 id，少数返回 ep_id；两者都兼容。
+                        epId = e.optLong("ep_id", 0L).takeIf { it > 0L } ?: e.optLong("id", 0L),
+                        cid = cid,
+                        aid = e.optLong("aid", 0L),
+                        bvid = e.optString("bvid"),
+                        title = e.optString("show_title").ifBlank {
+                            e.optString("long_title").ifBlank { e.optString("title") }
+                        },
+                        durationMs = e.optLong("duration", 0L),
+                        cover = normalizeUrl(e.optString("cover")),
+                        badge = e.optString("badge"),
+                        sectionType = e.optInt("section_type", 0)
+                    )
+                }
+                val isFinish = r.optJSONObject("publish")?.optInt("is_finish", 0) == 1
+                val seasonRefs = ArrayList<PgcSeasonRef>()
+                val seasonsArray = r.optJSONArray("seasons")
+                if (seasonsArray != null) for (i in 0 until seasonsArray.length()) {
+                    val s = seasonsArray.optJSONObject(i) ?: continue
+                    val refId = s.optLong("season_id", 0L)
+                    if (refId <= 0L) continue
+                    seasonRefs += PgcSeasonRef(
+                        seasonId = refId,
+                        title = s.optString("season_title").ifBlank { s.optString("title") },
+                        badge = s.optString("badge")
+                    )
+                }
+                mainHandler.post {
+                    callback(PgcSeasonDetail(media, r.optString("evaluate"), eps, isFinish, seasonRefs), null)
+                }
+            } catch (error: Exception) {
+                mainHandler.post { callback(null, readableError(error)) }
+            }
+        }
+    }
+
+    internal fun fetchDetail(bvid: String, aid: Long, callback: (VideoItem?, List<VideoPart>, String?) -> Unit): BiliRequest {
+        val request = BiliRequest()
+        val session = BiliSessionStore.cookie()
+        val addresses = buildList {
+            if (bvid.isNotBlank()) add(DETAIL_URL + URLEncoder.encode(bvid, "UTF-8"))
+            if (aid > 0L) add("https://api.bilibili.com/x/web-interface/view?aid=$aid")
+        }
+        fun deliver(video: VideoItem?, parts: List<VideoPart>, error: String?) {
+            mainHandler.post { if (!request.cancelled) callback(video, parts, error) }
+        }
+        fun fetch(index: Int, previousError: String?) {
+            if (request.cancelled) return
+            val address = addresses.getOrNull(index)
+            if (address == null) {
+                deliver(null, emptyList(), previousError ?: "无法获取视频信息")
+                return
+            }
+            val call = jsonCall(address, session = session)
+            if (!request.attach(call)) return
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    request.detach(call)
+                    fetch(index + 1, readableError(e))
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    val detail = try {
+                        response.use {
+                            val root = BiliHttp.json(it)
+                            ensureSuccess(root)
+                            val data = root.optJSONObject("data") ?: error("未返回视频信息")
+                            val pages = data.optJSONArray("pages")
+                            val parts = ArrayList<VideoPart>(pages?.length() ?: 0)
+                            if (pages != null) for (i in 0 until pages.length()) {
+                                val page = pages.optJSONObject(i) ?: continue
+                                parts += VideoPart(
+                                    page.optInt("page", i + 1),
+                                    page.optString("part").ifBlank { "第 ${i + 1} P" },
+                                    page.optLong("cid"),
+                                    page.optInt("duration")
+                                )
+                            }
+                            Pair(videoFromJson(data), parts)
+                        }
+                    } catch (error: Exception) {
+                        request.detach(call)
+                        fetch(index + 1, readableError(error))
+                        return
+                    }
+                    request.detach(call)
+                    deliver(detail.first, detail.second, null)
+                }
+            })
+        }
+        fetch(0, null)
+        return request
     }
 
     /** UP主粉丝数（万级由界面格式化）。mid 无效时直接回调 null。 */
@@ -309,20 +645,34 @@ object BiliApi {
      *  实测（2026-07）：旧接口 x/v2/reply 的 sort 参数已失效（sort=0 返回空、sort=1/2 同序），
      *  必须用新接口 x/v2/reply/main 的 mode 参数：mode=0 热度 / mode=2 时间，
      *  且分页用游标（pagination_str.offset），不能用 pn/ps。 */
-    private val commentCursors = HashMap<String, String>()
+    private val commentCursors = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val anonSearchInitLock = Any()
 
     fun fetchComments(aid: Long, page: Int, sort: Int = 0, callback: (List<VideoComment>, Int, String?) -> Unit) {
         if (aid <= 0L) { callback(emptyList(), -1, null); return }
+        fetchCommentsForTarget(oid = aid.toString(), commentType = 1, page = page, sort = sort, callback = callback)
+    }
+
+    /** 通用评论主列表加载：支持视频（type=1, oid=aid）与动态/图文/专栏（type=11/12/17, oid=comment_id_str）。 */
+    fun fetchCommentsForTarget(
+        oid: String,
+        commentType: Int,
+        page: Int,
+        sort: Int = 0,
+        callback: (List<VideoComment>, Int, String?) -> Unit
+    ) {
+        val cleanOid = oid.trim()
+        if (cleanOid.isEmpty() || commentType <= 0) { callback(emptyList(), -1, null); return }
         executeNetwork(
             onRejected = { mainHandler.post { callback(emptyList(), -1, "操作过快，请稍后再试") } }
         ) {
             try {
-                val cursorKey = "$aid:$sort"
+                val cursorKey = "$commentType:$cleanOid:$sort"
                 if (page <= 1) commentCursors.remove(cursorKey)
                 val offset = commentCursors[cursorKey] ?: ""
                 val signed = BiliWbiSign.signParams(
                     mapOf(
-                        "type" to "1", "oid" to aid.toString(),
+                        "type" to commentType.toString(), "oid" to cleanOid,
                         "mode" to (if (sort == 0) "0" else "2"),
                         "pagination_str" to """{"offset":"$offset"}""",
                         "plat" to "1", "web_location" to "333.788"
@@ -336,11 +686,30 @@ object BiliApi {
                 )
                 ensureSuccess(root)
                 val data = root.optJSONObject("data") ?: throw IllegalStateException("未返回评论数据")
+                val upperMid = data.optJSONObject("upper")?.optLong("mid", 0L) ?: 0L
+                val list = ArrayList<VideoComment>()
+                val pinnedIds = HashSet<Long>()
+                if (page <= 1) {
+                    val topObj = data.optJSONObject("top")
+                    val topUpper = topObj?.optJSONObject("upper")
+                    if (topUpper != null) {
+                        val pinned = parseComment(topUpper, isPinned = true, upperMid = upperMid)
+                        if (pinned.id <= 0L || pinnedIds.add(pinned.id)) list += pinned
+                    }
+                    val topReplies = data.optJSONArray("top_replies")
+                    if (topReplies != null) {
+                        for (index in 0 until topReplies.length()) {
+                            val reply = topReplies.optJSONObject(index) ?: continue
+                            val pinned = parseComment(reply, isPinned = true, upperMid = upperMid)
+                            if (pinned.id <= 0L || pinnedIds.add(pinned.id)) list += pinned
+                        }
+                    }
+                }
                 val replies = data.optJSONArray("replies") ?: JSONArray()
-                val list = ArrayList<VideoComment>(replies.length())
                 for (index in 0 until replies.length()) {
                     val reply = replies.optJSONObject(index) ?: continue
-                    list += parseComment(reply)
+                    val parsed = parseComment(reply, upperMid = upperMid)
+                    if (parsed.id <= 0L || pinnedIds.add(parsed.id)) list += parsed
                 }
                 val cursor = data.optJSONObject("cursor")
                 // reply/main's real next-page token lives in
@@ -364,13 +733,26 @@ object BiliApi {
     /** 楼中楼（子评论）分页加载；root=主评论 rpid。page 从 1 开始，-1 表示没有更多。 */
     fun fetchSubReplies(aid: Long, root: Long, page: Int, callback: (List<VideoComment>, Int, String?) -> Unit) {
         if (aid <= 0L || root <= 0L) { callback(emptyList(), -1, null); return }
+        fetchSubRepliesForTarget(oid = aid.toString(), commentType = 1, root = root, page = page, callback = callback)
+    }
+
+    /** 通用楼中楼（子评论）分页加载；支持任意评论区 (oid, commentType)。 */
+    fun fetchSubRepliesForTarget(
+        oid: String,
+        commentType: Int,
+        root: Long,
+        page: Int,
+        callback: (List<VideoComment>, Int, String?) -> Unit
+    ) {
+        val cleanOid = oid.trim()
+        if (cleanOid.isEmpty() || commentType <= 0 || root <= 0L) { callback(emptyList(), -1, null); return }
         executeNetwork(
             onRejected = { mainHandler.post { callback(emptyList(), -1, "操作过快，请稍后再试") } }
         ) {
             try {
                 val signed = BiliWbiSign.signParams(
                     mapOf(
-                        "type" to "1", "oid" to aid.toString(), "root" to root.toString(),
+                        "type" to commentType.toString(), "oid" to cleanOid, "root" to root.toString(),
                         "pn" to page.toString(), "ps" to "20", "plat" to "1"
                     )
                 )
@@ -380,11 +762,12 @@ object BiliApi {
                 )
                 ensureSuccess(rootJson)
                 val data = rootJson.optJSONObject("data") ?: throw IllegalStateException("未返回回复数据")
+                val upperMid = data.optJSONObject("upper")?.optLong("mid", 0L) ?: 0L
                 val replies = data.optJSONArray("replies") ?: JSONArray()
                 val list = ArrayList<VideoComment>(replies.length())
                 for (index in 0 until replies.length()) {
                     val reply = replies.optJSONObject(index) ?: continue
-                    list += parseComment(reply)
+                    list += parseComment(reply, upperMid = upperMid)
                 }
                 val pageInfo = data.optJSONObject("page")
                 val total = pageInfo?.optLong("count", 0L) ?: 0L
@@ -396,11 +779,38 @@ object BiliApi {
         }
     }
 
+    internal fun selectEmoteUrl(gifUrl: String, webpUrl: String, fallbackUrl: String): String {
+        val raw = gifUrl.ifBlank { webpUrl }.ifBlank { fallbackUrl }
+        return if (raw.isBlank()) "" else normalizeUrl(raw)
+    }
+
     /** Parse one reply object (shared by top-level and in-floor replies). */
-    private fun parseComment(reply: JSONObject): VideoComment {
+    internal fun parseComment(
+        reply: JSONObject,
+        isPinned: Boolean = false,
+        upperMid: Long = 0L
+    ): VideoComment {
         val member = reply.optJSONObject("member")
         val content = reply.optJSONObject("content")
         val message = cleanHtml(content?.optString("message").orEmpty())
+        // B 站富文本跳转链接（正片传送门 / 收藏集 / 搜索词等）
+        val jumpLinks = HashMap<String, String>()
+        content?.optJSONObject("jump_url")?.let { jump ->
+            val keys = jump.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                val value = jump.optJSONObject(key) ?: continue
+                val url = value.optString("url").ifBlank { value.optString("pc_url") }
+                val normalized = normalizeUrl(url)
+                if (key.isNotBlank() && CommentLinkParser.isSafeUrl(normalized)) {
+                    jumpLinks[key] = normalized
+                }
+            }
+        }
+        val memberMid = reply.optLong("mid", 0L).takeIf { it > 0L }
+            ?: member?.optString("mid")?.toLongOrNull()
+            ?: member?.optLong("mid", 0L)
+            ?: 0L
         // Official Bilibili emotes (placeholder name -> url): rendered inline at text size.
         val emotes = HashMap<String, String>()
         content?.optJSONObject("emote")?.let { emote ->
@@ -408,8 +818,12 @@ object BiliApi {
             while (names.hasNext()) {
                 val name = names.next()
                 val value = emote.optJSONObject(name)
-                val url = value?.optString("url").orEmpty()
-                if (url.isNotBlank()) emotes[name] = normalizeUrl(url)
+                val url = selectEmoteUrl(
+                    gifUrl = value?.optString("gif_url").orEmpty(),
+                    webpUrl = value?.optString("webp_url").orEmpty(),
+                    fallbackUrl = value?.optString("url").orEmpty()
+                )
+                if (url.isNotBlank()) emotes[name] = url
             }
         }
         // User-uploaded comment images (pictures array, each item has img_src).
@@ -435,9 +849,16 @@ object BiliApi {
         reply.optJSONArray("replies")?.let { array ->
             for (index in 0 until array.length()) {
                 val sub = array.optJSONObject(index) ?: continue
-                subs += parseComment(sub)
+                subs += parseComment(sub, upperMid = upperMid)
             }
         }
+        val replyControl = reply.optJSONObject("reply_control")
+        val rawLocation = replyControl
+            ?.optString("location").orEmpty()
+            .removePrefix("IP属地：").removePrefix("IP属地:").trim()
+        val isUpFlag = flag(replyControl, "is_up_flag") ||
+            flag(reply, "is_up") ||
+            (upperMid > 0L && memberMid == upperMid)
         // Keep the "[name]" placeholders in the content: the renderer replaces
         // them with inline emote images. Removing them here made emotes
         // disappear once the separate emote row was replaced by inline spans,
@@ -449,13 +870,18 @@ object BiliApi {
             content = message.ifBlank { "（评论已删除）" },
             likes = reply.optLong("like", 0L),
             publishedAt = reply.optLong("ctime", 0L),
+            userMid = memberMid,
+            location = rawLocation,
             emotes = emotes,
             pictures = pictures,
             replies = subs,
             replyCount = reply.optLong("rcount", 0L),
             // action: 0=none, 1=liked by the signed-in account.
-            liked = reply.optInt("action", 0) == 1
-        )
+            liked = reply.optInt("action", 0) == 1,
+            isPinned = isPinned,
+            isUp = isUpFlag,
+            jumpLinks = jumpLinks
+        ).also { CommentMentionResolver.register(it) }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -486,6 +912,22 @@ object BiliApi {
         like: Boolean,
         callback: (Boolean, String?) -> Unit
     ) {
+        postCommentLikeForTarget(oid = oid.toString(), commentType = 1, rpid = rpid, like = like, callback = callback)
+    }
+
+    /** 通用评论点赞/取消赞（支持任意评论区 oid + commentType）。 */
+    fun postCommentLikeForTarget(
+        oid: String,
+        commentType: Int,
+        rpid: Long,
+        like: Boolean,
+        callback: (Boolean, String?) -> Unit
+    ) {
+        val cleanOid = oid.trim()
+        if (cleanOid.isEmpty() || commentType <= 0 || rpid <= 0L) {
+            callback(false, "评论信息未就绪，请稍后再试")
+            return
+        }
         if (!BiliSessionStore.isLoggedIn()) { callback(false, "请先登录后再点赞评论"); return }
         val csrf = csrfToken()
         if (csrf.isBlank()) { callback(false, "登录凭证不完整"); return }
@@ -496,8 +938,8 @@ object BiliApi {
                 val root = postForm(
                     "https://api.bilibili.com/x/v2/reply/action",
                     mapOf(
-                        "type" to "1",
-                        "oid" to oid.toString(),
+                        "type" to commentType.toString(),
+                        "oid" to cleanOid,
                         "rpid" to rpid.toString(),
                         "action" to (if (like) "1" else "0"),
                         "csrf" to csrf
@@ -592,12 +1034,291 @@ object BiliApi {
                     folders += FavoriteFolder(
                         id = item.optLong("id", 0L),
                         name = item.optString("title").ifBlank { "未命名收藏夹" },
-                        count = item.optLong("media_count", 0L)
+                        count = item.optLong("media_count", 0L),
+                        // attr 是位掩码，bit0 才是私密；其余位（如 2、22）不代表私密
+                        owner = item.optJSONObject("upper")?.optString("name").orEmpty()
+                            .ifBlank { BiliSessionStore.cachedProfile()?.uname.orEmpty() },
+                        // 注意：created/list-all 不返回 cover，封面需另查 folder/info
+                        isPublic = (item.optInt("attr", 0) and 1) == 0
                     )
                 }
                 mainHandler.post { callback(folders, null) }
             } catch (error: Exception) {
                 mainHandler.post { callback(emptyList(), readableError(error)) }
+            }
+        }
+    }
+
+    /**
+     * 创建收藏夹（需登录 + CSRF）。
+     * POST /x/v3/fav/folder/add，privacy 0=公开 1=私密。
+     * cover 需传 B 站图床 URL，暂不支持本地图片上传，故不传。
+     */
+    fun createFavoriteFolder(
+        title: String,
+        intro: String,
+        isPublic: Boolean,
+        cover: String = "",
+        callback: (Boolean, String?) -> Unit
+    ) {
+        val name = title.trim()
+        if (name.isBlank()) { callback(false, "请填写收藏夹名称"); return }
+        if (!BiliSessionStore.isLoggedIn()) { callback(false, "请先登录"); return }
+        val csrf = csrfToken()
+        if (csrf.isBlank()) { callback(false, "登录凭证不完整"); return }
+        executeNetwork(
+            onRejected = { mainHandler.post { callback(false, "操作过快，请稍后再试") } }
+        ) {
+            try {
+                val form = linkedMapOf(
+                    "title" to name,
+                    "intro" to intro.trim(),
+                    "privacy" to if (isPublic) "0" else "1",
+                    "csrf" to csrf
+                )
+                if (cover.isNotBlank()) form["cover"] = cover
+                val root = postForm("https://api.bilibili.com/x/v3/fav/folder/add", form)
+                val code = root.optInt("code", -1)
+                if (code != 0) {
+                    mainHandler.post {
+                        callback(false, root.optString("message").ifBlank { "创建失败（$code）" })
+                    }
+                    return@executeNetwork
+                }
+                mainHandler.post { callback(true, null) }
+            } catch (error: Exception) {
+                mainHandler.post { callback(false, readableError(error)) }
+            }
+        }
+    }
+
+    /**
+     * 上传图片到 B 站图床，返回可直接用于 cover 的 URL。
+     * POST /x/dynamic/feed/draw/upload_bfs（multipart），要求宽高均 > 420。
+     */
+    fun uploadCoverImage(bytes: ByteArray, callback: (String?, String?) -> Unit) {
+        if (bytes.isEmpty()) { callback(null, "图片为空"); return }
+        if (!BiliSessionStore.isLoggedIn()) { callback(null, "请先登录"); return }
+        val csrf = csrfToken()
+        if (csrf.isBlank()) { callback(null, "登录凭证不完整"); return }
+        executeNetwork(
+            onRejected = { mainHandler.post { callback(null, "操作过快，请稍后再试") } }
+        ) {
+            try {
+                val body = okhttp3.MultipartBody.Builder()
+                    .setType(okhttp3.MultipartBody.FORM)
+                    .addFormDataPart(
+                        "file_up", "cover.jpg",
+                        okhttp3.RequestBody.create("image/jpeg".toMediaTypeOrNull(), bytes)
+                    )
+                    .addFormDataPart("category", "daily")
+                    .addFormDataPart("csrf", csrf)
+                    .build()
+                val request = BiliHttp.request("https://api.bilibili.com/x/dynamic/feed/draw/upload_bfs")
+                    .header("Cookie", BiliPlayUrl.cookieHeader())
+                    .header("Referer", "https://www.bilibili.com/")
+                    .post(body)
+                    .build()
+                val root = BiliHttp.client.newCall(request).execute().use(BiliHttp::json)
+                val code = root.optInt("code", -1)
+                if (code != 0) {
+                    mainHandler.post {
+                        callback(null, root.optString("message").ifBlank { "上传失败（$code）" })
+                    }
+                    return@executeNetwork
+                }
+                val url = root.optJSONObject("data")?.optString("image_url").orEmpty()
+                if (url.isBlank()) {
+                    mainHandler.post { callback(null, "上传返回地址为空") }
+                    return@executeNetwork
+                }
+                mainHandler.post { callback(normalizeUrl(url), null) }
+            } catch (error: Exception) {
+                mainHandler.post { callback(null, readableError(error)) }
+            }
+        }
+    }
+
+    /**
+     * 查询单个收藏夹元数据（含自定义封面 cover）。
+     * GET /x/v3/fav/folder/info?media_id=
+     */
+    fun fetchFavoriteFolderInfo(mediaId: Long, callback: (FavoriteFolder?, String?) -> Unit) {
+        if (mediaId <= 0L) { callback(null, "收藏夹不存在"); return }
+        android.util.Log.d("YuiFavCover", "folder_info $mediaId submit")
+        try {
+            folderMetaWorkers.execute {
+            try {
+                val root = getJson(
+                    "https://api.bilibili.com/x/v3/fav/folder/info?media_id=$mediaId",
+                    mapOf("Cookie" to BiliSessionStore.cookie())
+                )
+                ensureSuccess(root)
+                val data = root.optJSONObject("data")
+                if (data == null) {
+                    android.util.Log.w("YuiFavCover", "folder_info $mediaId data=null")
+                    mainHandler.post { callback(null, "收藏夹不存在") }
+                    return@execute
+                }
+                val coverUrl = normalizeUrl(data.optString("cover"))
+                android.util.Log.d("YuiFavCover", "folder_info $mediaId cover='$coverUrl'")
+                val folder = FavoriteFolder(
+                    id = data.optLong("id", mediaId),
+                    name = data.optString("title").ifBlank { "未命名收藏夹" },
+                    count = data.optLong("media_count", 0L),
+                    owner = data.optJSONObject("upper")?.optString("name").orEmpty(),
+                    isPublic = (data.optInt("attr", 0) and 1) == 0,
+                    cover = coverUrl
+                )
+                mainHandler.post { callback(folder, null) }
+            } catch (error: Exception) {
+                android.util.Log.w("YuiFavCover", "folder_info $mediaId error: ${error.message}")
+                mainHandler.post { callback(null, readableError(error)) }
+            }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            mainHandler.post { callback(null, "封面查询排队已满") }
+        }
+    }
+
+    /** 刷新单个收藏夹元数据（主要为了拿到最新 media_count）。 */
+    fun refreshFavoriteFolder(folderId: Long, callback: (FavoriteFolder?) -> Unit) {
+        if (folderId <= 0L) { callback(null); return }
+        fetchFavoriteFolderInfo(folderId) { folder, _ -> callback(folder) }
+    }
+
+    /** 编辑收藏夹（需登录 + CSRF）。privacy 0=公开 1=私密。 */
+    fun editFavoriteFolder(
+        mediaId: Long,
+        title: String,
+        intro: String,
+        isPublic: Boolean,
+        cover: String = "",
+        callback: (Boolean, String?) -> Unit
+    ) {
+        val name = title.trim()
+        if (mediaId <= 0L) { callback(false, "收藏夹不存在"); return }
+        if (name.isBlank()) { callback(false, "请填写收藏夹名称"); return }
+        if (!BiliSessionStore.isLoggedIn()) { callback(false, "请先登录"); return }
+        val csrf = csrfToken()
+        if (csrf.isBlank()) { callback(false, "登录凭证不完整"); return }
+        executeNetwork(
+            onRejected = { mainHandler.post { callback(false, "操作过快，请稍后再试") } }
+        ) {
+            try {
+                val form = linkedMapOf(
+                    "media_id" to mediaId.toString(),
+                    "title" to name,
+                    "intro" to intro.trim(),
+                    "privacy" to if (isPublic) "0" else "1",
+                    "csrf" to csrf
+                )
+                if (cover.isNotBlank()) form["cover"] = cover
+                val root = postForm("https://api.bilibili.com/x/v3/fav/folder/edit", form)
+                val code = root.optInt("code", -1)
+                if (code != 0) {
+                    mainHandler.post {
+                        callback(false, root.optString("message").ifBlank { "保存失败（$code）" })
+                    }
+                    return@executeNetwork
+                }
+                mainHandler.post { callback(true, null) }
+            } catch (error: Exception) {
+                mainHandler.post { callback(false, readableError(error)) }
+            }
+        }
+    }
+
+    /** 删除收藏夹（需登录 + CSRF）。mediaIds 逗号分隔。 */
+    fun deleteFavoriteFolders(mediaIds: String, callback: (Boolean, String?) -> Unit) {
+        val ids = mediaIds.trim()
+        if (ids.isBlank()) { callback(false, "收藏夹不存在"); return }
+        if (!BiliSessionStore.isLoggedIn()) { callback(false, "请先登录"); return }
+        val csrf = csrfToken()
+        if (csrf.isBlank()) { callback(false, "登录凭证不完整"); return }
+        executeNetwork(
+            onRejected = { mainHandler.post { callback(false, "操作过快，请稍后再试") } }
+        ) {
+            try {
+                val root = postForm(
+                    "https://api.bilibili.com/x/v3/fav/folder/del",
+                    linkedMapOf("media_ids" to ids, "csrf" to csrf)
+                )
+                val code = root.optInt("code", -1)
+                if (code != 0) {
+                    mainHandler.post {
+                        callback(false, root.optString("message").ifBlank { "删除失败（$code）" })
+                    }
+                    return@executeNetwork
+                }
+                mainHandler.post { callback(true, null) }
+            } catch (error: Exception) {
+                mainHandler.post { callback(false, readableError(error)) }
+            }
+        }
+    }
+
+    /** 批量删除收藏夹内视频（需登录 + CSRF）。resources 形如 "aid:2,aid:2"。 */
+    fun batchDeleteFavoriteResources(
+        mediaId: Long,
+        resources: String,
+        callback: (Boolean, String?) -> Unit
+    ) {
+        if (mediaId <= 0L || resources.isBlank()) { callback(false, "没有可删除的内容"); return }
+        if (!BiliSessionStore.isLoggedIn()) { callback(false, "请先登录"); return }
+        val csrf = csrfToken()
+        if (csrf.isBlank()) { callback(false, "登录凭证不完整"); return }
+        executeNetwork(
+            onRejected = { mainHandler.post { callback(false, "操作过快，请稍后再试") } }
+        ) {
+            try {
+                val root = postForm(
+                    "https://api.bilibili.com/x/v3/fav/resource/batch-del",
+                    linkedMapOf(
+                        "resources" to resources,
+                        "media_id" to mediaId.toString(),
+                        "platform" to "web",
+                        "csrf" to csrf
+                    )
+                )
+                val code = root.optInt("code", -1)
+                if (code != 0) {
+                    mainHandler.post {
+                        callback(false, root.optString("message").ifBlank { "删除失败（$code）" })
+                    }
+                    return@executeNetwork
+                }
+                mainHandler.post { callback(true, null) }
+            } catch (error: Exception) {
+                mainHandler.post { callback(false, readableError(error)) }
+            }
+        }
+    }
+
+    /** 清理收藏夹内已失效视频（需登录 + CSRF）。 */
+    fun cleanFavoriteResources(mediaId: Long, callback: (Boolean, String?) -> Unit) {
+        if (mediaId <= 0L) { callback(false, "收藏夹不存在"); return }
+        if (!BiliSessionStore.isLoggedIn()) { callback(false, "请先登录"); return }
+        val csrf = csrfToken()
+        if (csrf.isBlank()) { callback(false, "登录凭证不完整"); return }
+        executeNetwork(
+            onRejected = { mainHandler.post { callback(false, "操作过快，请稍后再试") } }
+        ) {
+            try {
+                val root = postForm(
+                    "https://api.bilibili.com/x/v3/fav/resource/clean",
+                    linkedMapOf("media_id" to mediaId.toString(), "csrf" to csrf)
+                )
+                val code = root.optInt("code", -1)
+                if (code != 0) {
+                    mainHandler.post {
+                        callback(false, root.optString("message").ifBlank { "清理失败（$code）" })
+                    }
+                    return@executeNetwork
+                }
+                mainHandler.post { callback(true, null) }
+            } catch (error: Exception) {
+                mainHandler.post { callback(false, readableError(error)) }
             }
         }
     }
@@ -764,11 +1485,9 @@ object BiliApi {
         }
     }
 
-    /** 拉取 B 站观看历史（需登录）。返回最近观看的视频列表。 */
-    /**
-     * 拉取 B 站观看历史（需登录）。旧接口 x/v2/history 已废弃（code -400），
+    /** 拉取 B 站观看历史（需登录）。旧接口 x/v2/history 已废弃（code -400），
      * 改用 x/web-interface/history/cursor 游标分页：
-     * 首次 max=0&view_at=0&business=archive；
+     * 首次 max=0&view_at=0&type=archive；
      * 后续必须把上一页 cursor 的 max / view_at / business 原样回传，
      * 否则会卡在第一段（这是「历史显示不全」的常见根因）。
      *
@@ -792,7 +1511,7 @@ object BiliApi {
                 val biz = business.ifBlank { "archive" }
                 val root = getJson(
                     "https://api.bilibili.com/x/web-interface/history/cursor" +
-                        "?max=$max&view_at=$viewAt&business=${URLEncoder.encode(biz, "UTF-8")}&ps=30",
+                        "?max=$max&view_at=$viewAt&business=${URLEncoder.encode(biz, "UTF-8")}&type=archive&ps=30",
                     mapOf("Cookie" to BiliPlayUrl.cookieHeader())
                 )
                 ensureSuccess(root)
@@ -806,30 +1525,97 @@ object BiliApi {
                 for (index in 0 until list.length()) {
                     val item = list.optJSONObject(index) ?: continue
                     val history = item.optJSONObject("history") ?: continue
-                    // 只收视频稿件；cursor 里 business 可能短暂切到 pgc 等，跳过无 bvid 的项
+                    // 只收视频稿件；跳过无 bvid 的项
                     val bvid = history.optString("bvid")
                     if (bvid.isBlank()) continue
+                    val progressSec = item.optLong("progress", 0L)
+                    val durationSec = item.optInt("duration", 0)
+                    val rawBusiness = history.optString("business").ifBlank { "archive" }
+                    val rawKid = item.optLong("kid", 0L)
                     videos += VideoItem(
                         bvid = bvid,
                         title = item.optString("title").ifBlank { "（无标题）" },
                         owner = item.optString("author_name").ifBlank { "未知UP主" },
                         cover = normalizeUrl(item.optString("cover")),
                         views = 0L,
-                        duration = item.optInt("duration", 0),
+                        duration = durationSec,
                         description = "",
                         // 历史接口的 view_at 是观看时间（秒）
                         publishedAt = item.optLong("view_at", 0L),
                         cid = history.optLong("cid", 0L),
                         aid = history.optLong("oid", 0L),
-                        ownerMid = item.optLong("author_mid", 0L)
+                        ownerMid = item.optLong("author_mid", 0L),
+                        rcmdReason = buildHistoryKid(rawBusiness, rawKid),
+                        watchProgressSec = progressSec
                     )
                 }
-                // 结束判定：本页原始 list 为空，或游标没有前进（B 站常见终点）
-                val ended = list.length() == 0 ||
-                    (nextMax == max && nextViewAt == viewAt && max != 0L)
+                // 结束判定：本页原始 list 为空，或游标不再前进（避免重复分页死循环）
+                val ended = isHistoryCursorEnded(
+                    listLength = list.length(),
+                    prevMax = max,
+                    prevViewAt = viewAt,
+                    nextMax = nextMax,
+                    nextViewAt = nextViewAt
+                )
                 mainHandler.post { callback(videos, null, nextMax, nextViewAt, nextBusiness, ended) }
             } catch (error: Exception) {
                 mainHandler.post { callback(emptyList(), readableError(error), max, viewAt, business, false) }
+            }
+        }
+    }
+
+    internal fun buildHistoryKid(business: String, kid: Long): String =
+        if (kid > 0L && business.isNotBlank()) "${business}_$kid" else ""
+
+    internal fun isHistoryCursorEnded(
+        listLength: Int,
+        prevMax: Long,
+        prevViewAt: Long,
+        nextMax: Long,
+        nextViewAt: Long
+    ): Boolean = listLength == 0 ||
+        (nextMax == 0L && nextViewAt == 0L) ||
+        (prevMax != 0L && nextMax == prevMax && nextViewAt == prevViewAt)
+
+    /** 删除单条历史记录（需登录）。kid 格式为 "<business>_<kid>"。 */
+    fun deleteHistoryItem(kid: String, callback: (Boolean, String?) -> Unit) {
+        if (!BiliSessionStore.isLoggedIn()) { callback(false, "请先登录"); return }
+        if (kid.isBlank()) { callback(false, "该条记录不支持删除"); return }
+        val csrf = csrfToken()
+        if (csrf.isBlank()) { callback(false, "登录凭证不完整"); return }
+        executeNetwork(
+            onRejected = { mainHandler.post { callback(false, "操作过快，请稍后再试") } }
+        ) {
+            try {
+                val root = postForm(
+                    "https://api.bilibili.com/x/v2/history/delete",
+                    mapOf("kid" to kid, "csrf" to csrf)
+                )
+                ensureSuccess(root)
+                mainHandler.post { callback(true, null) }
+            } catch (error: Exception) {
+                mainHandler.post { callback(false, readableError(error)) }
+            }
+        }
+    }
+
+    /** 清空远端观看历史（需登录）。 */
+    fun clearRemoteHistory(callback: (Boolean, String?) -> Unit) {
+        if (!BiliSessionStore.isLoggedIn()) { callback(false, "请先登录"); return }
+        val csrf = csrfToken()
+        if (csrf.isBlank()) { callback(false, "登录凭证不完整"); return }
+        executeNetwork(
+            onRejected = { mainHandler.post { callback(false, "操作过快，请稍后再试") } }
+        ) {
+            try {
+                val root = postForm(
+                    "https://api.bilibili.com/x/v2/history/clear",
+                    mapOf("csrf" to csrf)
+                )
+                ensureSuccess(root)
+                mainHandler.post { callback(true, null) }
+            } catch (error: Exception) {
+                mainHandler.post { callback(false, readableError(error)) }
             }
         }
     }
@@ -889,7 +1675,8 @@ object BiliApi {
                         cid = history?.optLong("cid", 0L) ?: 0L,
                         aid = history?.optLong("oid", 0L)
                             ?: item.optLong("aid", 0L),
-                        ownerMid = item.optLong("author_mid", 0L)
+                        ownerMid = item.optLong("author_mid", 0L),
+                        watchProgressSec = item.optLong("progress", 0L)
                     )
                 }
                 val hasMore = data.optBoolean("has_more", list.length() >= 20)
@@ -900,9 +1687,48 @@ object BiliApi {
         }
     }
 
+    private val historyReports = object {
+        private val lock = Any()
+        private val queue = LinkedHashMap<String, Pair<String, Map<String, String>>>()
+        private val worker = ThreadPoolExecutor(1, 1, 15L, TimeUnit.SECONDS, LinkedBlockingQueue()).apply {
+            allowCoreThreadTimeOut(true)
+        }
+        private var scheduled = false
+
+        fun offer(session: String, form: Map<String, String>) {
+            val key = "${form["aid"]}:${form["cid"]}"
+            synchronized(lock) {
+                queue[key] = session to form
+                if (queue.size > 16) queue.remove(queue.keys.first())
+                if (scheduled) return
+                scheduled = true
+            }
+            worker.execute {
+                while (true) {
+                    val report = synchronized(lock) {
+                        if (queue.isEmpty()) {
+                            scheduled = false
+                            return@execute
+                        }
+                        requireNotNull(queue.remove(queue.keys.first()))
+                    }
+                    if (report.first != BiliSessionStore.cookie()) continue
+                    try {
+                        postForm("https://api.bilibili.com/x/v2/history/report", report.second, report.first)
+                    } catch (error: IOException) {
+                        android.util.Log.d("BiliApi", "Unable to report playback progress")
+                    } catch (_: org.json.JSONException) {
+                        android.util.Log.d("BiliApi", "Invalid playback history response")
+                    }
+                }
+            }
+        }
+    }
+
     /** 上报观看进度到 B 站历史（需登录）。status: 3=播放中, 2=暂停/退出。 */
     fun reportHistory(aid: Long, cid: Long, progressSeconds: Long, durationSeconds: Long, status: Int) {
-        if (aid <= 0L || cid <= 0L || !BiliSessionStore.isLoggedIn()) return
+        val session = BiliSessionStore.cookie()
+        if (aid <= 0L || cid <= 0L || !BiliSessionStore.isLoggedIn(session)) return
         val form = linkedMapOf(
             "aid" to aid.toString(),
             "cid" to cid.toString(),
@@ -910,11 +1736,9 @@ object BiliApi {
             "pt" to durationSeconds.toString(),
             "status" to status.toString(),
             "type" to "3",
-            "csrf" to csrfToken()
+            "csrf" to csrfToken(session)
         )
-        Thread {
-            try { postForm("https://api.bilibili.com/x/v2/history/report", form) } catch (_: Exception) { }
-        }.start()
+        historyReports.offer(session, form)
     }
 
     /** 收藏/取消收藏视频（需登录）。rid=视频 aid，type=2 固定；addIds/delIds 为逗号分隔的收藏夹 id。 */
@@ -1018,88 +1842,59 @@ object BiliApi {
         return list
     }
 
-    private fun csrfToken(): String =
-        BiliSessionStore.cookie()
+    private fun csrfToken(session: String = BiliSessionStore.cookie()): String =
+        session
             .substringAfter("bili_jct=", "").substringBefore(";").trim()
 
-    private fun postForm(address: String, form: Map<String, String>): JSONObject {
-        val connection = (URL(address).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 12_000
-            readTimeout = 15_000
-            requestMethod = "POST"
-            doOutput = true
-            setRequestProperty("User-Agent", NETWORK_USER_AGENT)
-            setRequestProperty("Referer", "https://www.bilibili.com/")
-            setRequestProperty("Origin", "https://www.bilibili.com")
-            setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-            // Prefer full playurl cookie (session + buvid) for write actions.
-            val cookie = BiliPlayUrl.cookieHeader().ifBlank { BiliSessionStore.cookie() }
-            if (cookie.isNotBlank()) setRequestProperty("Cookie", cookie)
-        }
-        try {
-            val body = form.entries.joinToString("&") { (name, value) ->
-                "${URLEncoder.encode(name, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
-            }
-            connection.outputStream.bufferedWriter().use { it.write(body) }
-            val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
-            val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-            if (text.isBlank()) throw IllegalStateException("网络请求没有返回内容（HTTP ${connection.responseCode}）")
-            return JSONObject(text)
-        } finally {
-            connection.disconnect()
-        }
+    private fun postForm(address: String, form: Map<String, String>,
+                         session: String = BiliSessionStore.cookie()): JSONObject {
+        val body = okhttp3.FormBody.Builder().apply { form.forEach { (name, value) -> add(name, value) } }.build()
+        val request = BiliHttp.request(address)
+            .header("Origin", "https://www.bilibili.com")
+            .header("Cookie", BiliPlayUrl.cookieHeader(session = session))
+            .post(body)
+            .build()
+        return BiliHttp.client.newCall(request).execute().use(BiliHttp::json)
     }
 
     private fun requestFeed(
         address: String,
         callback: (FeedPage?, String?) -> Unit,
+        checkNoMore: Boolean = false,
         extractor: (JSONObject) -> JSONArray?
-    ) {
-        executeNetwork(
-            onRejected = { mainHandler.post { callback(null, "操作过快，请稍后再试") } }
-        ) {
-            try {
-                val root = getJson(address)
-                ensureSuccess(root)
-                val array = extractor(root) ?: throw IllegalStateException("未返回视频列表")
-                val videos = ArrayList<VideoItem>()
-                for (index in 0 until array.length()) {
-                    array.optJSONObject(index)?.let { video ->
-                        val parsed = videoFromJson(video)
-                        if (parsed.bvid.isNotBlank()) videos += parsed
-                    }
-                }
-                if (array.length() > 0 && videos.isEmpty()) {
-                    throw IllegalStateException("未返回有效视频")
-                }
-                mainHandler.post { callback(FeedPage(videos, array.length() == 0), null) }
-            } catch (error: Exception) {
-                mainHandler.post { callback(null, readableError(error)) }
-            }
+    ): Call {
+        val call = jsonCall(address)
+        fun deliver(page: FeedPage?, error: String?) {
+            mainHandler.post { callback(page, error) }
         }
-    }
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) = deliver(null, readableError(e))
 
-    private fun requestList(
-        address: String,
-        callback: (List<VideoItem>?, String?) -> Unit,
-        extractor: (JSONObject) -> JSONArray
-    ) {
-        executeNetwork(
-            onRejected = { mainHandler.post { callback(null, "操作过快，请稍后再试") } }
-        ) {
-            try {
-                val root = getJson(address)
-                ensureSuccess(root)
-                val array = extractor(root)
-                val videos = ArrayList<VideoItem>()
-                for (index in 0 until array.length()) {
-                    array.optJSONObject(index)?.let { videos += videoFromJson(it) }
+            override fun onResponse(call: Call, response: Response) {
+                val result = try {
+                    response.use {
+                        val root = BiliHttp.json(it)
+                        ensureSuccess(root)
+                        val array = extractor(root) ?: error("未返回视频列表")
+                        val videos = ArrayList<VideoItem>(array.length())
+                        for (index in 0 until array.length()) {
+                            val entry = array.optJSONObject(index) ?: continue
+                            val video = videoFromJson(entry)
+                            if (video.bvid.isNotBlank()) videos.add(video)
+                        }
+                        check(array.length() == 0 || videos.isNotEmpty()) { "未返回有效视频" }
+                        val endReached = array.length() == 0 ||
+                            (checkNoMore && flag(root.optJSONObject("data"), "no_more"))
+                        FeedPage(videos, endReached)
+                    }
+                } catch (error: Exception) {
+                    deliver(null, readableError(error))
+                    return
                 }
-                mainHandler.post { callback(videos, null) }
-            } catch (error: Exception) {
-                mainHandler.post { callback(null, readableError(error)) }
+                deliver(result, null)
             }
-        }
+        })
+        return call
     }
 
     private fun executeNetwork(onRejected: () -> Unit, task: () -> Unit) {
@@ -1118,49 +1913,83 @@ object BiliApi {
         }
     }
 
-    private fun ensureAnonymousSearchCookie() {
-        if (anonymousSearchCookie.isNotBlank()) return
-        val root = getJson(FINGERPRINT_URL)
-        ensureSuccess(root)
-        val data = root.optJSONObject("data") ?: throw IllegalStateException("未建立搜索会话")
-        val buvid3 = data.optString("b_3")
-        val buvid4 = data.optString("b_4")
-        if (buvid3.isBlank()) throw IllegalStateException("未建立搜索会话")
-        anonymousSearchCookie = "buvid3=$buvid3; buvid4=$buvid4; CURRENT_FNVAL=4048; CURRENT_QUALITY=80"
+    /** 返回本轮使用的匿名 cookie 快照；带单飞锁防止 UGC/番剧/影视并发首次搜索重复拉取 SPI。 */
+    private fun ensureAnonymousSearchCookie(): String {
+        val current = anonymousSearchCookie
+        if (current.isNotBlank()) return current
+        synchronized(anonSearchInitLock) {
+            val again = anonymousSearchCookie
+            if (again.isNotBlank()) return again
+            // SPI 必须无条件匿名请求，不能带登录态
+            val root = jsonCall(FINGERPRINT_URL, emptyMap(), session = "").execute().use(BiliHttp::json)
+            ensureSuccess(root)
+            val data = root.optJSONObject("data") ?: throw IllegalStateException("未建立搜索会话")
+            val buvid3 = data.optString("b_3")
+            val buvid4 = data.optString("b_4")
+            if (buvid3.isBlank()) throw IllegalStateException("未建立搜索会话")
+            val cookie = "buvid3=$buvid3; buvid4=$buvid4; CURRENT_FNVAL=4048; CURRENT_QUALITY=80"
+            anonymousSearchCookie = cookie
+            return cookie
+        }
     }
 
-    private fun searchHeaders(): Map<String, String> {
+    private fun searchHeaders(anonCookie: String): Map<String, String> {
         val headers = LinkedHashMap<String, String>()
         headers["Referer"] = "https://search.bilibili.com/"
         headers["Origin"] = "https://search.bilibili.com"
-        if (anonymousSearchCookie.isNotBlank()) headers["Cookie"] = anonymousSearchCookie
+        headers["Cookie"] = anonCookie
         return headers
     }
 
-    private fun isRequestBanned(error: Exception): Boolean =
-        error.message.orEmpty().contains("request was banned", ignoreCase = true)
+    internal fun isRequestBanned(error: Exception): Boolean {
+        val message = error.message.orEmpty()
+        return message.contains("request was banned", ignoreCase = true) ||
+            message.contains("412") ||
+            message.contains("拦截") ||
+            message.contains("v_voucher") ||
+            message.contains("风险") ||
+            message.contains("过快")
+    }
 
-    private fun getJson(address: String, extraHeaders: Map<String, String> = emptyMap()): JSONObject {
-        val connection = (URL(address).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 12_000
-            readTimeout = 15_000
-            requestMethod = "GET"
-            setRequestProperty("User-Agent", NETWORK_USER_AGENT)
-            setRequestProperty("Referer", "https://www.bilibili.com/")
-            setRequestProperty("Accept", "application/json, text/plain, */*")
-            // Logged-in cookie unlocks personalised fields such as req_user.like
-            // and reply.action. Anonymous requests keep working without it.
-            val session = BiliSessionStore.cookie()
-            if (session.isNotBlank()) setRequestProperty("Cookie", session)
-            extraHeaders.forEach { (name, value) -> setRequestProperty(name, value) }
-        }
-        try {
-            val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
-            val body = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-            if (body.isBlank()) throw IllegalStateException("网络请求没有返回内容（HTTP ${connection.responseCode}）")
+    /** JVM 单测入口：与 isRequestBanned 同逻辑。 */
+    internal fun isRequestBannedForTest(error: Exception): Boolean = isRequestBanned(error)
+
+    /** 搜索响应三分类：正常零命中（numResults=0，无 result 键）不算风控，不能触发重试。 */
+    internal enum class SearchOutcome { HAS_RESULT, EMPTY, GAIA_VERIFICATION }
+
+    internal fun classifySearchOutcome(voucher: String, numResults: Long, hasResultKey: Boolean): SearchOutcome {
+        if (voucher.isNotBlank()) return SearchOutcome.GAIA_VERIFICATION
+        if (numResults == 0L && !hasResultKey) return SearchOutcome.EMPTY
+        if (hasResultKey) return SearchOutcome.HAS_RESULT
+        return SearchOutcome.GAIA_VERIFICATION
+    }
+
+    internal fun classifySearchOutcome(data: JSONObject): SearchOutcome = classifySearchOutcome(
+        voucher = data.optString("v_voucher"),
+        numResults = data.optLong("numResults", -1L),
+        hasResultKey = data.has("result")
+    )
+
+    private fun jsonCall(address: String, extraHeaders: Map<String, String> = emptyMap(),
+                         session: String = BiliSessionStore.cookie()): Call {
+        val request = BiliHttp.request(address).apply {
+            if (session.isNotBlank()) header("Cookie", session)
+            extraHeaders.forEach { (name, value) -> header(name, value) }
+        }.build()
+        return BiliHttp.client.newCall(request)
+    }
+
+    private fun getJson(address: String, extraHeaders: Map<String, String> = emptyMap()): JSONObject =
+        jsonCall(address, extraHeaders).execute().use(BiliHttp::json)
+
+    /** 搜索专用：强制不带登录态 cookie；非 2xx 时保留状态码，避免风控页被当 JSON 解析异常吞掉。 */
+    private fun searchJson(address: String, anonCookie: String): JSONObject {
+        val response = jsonCall(address, searchHeaders(anonCookie), session = "").execute()
+        response.use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (body.isBlank()) throw IOException("搜索接口没有返回内容（HTTP ${resp.code}）")
+            if (!resp.isSuccessful) throw IOException("搜索接口异常（HTTP ${resp.code}）")
             return JSONObject(body)
-        } finally {
-            connection.disconnect()
         }
     }
 
@@ -1197,6 +2026,7 @@ object BiliApi {
                     val bvid = ep.optString("bvid")
                     val aid = ep.optLong("aid")
                     if (bvid.isBlank() && aid <= 0L) continue
+                    val arc = ep.optJSONObject("arc")
                     episodes += UgcEpisode(
                         bvid = bvid,
                         aid = aid,
@@ -1205,14 +2035,17 @@ object BiliApi {
                             .ifBlank { "第 ${episodes.size + 1} 集" },
                         // episodes 顶层没有 duration，真实时长在 arc.duration 里。
                         duration = ep.optInt("duration").takeIf { it > 0 }
-                            ?: (ep.optJSONObject("arc")?.optInt("duration") ?: 0),
+                            ?: (arc?.optInt("duration") ?: 0),
                         // episodes 顶层一般没有 cover，分集封面在 arc.pic（arc 与 data 对象同构）；
                         // 保留顶层 cover 兼容个别返回该字段的接口形态。
                         cover = normalizeUrl(ep.optString("cover").ifBlank {
-                            ep.optJSONObject("arc")?.optString("pic").orEmpty()
+                            arc?.optString("pic").orEmpty()
                         }),
+                        publishedAt = arc?.optLong("pubdate")?.takeIf { it > 0L }
+                            ?: arc?.optLong("ctime")?.takeIf { it > 0L }
+                            ?: 0L,
                         charge = hasExplicitChargeFlag(ep) ||
-                            hasExplicitChargeFlag(ep.optJSONObject("arc"))
+                            hasExplicitChargeFlag(arc)
                     )
                 }
             }
@@ -1270,13 +2103,17 @@ object BiliApi {
             )
         }
 
+        val stat = source.optJSONObject("stat")
+        val rcmdReason = cleanHtml(
+            source.optJSONObject("rcmd_reason")?.optString("content").orEmpty()
+        )
         return VideoItem(
             bvid = source.optString("bvid"),
             title = title,
             owner = source.optString("author").ifBlank { ownerObject?.optString("name").orEmpty() }
                 .ifBlank { "哔哩哔哩用户" },
             cover = normalizeUrl(source.optString("pic")),
-            views = source.optLong("play", source.optJSONObject("stat")?.optLong("view", 0L) ?: 0L),
+            views = source.optLong("play", stat?.optLong("view", 0L) ?: 0L),
             duration = durationFrom(source.opt("duration")),
             description = cleanHtml(source.optString("description").ifBlank { source.optString("desc") }),
             publishedAt = source.optLong("pubdate", source.optLong("ctime")),
@@ -1284,9 +2121,12 @@ object BiliApi {
             aid = source.optLong("aid"),
             ownerMid = ownerObject?.optLong("mid", 0L) ?: 0L,
             ownerAvatar = normalizeUrl(ownerObject?.optString("face").orEmpty()),
-            replyCount = source.optJSONObject("stat")?.optLong("reply", 0L)
+            replyCount = stat?.optLong("reply", 0L)
                 ?: source.optLong("review", 0L),
-            likes = source.optJSONObject("stat")?.optLong("like", 0L) ?: 0L,
+            danmakuCount = stat?.optLong("danmaku", 0L)
+                ?: source.optLong("video_review", 0L),
+            rcmdReason = rcmdReason,
+            likes = stat?.optLong("like", 0L) ?: 0L,
             liked = liked,
             season = normalizedSeason ?: season,
             charge = charge || (normalizedSeason?.episodes?.any { it.charge } == true)

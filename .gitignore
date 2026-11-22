@@ -1,5 +1,6 @@
 .gradle/
 .gradle-home/
+.build-env/
 .kotlin/
 app/build/
 build/
@@ -7,3 +8,4 @@ local.properties
 *.iml
 .idea/
 aapt2-launcher
+.aicode/

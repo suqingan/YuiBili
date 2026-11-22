@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 前景位图的 Logo 视觉区占画布 75.5%，超出自适应图标 66.7% 安全区，向内收 12% 保持视觉居中合适 -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/ic_launcher_foreground_img"
+    android:inset="12%" />

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 樱花玫瑰粉丝缎渐变底 -->
+    <path android:pathData="M0,0H108V108H0Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="12"
+                android:startY="8"
+                android:endX="96"
+                android:endY="102">
+                <item android:offset="0.0" android:color="#FFFF7AA8" />
+                <item android:offset="0.52" android:color="#FFF04C85" />
+                <item android:offset="1.0" android:color="#FFD4326B" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- 左上角柔和高光晕 -->
+    <path android:pathData="M0,0H108V82C76,62 38,58 0,76Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="28"
+                android:centerY="22"
+                android:gradientRadius="72">
+                <item android:offset="0.0" android:color="#48FFFFFF" />
+                <item android:offset="1.0" android:color="#00FFFFFF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- 右下角深玫红柔暗衬底增强立体景深 -->
+    <path android:pathData="M24,108C58,82 84,54 108,24V108Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="88"
+                android:centerY="88"
+                android:gradientRadius="64">
+                <item android:offset="0.0" android:color="#328F1442" />
+                <item android:offset="1.0" android:color="#008F1442" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>

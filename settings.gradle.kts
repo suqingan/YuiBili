@@ -1,8 +1,14 @@
 pluginManagement {
     repositories {
-        maven("https://mirrors.cloud.tencent.com/nexus/repository/maven-public/")
+        maven("https://maven.aliyun.com/repository/google") {
+            content {
+                includeGroupAndSubgroups("com.android")
+                includeGroupAndSubgroups("androidx")
+                includeGroup("com.google.testing.platform")
+            }
+        }
+        maven("https://maven.aliyun.com/repository/central")
         maven("https://maven.aliyun.com/repository/gradle-plugin")
-        maven("https://maven.aliyun.com/repository/google")
         google()
         mavenCentral()
         gradlePluginPortal()
@@ -11,9 +17,13 @@ pluginManagement {
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
-        maven("https://mirrors.cloud.tencent.com/nexus/repository/maven-public/")
-        maven("https://maven.aliyun.com/repository/google")
-        maven("https://maven.aliyun.com/repository/public")
+        maven("https://maven.aliyun.com/repository/google") {
+            content {
+                includeGroupAndSubgroups("androidx")
+                includeGroupAndSubgroups("com.android")
+            }
+        }
+        maven("https://maven.aliyun.com/repository/central")
         google()
         mavenCentral()
     }

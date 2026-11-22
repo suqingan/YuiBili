@@ -1,11 +1,18 @@
 package com.yuilittle.bili
 
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.FormBody
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
+import java.io.IOException
 import java.net.URLEncoder
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Bilibili web login endpoints (scan QR code + SMS) and the authenticated
@@ -18,7 +25,14 @@ object BiliLoginApi {
         "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
     private const val REFERER = "https://www.bilibili.com/"
 
-    private val pool: ExecutorService by lazy { Executors.newFixedThreadPool(2) }
+    /** 复用 BiliHttp 的共享连接池与 HTTP/2 复用，缩短冷启动 TLS/建连耗时。 */
+    private val client: OkHttpClient by lazy {
+        BiliHttp.client.newBuilder()
+            .connectTimeout(12, TimeUnit.SECONDS)
+            .readTimeout(12, TimeUnit.SECONDS)
+            .callTimeout(20, TimeUnit.SECONDS)
+            .build()
+    }
 
     /** QR scan status from poll(). */
     const val QR_PENDING = 0
@@ -41,61 +55,81 @@ object BiliLoginApi {
     )
 
     /** Async GET returning the parsed JSON object, or error text. */
-    private fun getJson(url: String, cookie: String = "",
-                        headerSink: ((Map<String, List<String>>) -> Unit)? = null,
-                        callback: (JSONObject?, String?) -> Unit) {
-        pool.execute {
-            try {
-                val connection = (URL(url).openConnection() as HttpURLConnection).apply {
-                    requestMethod = "GET"
-                    connectTimeout = 12000
-                    readTimeout = 12000
-                    setRequestProperty("User-Agent", LOGIN_UA)
-                    setRequestProperty("Referer", REFERER)
-                    setRequestProperty("Accept", "application/json, text/plain, */*")
-                    if (cookie.isNotBlank()) setRequestProperty("Cookie", cookie)
-                }
-                val code = connection.responseCode
-                headerSink?.invoke(connection.headerFields)
-                val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-                val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-                connection.disconnect()
-                callback(JSONObject(text), null)
-            } catch (error: Exception) {
-                callback(null, error.message ?: "网络错误")
+    private fun getJson(
+        url: String,
+        cookie: String = "",
+        headerSink: ((List<Pair<String, String>>) -> Unit)? = null,
+        callback: (JSONObject?, String?) -> Unit
+    ) {
+        val request = Request.Builder()
+            .url(url)
+            .get()
+            .header("User-Agent", LOGIN_UA)
+            .header("Referer", REFERER)
+            .header("Accept", "application/json, text/plain, */*")
+            .apply { if (cookie.isNotBlank()) header("Cookie", cookie) }
+            .build()
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                callback(null, e.message ?: "网络错误")
             }
-        }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use { res ->
+                    try {
+                        headerSink?.invoke(res.headers.toList())
+                        val text = res.body?.string().orEmpty()
+                        if (text.isBlank()) {
+                            callback(null, "网络错误（HTTP ${res.code}）")
+                        } else {
+                            callback(JSONObject(text), null)
+                        }
+                    } catch (error: Exception) {
+                        callback(null, error.message ?: "网络错误")
+                    }
+                }
+            }
+        })
     }
 
     /** Async POST form-encoded returning the parsed JSON object, or error text. */
-    private fun postForm(url: String, fields: Map<String, String>, cookie: String = "",
-                         callback: (JSONObject?, String?) -> Unit) {
-        pool.execute {
-            try {
-                val body = fields.entries.joinToString("&") { (k, v) ->
-                    "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v, "UTF-8")}"
-                }
-                val connection = (URL(url).openConnection() as HttpURLConnection).apply {
-                    requestMethod = "POST"
-                    doOutput = true
-                    connectTimeout = 12000
-                    readTimeout = 12000
-                    setRequestProperty("User-Agent", LOGIN_UA)
-                    setRequestProperty("Referer", REFERER)
-                    setRequestProperty("Origin", "https://www.bilibili.com")
-                    setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-                    if (cookie.isNotBlank()) setRequestProperty("Cookie", cookie)
-                }
-                connection.outputStream.use { it.write(body.toByteArray()) }
-                val code = connection.responseCode
-                val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-                val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-                connection.disconnect()
-                callback(JSONObject(text), null)
-            } catch (error: Exception) {
-                callback(null, error.message ?: "网络错误")
+    private fun postForm(
+        url: String,
+        fields: Map<String, String>,
+        cookie: String = "",
+        callback: (JSONObject?, String?) -> Unit
+    ) {
+        val body = FormBody.Builder().apply {
+            fields.forEach { (k, v) -> add(k, v) }
+        }.build()
+        val request = Request.Builder()
+            .url(url)
+            .post(body)
+            .header("User-Agent", LOGIN_UA)
+            .header("Referer", REFERER)
+            .header("Origin", "https://www.bilibili.com")
+            .apply { if (cookie.isNotBlank()) header("Cookie", cookie) }
+            .build()
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                callback(null, e.message ?: "网络错误")
             }
-        }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use { res ->
+                    try {
+                        val text = res.body?.string().orEmpty()
+                        if (text.isBlank()) {
+                            callback(null, "网络错误（HTTP ${res.code}）")
+                        } else {
+                            callback(JSONObject(text), null)
+                        }
+                    } catch (error: Exception) {
+                        callback(null, error.message ?: "网络错误")
+                    }
+                }
+            }
+        })
     }
 
     // ── QR code login ──────────────────────────────────────────────
@@ -121,18 +155,15 @@ object BiliLoginApi {
         // cross-domain link can be empty for some accounts).
         val headerPairs = ArrayList<String>()
         getJson(url, headerSink = { headers ->
-            // HttpURLConnection 的 Set-Cookie 键名大小写不统一，全扫一遍更稳。
-            headers.forEach { (key, values) ->
-                if (key != null && key.equals("Set-Cookie", ignoreCase = true)) {
-                    values.forEach { raw ->
-                        val pair = raw.substringBefore(';').trim()
-                        val name = pair.substringBefore('=')
-                        val value = pair.substringAfter('=', "")
-                        if (name in SESSION_NAMES && value.isNotBlank() &&
-                            headerPairs.none { it.startsWith("$name=") }
-                        ) {
-                            headerPairs += "$name=$value"
-                        }
+            headers.forEach { (key, raw) ->
+                if (key.equals("Set-Cookie", ignoreCase = true)) {
+                    val pair = raw.substringBefore(';').trim()
+                    val name = pair.substringBefore('=')
+                    val value = pair.substringAfter('=', "")
+                    if (name in SESSION_NAMES && value.isNotBlank() &&
+                        headerPairs.none { it.startsWith("$name=") }
+                    ) {
+                        headerPairs += "$name=$value"
                     }
                 }
             }
@@ -188,60 +219,47 @@ object BiliLoginApi {
 
     // ── Profile ────────────────────────────────────────────────────
 
-    /**
-     * Fetches the logged-in account profile.
-     *
-     * Basic fields come from `/x/web-interface/nav` (uname/face/coins/vip/level).
-     * Following / follower counts are no longer on that endpoint — they live on
-     * `/x/web-interface/nav/stat` (with `/x/relation/stat?vmid=` as a fallback).
-     */
-    fun fetchProfile(cookie: String, callback: (UserInfo?, String?) -> Unit) {
-        getJson("https://api.bilibili.com/x/web-interface/nav", cookie) { root, error ->
-            if (error != null || root == null) { callback(null, error ?: "网络错误"); return@getJson }
-            if (root.optInt("code") != 0) { callback(null, "未登录"); return@getJson }
-            val data = root.optJSONObject("data") ?: run { callback(null, "数据异常"); return@getJson }
-            if (data.optBoolean("isLogin", false) == false) { callback(null, "未登录"); return@getJson }
-            val levelInfo = data.optJSONObject("level_info")
-            // Keep legacy key names as last-resort defaults in case Bilibili
-            // re-introduces them on nav later.
-            val base = UserInfo(
-                uid = data.optLong("mid", 0L),
-                uname = data.optString("uname", "未知用户"),
-                face = data.optString("face", ""),
-                coins = data.optDouble("money", 0.0),
-                vipStatus = data.optInt("vipStatus", 0),
-                vipType = data.optInt("vipType", 0),
-                level = levelInfo?.optInt("current_level", 0) ?: 0,
-                following = data.optInt("following", data.optInt("mid_following", 0)),
-                follower = data.optInt("follower", 0)
-            )
-            enrichRelationCounts(cookie, base, callback)
+    fun fetchVipStatus(cookie: String, callback: (Int?, Int) -> Unit) {
+        getJson("https://api.bilibili.com/x/web-interface/nav", cookie) { root, _ ->
+            val data = root?.optJSONObject("data")
+            when {
+                root?.optInt("code", -1) == 0 && data?.optBoolean("isLogin") == true ->
+                    callback(data.optInt("vipStatus"), data.optInt("vipType"))
+                root?.optInt("code", -1) == -101 -> callback(0, 0)
+                else -> callback(null, 0)
+            }
         }
     }
 
-    /** Fills following/follower via nav/stat, then relation/stat as fallback. */
-    private fun enrichRelationCounts(
+    /**
+     * 并发拉取 /x/web-interface/nav 与 /x/web-interface/nav/stat 并汇聚结果，
+     * 仅在 nav/stat 失败时再回退 /x/relation/stat?vmid=，减少一次完整 RTT。
+     */
+    fun fetchProfile(
         cookie: String,
-        base: UserInfo,
+        onBaseReady: ((UserInfo) -> Unit)? = null,
         callback: (UserInfo?, String?) -> Unit
     ) {
-        getJson("https://api.bilibili.com/x/web-interface/nav/stat", cookie) { statRoot, _ ->
-            val stat = if (statRoot != null && statRoot.optInt("code") == 0) {
-                statRoot.optJSONObject("data")
-            } else null
-            if (stat != null) {
-                callback(
-                    base.copy(
-                        following = stat.optInt("following", base.following),
-                        follower = stat.optInt("follower", base.follower)
-                    ),
-                    null
-                )
-                return@getJson
+        val navRef = AtomicReference<Pair<UserInfo?, String?>?>(null)
+        val statRef = AtomicReference<Pair<Int, Int>?>(null)
+        val pending = AtomicInteger(2)
+
+        fun tryFinish() {
+            if (pending.get() > 0) return
+            val navResult = navRef.get()
+            val base = navResult?.first
+            if (base == null) {
+                callback(null, navResult?.second ?: "网络错误")
+                return
+            }
+            val counts = statRef.get()
+            if (counts != null) {
+                callback(base.copy(following = counts.first, follower = counts.second), null)
+                return
             }
             if (base.uid <= 0L) {
                 callback(base, null)
-                return@getJson
+                return
             }
             getJson(
                 "https://api.bilibili.com/x/relation/stat?vmid=${base.uid}",
@@ -259,11 +277,48 @@ object BiliLoginApi {
                         null
                     )
                 } else {
-                    // Profile itself is valid; counts just stay at whatever
-                    // nav happened to provide (usually 0 after API change).
                     callback(base, null)
                 }
             }
+        }
+
+        getJson("https://api.bilibili.com/x/web-interface/nav", cookie) { root, error ->
+            val parsed: Pair<UserInfo?, String?> = when {
+                error != null || root == null -> null to (error ?: "网络错误")
+                root.optInt("code") != 0 -> null to "未登录"
+                else -> {
+                    val data = root.optJSONObject("data")
+                    if (data == null) null to "数据异常"
+                    else if (!data.optBoolean("isLogin", false)) null to "未登录"
+                    else {
+                        val levelInfo = data.optJSONObject("level_info")
+                        UserInfo(
+                            uid = data.optLong("mid", 0L),
+                            uname = data.optString("uname", "未知用户"),
+                            face = data.optString("face", ""),
+                            coins = data.optDouble("money", 0.0),
+                            vipStatus = data.optInt("vipStatus", 0),
+                            vipType = data.optInt("vipType", 0),
+                            level = levelInfo?.optInt("current_level", 0) ?: 0,
+                            following = data.optInt("following", data.optInt("mid_following", 0)),
+                            follower = data.optInt("follower", 0)
+                        ) to null
+                    }
+                }
+            }
+            navRef.set(parsed)
+            parsed.first?.let { onBaseReady?.invoke(it) }
+            if (pending.decrementAndGet() == 0) tryFinish()
+        }
+
+        getJson("https://api.bilibili.com/x/web-interface/nav/stat", cookie) { statRoot, _ ->
+            val stat = if (statRoot != null && statRoot.optInt("code") == 0) {
+                statRoot.optJSONObject("data")
+            } else null
+            if (stat != null) {
+                statRef.set(stat.optInt("following", -1) to stat.optInt("follower", -1))
+            }
+            if (pending.decrementAndGet() == 0) tryFinish()
         }
     }
 

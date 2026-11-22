@@ -13,8 +13,6 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
-import android.graphics.PorterDuff
-import android.graphics.PorterDuffXfermode
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
@@ -33,23 +31,26 @@ import kotlin.math.max
 /** Extra flag: when set, MainActivity switches to the account ("我的") page. */
 const val EXTRA_SWITCH_TO_ACCOUNT = "main_switch_to_account"
 
-/**
- * The shell for YuiBili's three root destinations.
- * Content is deliberately empty for the current shell; this class owns only
- * root navigation, swipe handling, and lightweight continuous transitions.
- */
 class MainActivity : Activity() {
     private lateinit var pageHost: FrameLayout
-    private lateinit var bottomNavigation: FrostedBottomNavigation
-    private val pages = arrayOfNulls<View>(3)
+    private var bottomNavigation: FrostedBottomNavigation? = null
+    private var tabletRail: TabletRailNav? = null
+    private var tabletStage: TabletVerticalStage? = null
+    private val pages = arrayOfNulls<View>(2)
     private var currentPage = HOME
+    private var currentTabletDest = TabletRailNav.DEST_HOME
     private var refreshOnEntry = true
+    private var restoredHomeState: Bundle? = null
+    private var resumed = false
     private var reducedMotion = false
+    private var builtAsTablet = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         reducedMotion = MotionTokens.isReduced(this)
         Theme.init(this)
+        builtAsTablet = LayoutMode.isTablet
+        LayoutMode.applyTabletOrientationIfEnabled(this)
         // Paint the window with the current theme colour BEFORE any content so
         // recreate() after night-mode toggle never flashes the light styles.xml
         // windowBackground (#FFFCFA) for one frame.
@@ -62,18 +63,88 @@ class MainActivity : Activity() {
         // A new task/activity entry refreshes the feeds; state restoration (such as
         // rotation or process recreation with saved state) keeps the visible feed.
         refreshOnEntry = savedInstanceState == null
-        currentPage = savedInstanceState?.getInt(STATE_CURRENT_PAGE, HOME)
-            ?.coerceIn(HOME, PROFILE)
-            ?: HOME
+        restoredHomeState = savedInstanceState?.getBundle(STATE_HOME) ?: savedInstanceState
+        currentPage = savedInstanceState?.getInt(STATE_CURRENT_PAGE, HOME)?.coerceIn(HOME, PROFILE)
+            ?: destinationFor(intent) ?: HOME
+        currentTabletDest = savedInstanceState?.getInt(STATE_TABLET_DEST, TabletRailNav.DEST_HOME)
+            ?.coerceIn(0, TabletRailNav.DEST_COUNT - 1)
+            ?: if (destinationFor(intent) == PROFILE) TabletRailNav.DEST_PROFILE else TabletRailNav.DEST_HOME
         configureSystemBars()
 
         val root = FrameLayout(this).apply {
             setBackgroundColor(COLOR_BACKGROUND)
         }
 
-        // Root pages are selected by tapping, or by holding and scrubbing the dock.
-        // The content area keeps its own horizontal gestures for 推荐 / 热门.
-        pageHost = FrameLayout(this)
+        if (builtAsTablet) {
+            // 平板一体化工作台：左侧固定 Navigation Rail（首页/搜索/下载/收藏/历史/我的+夜间）+ 右侧纵向弹簧滚动舞台
+            val shell = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setBackgroundColor(COLOR_BACKGROUND)
+            }
+            val rail = TabletRailNav(
+                context = this,
+                onSelectDestination = { dest -> showTabletDestination(dest, animate = true) },
+                onToggleTheme = { anchor -> toggleDarkModeFromRail(anchor) }
+            )
+            tabletRail = rail
+            val stage = TabletVerticalStage(this)
+            tabletStage = stage
+            pageHost = stage
+
+            shell.addView(
+                rail,
+                LinearLayout.LayoutParams(
+                    dp(TabletRailNav.RAIL_WIDTH_DP),
+                    LinearLayout.LayoutParams.MATCH_PARENT
+                )
+            )
+            shell.addView(
+                View(this).apply { setBackgroundColor(Ds.colors.lineSoft) },
+                LinearLayout.LayoutParams(Ds.hairline(this), LinearLayout.LayoutParams.MATCH_PARENT)
+            )
+            shell.addView(
+                stage,
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+            )
+            root.addView(
+                shell,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                )
+            )
+            if (BiliSessionStore.isLoggedIn()) {
+                BiliSessionStore.preloadProfileIfNeeded(this) { info ->
+                    runOnUiThread {
+                        (tabletStage?.getPage(TabletRailNav.DEST_PROFILE) as? AccountPageView)?.syncCachedProfile(info)
+                    }
+                }
+            }
+            showTabletDestination(currentTabletDest, animate = false)
+            setContentView(root)
+            playPendingThemeTransition(root)
+            requestNotificationPermissionIfNeeded()
+            showDisclaimerIfNeeded()
+            root.postDelayed({
+                if (!isFinishing && !isDestroyed) BiliPlayUrl.prewarm()
+            }, 650L)
+            return
+        }
+
+        // 手机端：保持原左右滑动 RootPager + 悬浮底部胶囊导航
+        val pager = RootPager(this)
+        pageHost = pager
+        pager.setOnPageSelectedListener { index ->
+            currentPage = index
+            if (!pager.isTransitioning()) updateActivePage()
+            bottomNavigation?.setSelectedIndex(index)
+        }
+        pager.setOnPageRevealListener { index ->
+            if (index == HOME) (pages[HOME] as? HomeFeedView)?.prepareVisible()
+        }
+        pager.setOnPageScrollListener { progress ->
+            bottomNavigation?.setScrollProgress(progress)
+        }
         root.addView(
             pageHost,
             FrameLayout.LayoutParams(
@@ -82,87 +153,170 @@ class MainActivity : Activity() {
             )
         )
 
-        for (index in pages.indices) {
-            val page = createRootPage(index).apply {
-                contentDescription = pageDescription(index)
-                visibility = if (index == currentPage) View.VISIBLE else View.INVISIBLE
-            }
-            pages[index] = page
-            pageHost.addView(
-                page,
-                FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.MATCH_PARENT
-                )
-            )
-        }
-
-        bottomNavigation = FrostedBottomNavigation(this).apply {
+        val dock = FrostedBottomNavigation(this).apply {
             setOnDestinationSelectedListener { destination -> showPage(destination) }
+            // 已在首页时再点「首页」：快速平滑回顶（不再切页）
+            setOnDestinationReselectedListener { destination ->
+                if (destination == HOME && currentPage == HOME) {
+                    (pages[HOME] as? HomeFeedView)?.scrollToTop()
+                }
+            }
         }
-        // A compact floating dock: generous touch targets without a heavy long rail.
-        val navigationWidth = minOf(
-            dp(240),
-            resources.displayMetrics.widthPixels - dp(40)
-        )
+        bottomNavigation = dock
+        val dockWidth = minOf(dp(208), resources.displayMetrics.widthPixels - dp(48))
         root.addView(
-            bottomNavigation,
+            dock,
             FrameLayout.LayoutParams(
-                navigationWidth,
-                dp(78),
+                dockWidth,
+                dp(62),
                 Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
             ).apply {
-                bottomMargin = dp(16)
+                bottomMargin = dp(12)
             }
         )
 
+        if (BiliSessionStore.isLoggedIn()) {
+            BiliSessionStore.preloadProfileIfNeeded(this) { info ->
+                runOnUiThread {
+                    (pages[PROFILE] as? AccountPageView)?.syncCachedProfile(info)
+                }
+            }
+        }
+        for (index in pages.indices) obtainPage(index)
+        pager.showPage(currentPage, animate = false)
         setContentView(root)
         playPendingThemeTransition(root)
         requestNotificationPermissionIfNeeded()
         showDisclaimerIfNeeded()
-        // Each open: one silent live check against remote JSON. No sticky disk cache —
-        // tip only appears when the *current* remote is newer than this install.
-        // Skipped while the first-run disclaimer is still pending.
+        // 冷启动空闲阶段预热 WBI 密钥与匿名 buvid（合并单飞），首屏稳定后点开视频或搜索无需再临时握手
         root.postDelayed({
-            val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            if (prefs.getBoolean(KEY_DISCLAIMER_ACCEPTED, false)) {
-                UpdateChecker.checkOnLaunch(this@MainActivity)
-            }
-        }, 1200L)
-        bottomNavigation.setSelectedIndex(currentPage)
-        (pages[HOME] as? HomeFeedView)?.let { home ->
-            savedInstanceState?.let { state -> home.restoreState(state) }
-        }
+            if (!isFinishing && !isDestroyed) BiliPlayUrl.prewarm()
+        }, 650L)
+        bottomNavigation?.setSelectedIndex(currentPage)
         root.post {
-            bottomNavigation.alpha = if (reducedMotion) 1f else 0f
-            bottomNavigation.translationY = if (reducedMotion) 0f else dp(18).toFloat()
-            bottomNavigation.animate()
-                .alpha(1f)
-                .translationY(0f)
-                .setDuration(if (reducedMotion) MotionTokens.smallMs else MotionTokens.panelMs)
-                .setInterpolator(MotionTokens.easeOut)
-                .start()
+            bottomNavigation?.alpha = 1f
+            bottomNavigation?.translationY = 0f
         }
+    }
+
+    private fun showTabletDestination(dest: Int, animate: Boolean) {
+        val stage = tabletStage ?: return
+        currentTabletDest = dest.coerceIn(0, TabletRailNav.DEST_COUNT - 1)
+        tabletRail?.setSelectedDestination(currentTabletDest)
+        stage.showPage(currentTabletDest, { createTabletPage(currentTabletDest) }, animate = animate)
+        updateActivePage()
+    }
+
+    private fun createTabletPage(dest: Int): View = when (dest) {
+        TabletRailNav.DEST_HOME -> HomeFeedView(this, refreshOnEntry, restoredHomeState).also {
+            restoredHomeState = null
+            pages[HOME] = it
+        }
+        TabletRailNav.DEST_SEARCH -> TabletSearchPageView(this)
+        TabletRailNav.DEST_DOWNLOADS -> DownloadPageView(this, initialTab = DownloadPageView.TAB_VIDEO, onClose = null)
+        TabletRailNav.DEST_FAVORITES -> TabletFavoritesPageView(this)
+        TabletRailNav.DEST_HISTORY -> TabletHistoryPageView(this)
+        else -> AccountPageView(this).also { pages[PROFILE] = it }
+    }
+
+    private fun toggleDarkModeFromRail(anchor: View) {
+        val next = !Theme.isDark
+        try {
+            val content = window.decorView.findViewById<View>(android.R.id.content) ?: window.decorView
+            val anchorLoc = IntArray(2)
+            val contentLoc = IntArray(2)
+            anchor.getLocationOnScreen(anchorLoc)
+            content.getLocationOnScreen(contentLoc)
+            val cx = anchorLoc[0] - contentLoc[0] + anchor.width / 2f
+            val cy = anchorLoc[1] - contentLoc[1] + anchor.height / 2f
+            val bmp = Bitmap.createBitmap(
+                content.width.coerceAtLeast(1),
+                content.height.coerceAtLeast(1),
+                Bitmap.Config.ARGB_8888
+            )
+            content.draw(Canvas(bmp))
+            Theme.prepareCircularTransition(bmp, cx, cy, expand = next)
+        } catch (_: Exception) {
+        }
+        Theme.setDark(this, next)
+        @Suppress("DEPRECATION")
+        overridePendingTransition(0, 0)
+        recreate()
     }
 
     override fun onResume() {
         super.onResume()
-        // Soft: keep the profile card stable when returning from history/favorites.
-        (pages[PROFILE] as? AccountPageView)?.refresh(soft = true)
-        // Returning from background / launcher also re-checks remote JSON so a
-        // just-pushed update.json is picked up without killing the process.
-        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        if (prefs.getBoolean(KEY_DISCLAIMER_ACCEPTED, false)) {
-            UpdateChecker.checkOnForeground(this)
-        }
+        resumed = true
+        updateActivePage()
+    }
+
+    override fun onPause() {
+        resumed = false
+        updateActivePage()
+        super.onPause()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        if (intent.getBooleanExtra(EXTRA_SWITCH_TO_ACCOUNT, false)) {
-            showPage(PROFILE)
-            (pages[PROFILE] as? AccountPageView)?.refresh(soft = false)
+        destinationFor(intent)?.let { dest ->
+            if (builtAsTablet) {
+                showTabletDestination(
+                    if (dest == PROFILE) TabletRailNav.DEST_PROFILE else TabletRailNav.DEST_HOME,
+                    animate = true
+                )
+            } else {
+                showPage(dest)
+            }
         }
+    }
+
+    @Suppress("DEPRECATION")
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (builtAsTablet) {
+            val curView = tabletStage?.getPage(currentTabletDest)
+            if (curView is TabletSearchPageView && curView.handleBack()) return
+            if (curView is DownloadPageView && curView.handleBack()) return
+            if (currentTabletDest != TabletRailNav.DEST_HOME) {
+                showTabletDestination(TabletRailNav.DEST_HOME, animate = true)
+                return
+            }
+        }
+        super.onBackPressed()
+    }
+
+    override fun onDestroy() {
+        (tabletStage?.getPage(TabletRailNav.DEST_SEARCH) as? TabletSearchPageView)?.destroy()
+        super.onDestroy()
+    }
+
+    private fun destinationFor(intent: Intent): Int? = when {
+        intent.getBooleanExtra(EXTRA_SWITCH_TO_ACCOUNT, false) -> PROFILE
+        else -> null
+    }
+
+    private fun updateActivePage() {
+        if (builtAsTablet) {
+            (tabletStage?.getPage(TabletRailNav.DEST_HOME) as? HomeFeedView)
+                ?.setActive(resumed && currentTabletDest == TabletRailNav.DEST_HOME)
+            (tabletStage?.getPage(TabletRailNav.DEST_PROFILE) as? AccountPageView)
+                ?.setActive(resumed && currentTabletDest == TabletRailNav.DEST_PROFILE)
+            (tabletStage?.getPage(TabletRailNav.DEST_DOWNLOADS) as? DownloadPageView)
+                ?.setActive(resumed && currentTabletDest == TabletRailNav.DEST_DOWNLOADS)
+            if (resumed) {
+                when (currentTabletDest) {
+                    TabletRailNav.DEST_SEARCH ->
+                        (tabletStage?.getPage(TabletRailNav.DEST_SEARCH) as? TabletSearchPageView)?.onPageActivated()
+                    TabletRailNav.DEST_FAVORITES ->
+                        (tabletStage?.getPage(TabletRailNav.DEST_FAVORITES) as? TabletFavoritesPageView)?.onPageActivated()
+                    TabletRailNav.DEST_HISTORY ->
+                        (tabletStage?.getPage(TabletRailNav.DEST_HISTORY) as? TabletHistoryPageView)?.onPageActivated()
+                }
+            }
+            return
+        }
+        (pages[HOME] as? HomeFeedView)?.setActive(resumed && currentPage == HOME)
+        (pages[PROFILE] as? AccountPageView)?.setActive(resumed && currentPage == PROFILE)
     }
 
     /** Android 13+ 需要运行时授予通知权限，后台下载进度通知依赖它。 */
@@ -185,12 +339,12 @@ class MainActivity : Activity() {
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(24), dp(24), dp(20))
-            background = rounded(COLOR_CARD, dp(18), COLOR_CARD_BORDER, dp(1))
+            background = Ds.card(this@MainActivity, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.dialog)
         }
         content.addView(TextView(this).apply {
             text = "免责声明"
             textSize = 18f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            typeface = Ds.display(bold = true)
             gravity = Gravity.CENTER
             setTextColor(COLOR_INK)
         }, LinearLayout.LayoutParams(
@@ -201,8 +355,9 @@ class MainActivity : Activity() {
                 "\"哔哩哔哩\"及\"Bilibili\"名称、LOGO及相关图形是上海幻电信息科技有限公司的注册商标或商标。\n" +
                 "本项目与哔哩哔哩及其关联公司无任何关联、合作、授权或背书等关系。"
             textSize = 13f
+            typeface = Ds.body()
             setLineSpacing(dp(6).toFloat(), 1f)
-            setTextColor(COLOR_INK)
+            setTextColor(COLOR_MUTED)
             setPadding(0, dp(16), 0, 0)
         }, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
@@ -210,6 +365,7 @@ class MainActivity : Activity() {
         val agreeBox = CheckBox(this).apply {
             text = "我已阅读免责声明，继续使用"
             textSize = 13f
+            typeface = Ds.body()
             setTextColor(COLOR_INK)
             setPadding(0, dp(12), 0, 0)
         }
@@ -224,18 +380,19 @@ class MainActivity : Activity() {
         val cancelButton = TextView(this).apply {
             text = "取消"
             textSize = 14f
+            typeface = Ds.body()
             gravity = Gravity.CENTER
             setTextColor(COLOR_MUTED)
-            background = rounded(COLOR_SURFACE, dp(13), COLOR_CARD_BORDER, dp(1))
+            background = Ds.pill(this@MainActivity, COLOR_SURFACE, Ds.colors.lineSoft)
             isClickable = true
         }
         val confirmButton = TextView(this).apply {
             text = "确定"
             textSize = 14f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            typeface = Ds.body(true)
             gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            background = rounded(COLOR_ROSE, dp(13))
+            setTextColor(COLOR_ON_ROSE)
+            background = Ds.pill(this@MainActivity, COLOR_ROSE)
             isClickable = true
             isEnabled = false
             alpha = 0.4f
@@ -264,7 +421,7 @@ class MainActivity : Activity() {
         dialog.setCanceledOnTouchOutside(false)
         dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         dialog.window?.setLayout(
-            resources.displayMetrics.widthPixels - dp(48),
+            minOf(resources.displayMetrics.widthPixels - dp(48), dp(420)),
             android.view.ViewGroup.LayoutParams.WRAP_CONTENT
         )
         dialog.show()
@@ -272,93 +429,46 @@ class MainActivity : Activity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putInt(STATE_CURRENT_PAGE, currentPage)
-        (pages[HOME] as? HomeFeedView)?.saveState(outState)
+        outState.putInt(STATE_TABLET_DEST, currentTabletDest)
+        val home = (if (builtAsTablet) tabletStage?.getPage(TabletRailNav.DEST_HOME) else pages[HOME]) as? HomeFeedView
+        val homeState = if (home == null) restoredHomeState else Bundle().also { home.saveState(it) }
+        if (homeState != null) outState.putBundle(STATE_HOME, homeState)
         super.onSaveInstanceState(outState)
     }
 
-    private fun createRootPage(index: Int): View = when (index) {
-        HOME -> HomeFeedView(this, refreshOnEntry)
-        DOWNLOADS -> DownloadPageView(this).apply {
-            // 多选时暂时隐藏悬浮底部导航，避免挡住底部「全选/删除」操作栏
-            onSelectionModeChanged = { on ->
-                bottomNavigation.visibility = if (on) View.GONE else View.VISIBLE
-            }
+    private fun obtainPage(index: Int): View {
+        pages[index]?.let { return it }
+        val page = createRootPage(index).apply {
+            contentDescription = pageDescription(index)
         }
+        (pageHost as RootPager).addPage(page)
+        pages[index] = page
+        return page
+    }
+
+    private fun createRootPage(index: Int): View = when (index) {
+        HOME -> HomeFeedView(this, refreshOnEntry, restoredHomeState).also { restoredHomeState = null }
         else -> AccountPageView(this)
     }
 
-    /**
-     * Select a root destination without imitating the 推荐 / 热门 horizontal pager.
-     * A short cross-fade with a tiny vertical lift remains interruptible, which is
-     * important when a held finger scrubs quickly across several destinations.
-     */
+    /** 根页面切换：底栏点击与左右滑动走同一个滑动容器。 */
     private fun showPage(destination: Int) {
         if (destination !in pages.indices) return
-        // 切走下载页时确保底部导航恢复可见（下载页多选期间它可能被隐藏）
-        bottomNavigation.visibility = View.VISIBLE
         if (destination == currentPage) {
-            bottomNavigation.setSelectedIndex(destination)
+            bottomNavigation?.setSelectedIndex(destination)
+            tabletRail?.setSelectedDestination(destination)
             return
         }
-
+        if (destination == HOME) (pages[HOME] as? HomeFeedView)?.prepareVisible()
         val previous = currentPage
-        val outgoing = pages[previous] ?: return
-        val incoming = pages[destination] ?: return
-
-        for (index in pages.indices) {
-            val page = pages[index] ?: continue
-            page.animate().setListener(null)
-            page.animate().cancel()
-            if (index != previous && index != destination) {
-                page.visibility = View.INVISIBLE
-                page.alpha = 1f
-                page.translationX = 0f
-                page.translationY = 0f
-                page.scaleX = 1f
-                page.scaleY = 1f
-            }
-        }
-
-        incoming.visibility = View.VISIBLE
-        outgoing.visibility = View.VISIBLE
-        incoming.alpha = if (reducedMotion) 1f else 0f
-        incoming.translationY = if (reducedMotion) 0f else dp(8).toFloat()
-        outgoing.alpha = 1f
-        outgoing.translationY = 0f
-        outgoing.translationX = 0f
-        outgoing.scaleX = 1f
-        outgoing.scaleY = 1f
         currentPage = destination
-        bottomNavigation.setSelectedIndex(destination)
-
-        outgoing.animate()
-            .alpha(0f)
-            .translationY(if (reducedMotion) 0f else -dp(3).toFloat())
-            .setDuration(MotionTokens.smallMs)
-            .setInterpolator(MotionTokens.easeOut)
-            .setListener(object : AnimatorListenerAdapter() {
-                override fun onAnimationEnd(animation: Animator) {
-                    if (currentPage != previous) {
-                        outgoing.visibility = View.INVISIBLE
-                        outgoing.alpha = 1f
-                        outgoing.translationY = 0f
-                    }
-                }
-            })
-            .start()
-
-        if (reducedMotion) {
-            incoming.alpha = 1f
-            incoming.translationY = 0f
-        } else {
-            incoming.animate()
-                .alpha(1f)
-                .translationY(0f)
-                .setDuration(MotionTokens.panelMs)
-                .setInterpolator(MotionTokens.easeOut)
-                .setListener(null)
-                .start()
+        bottomNavigation?.setSelectedIndex(destination)
+        tabletRail?.setSelectedDestination(destination)
+        (pageHost as? RootPager)?.showPage(destination, animate = !reducedMotion)
+        if ((pageHost as? RootPager)?.isTransitioning() != true) {
+            updateActivePage()
         }
+        if (previous == destination) return
     }
 
     private fun configureSystemBars() {
@@ -375,37 +485,37 @@ class MainActivity : Activity() {
     private fun playPendingThemeTransition(root: FrameLayout) {
         val pending = Theme.consumeCircularTransition() ?: return
         val (bitmap, center, expand) = pending
+        if (reducedMotion) {
+            bitmap.recycle()
+            return
+        }
         val cx = center.first
         val cy = center.second
+        // Smooth theme switch: subtle fade-out of the previous window snapshot
+        // when reduced motion is enabled, or fast snappy circular reveal from
+        // the toggle switch.
         val overlay = object : View(this) {
-            private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-            private val clearPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
-            }
+            private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
             private val path = Path()
+            private val destination = RectF()
             var radius = 0f
             var modeExpand = true
 
             override fun onDraw(canvas: Canvas) {
                 if (width <= 0 || height <= 0 || bitmap.isRecycled) return
-                val dst = RectF(0f, 0f, width.toFloat(), height.toFloat())
+                destination.set(0f, 0f, width.toFloat(), height.toFloat())
+                path.rewind()
+                path.addCircle(cx, cy, radius.coerceAtLeast(0f), Path.Direction.CW)
+                val save = canvas.save()
                 if (modeExpand) {
-                    // Full old screenshot with a growing clear hole.
-                    val layer = canvas.saveLayer(dst, null)
-                    canvas.drawBitmap(bitmap, null, dst, paint)
-                    path.reset()
-                    path.addCircle(cx, cy, radius, Path.Direction.CW)
-                    canvas.drawPath(path, clearPaint)
-                    canvas.restoreToCount(layer)
-                } else {
-                    // Shrinking circle of the old screenshot.
-                    val layer = canvas.saveLayer(dst, null)
-                    path.reset()
-                    path.addCircle(cx, cy, radius.coerceAtLeast(0f), Path.Direction.CW)
-                    canvas.clipPath(path)
-                    canvas.drawBitmap(bitmap, null, dst, paint)
-                    canvas.restoreToCount(layer)
-                }
+                    if (Build.VERSION.SDK_INT >= 26) canvas.clipOutPath(path)
+                    else {
+                        @Suppress("DEPRECATION")
+                        canvas.clipPath(path, android.graphics.Region.Op.DIFFERENCE)
+                    }
+                } else canvas.clipPath(path)
+                canvas.drawBitmap(bitmap, null, destination, paint)
+                canvas.restoreToCount(save)
             }
         }
         overlay.modeExpand = expand
@@ -421,8 +531,8 @@ class MainActivity : Activity() {
             val end = if (expand) maxR else 0f
             overlay.radius = start
             ValueAnimator.ofFloat(start, end).apply {
-                duration = 520L
-                interpolator = PathInterpolator(0.2f, 0.8f, 0.2f, 1f)
+                duration = 380L
+                interpolator = MotionTokens.easeOut
                 addUpdateListener {
                     overlay.radius = it.animatedValue as Float
                     overlay.invalidate()
@@ -466,7 +576,6 @@ class MainActivity : Activity() {
 
     private fun pageDescription(index: Int): String = when (index) {
         HOME -> "首页"
-        DOWNLOADS -> "下载"
         else -> "我的"
     }
 
@@ -475,9 +584,10 @@ class MainActivity : Activity() {
 
     private companion object {
         const val HOME = 0
-        const val DOWNLOADS = 1
-        const val PROFILE = 2
+        const val PROFILE = 1
         const val STATE_CURRENT_PAGE = "main_current_page"
+        const val STATE_TABLET_DEST = "main_tablet_dest"
+        const val STATE_HOME = "main_home_state"
         const val PREFS_NAME = "yuibili_settings"
         const val KEY_DISCLAIMER_ACCEPTED = "disclaimer_accepted"
     }

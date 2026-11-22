@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 丝带整体轻微投影（安全区内 24..84） -->
+    <path
+        android:fillColor="#26700F34"
+        android:pathData="M31.5,33.5C30.8,31.2 32.6,29.0 35.0,29.0H42.8C44.5,29.0 46.0,30.0 46.8,31.6L55.2,48.6L63.5,33.2C64.4,31.5 66.2,30.6 68.1,31.2L77.2,34.4C79.6,35.2 80.5,38.0 79.1,40.1L63.2,63.5C61.8,65.6 59.8,68.8 58.6,71.2L51.4,81.4C49.6,83.8 45.8,83.6 44.3,80.9L41.8,76.4C40.9,74.8 41.1,72.8 42.2,71.3L49.4,61.6L31.5,33.5Z" />
+
+    <!-- 底层斜折丝带（右下主折面：从右上穿入并与左下 Y 干汇合，呈柔和半透明磨砂珍珠粉） -->
+    <path android:pathData="M62.8,32.2C63.8,30.6 65.8,29.8 67.6,30.4L76.2,33.2C78.7,34.0 79.7,37.0 78.2,39.2L52.8,76.4C50.9,79.2 46.7,79.1 44.9,76.2L42.1,71.6C41.2,70.1 41.3,68.2 42.3,66.8L62.8,32.2Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="75"
+                android:startY="31"
+                android:endX="44"
+                android:endY="77">
+                <item android:offset="0.0" android:color="#F4FFFFFF" />
+                <item android:offset="0.55" android:color="#D6FFD4E4" />
+                <item android:offset="1.0" android:color="#BAFFACC9" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 右翼折叠过渡播放三角（与 Y 丝带自然咬合，指向右侧的圆润 Play 翼） -->
+    <path android:pathData="M56.4,48.2L77.8,47.4C81.2,47.3 83.2,51.2 81.2,54.0L72.6,65.8C70.6,68.5 66.8,68.9 64.4,66.6L55.4,57.8C53.6,56.0 54.0,50.1 56.4,48.2Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="56"
+                android:startY="47"
+                android:endX="78"
+                android:endY="66">
+                <item android:offset="0.0" android:color="#EAFFE6F0" />
+                <item android:offset="1.0" android:color="#C6FFB7D2" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 折痕阴影（增强丝带前后交叠空间感） -->
+    <path
+        android:fillColor="#28A41C50"
+        android:pathData="M49.6,47.4L58.6,59.8L54.0,65.2L45.4,53.2Z" />
+
+    <!-- 顶层主丝带（左上倾斜臂斜插向右下转折并收出利落尖尾，与右翼合力形成鲜明“Y + Play”视觉锚点） -->
+    <path android:pathData="M31.0,32.0C29.8,29.8 31.4,27.2 33.9,27.2H42.6C44.5,27.2 46.2,28.3 47.0,30.0L57.6,51.8C58.3,53.2 58.2,54.8 57.3,56.1L47.5,71.0C45.9,73.4 42.3,73.1 41.1,70.5L38.6,65.2C38.0,63.9 38.2,62.3 39.0,61.1L45.0,52.4L31.0,32.0Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="32"
+                android:startY="27"
+                android:endX="56"
+                android:endY="71">
+                <item android:offset="0.0" android:color="#FFFFFFFF" />
+                <item android:offset="0.7" android:color="#FFFDF7FA" />
+                <item android:offset="1.0" android:color="#FFFFDFE9" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 右翼顶层小高光片，令整个 Play 尖端更饱满通透 -->
+    <path android:pathData="M62.6,31.6C63.6,30.0 65.6,29.4 67.3,30.1L75.8,33.4C78.1,34.3 79.0,37.1 77.6,39.2L65.4,57.2C64.2,59.0 61.8,59.4 60.2,58.0L56.0,54.4C54.6,53.2 54.4,51.2 55.4,49.6L62.6,31.6Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="68"
+                android:startY="30"
+                android:endX="61"
+                android:endY="58">
+                <item android:offset="0.0" android:color="#FFFFFFFF" />
+                <item android:offset="0.65" android:color="#EBFFE9F2" />
+                <item android:offset="1.0" android:color="#C8FFC8DD" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 中心轻盈播放箭头高光点缀，让“视频播放”意图一眼即明 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M63.4,47.8L75.2,54.4C77.0,55.4 77.0,58.0 75.2,59.0L63.4,65.6C61.6,66.6 59.4,65.3 59.4,63.2V50.2C59.4,48.1 61.6,46.8 63.4,47.8Z" />
+
+    <!-- 左上沿柔和亮边 -->
+    <path
+        android:fillColor="#66FFFFFF"
+        android:pathData="M33.9,27.6H42.4C44.0,27.6 45.4,28.5 46.1,29.9L47.3,32.4C46.0,30.7 44.3,29.7 42.2,29.7H34.2C32.7,29.7 31.6,30.9 31.8,32.3L31.0,30.8C30.4,29.2 31.8,27.6 33.9,27.6Z" />
+</vector>

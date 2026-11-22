@@ -3,18 +3,16 @@ package com.yuilittle.bili
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
-/** Small, bounded snapshot used only to paint the first frame on a cold start. */
 object FeedStore {
-    // Keep every item the bounded runtime window may expose, so a restored
-    // scroll anchor never lands past the persisted snapshot.
-    const val MAX_STORED_ITEMS = FeedPagingPolicy.MAX_IN_MEMORY_ITEMS
+    private const val MAX_STORED_ITEMS = FeedPagingPolicy.MAX_IN_MEMORY_ITEMS
     private const val PREFS = "bounded_feed_snapshot"
 
     data class State(
@@ -23,70 +21,81 @@ object FeedStore {
         val lastScannedPage: Int
     )
 
-    private const val MAX_STORE_QUEUE = 8
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val stateWriter = ThreadPoolExecutor(
-        1,
-        1,
-        10L,
-        TimeUnit.SECONDS,
-        LinkedBlockingQueue<Runnable>(MAX_STORE_QUEUE),
-        ThreadPoolExecutor.AbortPolicy()
-    ).apply { allowCoreThreadTimeOut(true) }
+    private val disk = ThreadPoolExecutor(1, 1, 15L, TimeUnit.SECONDS, LinkedBlockingQueue()).apply {
+        allowCoreThreadTimeOut(true)
+    }
+    private val snapshots = arrayOfNulls<State>(2)
+    private val waitingReaders = HashMap<Int, MutableList<(State) -> Unit>>()
+    private val writeLock = Any()
+    private val pendingWrites = LinkedHashMap<Int, State>()
+    private var writerScheduled = false
 
-    fun load(context: Context, tab: Int): List<VideoItem> = loadState(context, tab).videos
-
-    fun loadPage(context: Context, tab: Int): Int = loadState(context, tab).lastSuccessfulPage
-
-    fun loadScannedPage(context: Context, tab: Int): Int = loadState(context, tab).lastScannedPage
-
-    fun loadState(context: Context, tab: Int): State {
-        val preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val hasLegacySnapshot = preferences.contains(key(tab))
-        val successfulPage = preferences.getInt(pageKey(tab), if (hasLegacySnapshot) 1 else 0)
-            .coerceAtLeast(0)
-        val scannedPage = preferences.getInt(scanKey(tab), successfulPage).coerceAtLeast(successfulPage)
-        return State(
-            videos = videosFromJson(preferences.getString(key(tab), null)),
-            lastSuccessfulPage = successfulPage,
-            lastScannedPage = scannedPage
-        )
+    fun loadState(context: Context, tab: Int, callback: (State) -> Unit): (() -> Unit)? {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        snapshots[tab]?.let {
+            callback(it)
+            return null
+        }
+        val readers = waitingReaders.getOrPut(tab) {
+            val application = context.applicationContext
+            disk.execute {
+                val fromDisk = readState(application, tab)
+                mainHandler.post {
+                    val state = snapshots[tab] ?: fromDisk.also { snapshots[tab] = it }
+                    waitingReaders.remove(tab)?.toList()?.forEach { it(state) }
+                }
+            }
+            ArrayList()
+        }
+        readers.add(callback)
+        return { readers.remove(callback) }
     }
 
-    /**
-     * Commits one coherent feed state off the UI thread. The callback runs on the
-     * main thread only after the disk commit is complete, so a visible new batch
-     * always has its matching cursor and duplicate-scan progress persisted.
-     */
-    fun saveState(
-        context: Context,
-        tab: Int,
-        videos: List<VideoItem>,
-        lastSuccessfulPage: Int,
-        lastScannedPage: Int,
-        callback: (Boolean) -> Unit
-    ) {
-        val storedVideos = videos.take(MAX_STORED_ITEMS)
-        val encoded = videosToJson(storedVideos)
-        val safeSuccessfulPage = lastSuccessfulPage.coerceAtLeast(0)
-        val safeScannedPage = lastScannedPage.coerceAtLeast(safeSuccessfulPage)
-        val applicationContext = context.applicationContext
-        try {
-            stateWriter.execute {
-                val committed = try {
-                    applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                        .edit()
-                        .putString(key(tab), encoded)
-                        .putInt(pageKey(tab), safeSuccessfulPage)
-                        .putInt(scanKey(tab), safeScannedPage)
-                        .commit()
-                } catch (_: Exception) {
-                    false
-                }
-                mainHandler.post { callback(committed) }
+    private fun readState(context: Context, tab: Int): State = try {
+        val preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val videos = videosFromJson(preferences.getString(key(tab), null))
+        val successfulPage = preferences.getInt(pageKey(tab), if (videos.isEmpty()) 0 else 1).coerceAtLeast(0)
+        val scannedPage = preferences.getInt(scanKey(tab), successfulPage).coerceAtLeast(0)
+        State(videos, successfulPage, scannedPage)
+    } catch (error: ClassCastException) {
+        Log.w("FeedStore", "Invalid feed snapshot", error)
+        State(emptyList(), 0, 0)
+    }
+
+    fun saveState(context: Context, tab: Int, videos: List<VideoItem>, page: Int, scannedPage: Int) {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        val state = State(videos, page, scannedPage)
+        snapshots[tab] = state
+        val schedule = synchronized(writeLock) {
+            pendingWrites[tab] = state
+            if (writerScheduled) false else {
+                writerScheduled = true
+                true
             }
-        } catch (_: RejectedExecutionException) {
-            mainHandler.post { callback(false) }
+        }
+        if (!schedule) return
+        val application = context.applicationContext
+        disk.execute { flushWrites(application) }
+    }
+
+    private fun flushWrites(context: Context) {
+        val preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        while (true) {
+            val batch = synchronized(writeLock) {
+                if (pendingWrites.isEmpty()) {
+                    writerScheduled = false
+                    return
+                }
+                pendingWrites.toMap().also { pendingWrites.clear() }
+            }
+            val editor = preferences.edit()
+            for ((tab, state) in batch) {
+                editor.putString(key(tab), videosToJson(state.videos))
+                    .putInt(pageKey(tab), state.lastSuccessfulPage)
+                    .putInt(scanKey(tab), state.lastScannedPage)
+            }
+            if (!editor.commit()) Log.w("FeedStore", "Unable to persist feed snapshots")
         }
     }
 
@@ -94,11 +103,13 @@ object FeedStore {
         if (value.isNullOrBlank()) return emptyList()
         return try {
             val array = JSONArray(value)
-            val videos = ArrayList<VideoItem>(minOf(array.length(), MAX_STORED_ITEMS))
-            for (index in 0 until minOf(array.length(), MAX_STORED_ITEMS)) {
+            val count = minOf(array.length(), MAX_STORED_ITEMS)
+            val videos = ArrayList<VideoItem>(count)
+            val seen = HashSet<String>(count)
+            for (index in 0 until count) {
                 val item = array.optJSONObject(index) ?: continue
                 val bvid = item.optString("bvid")
-                if (bvid.isBlank()) continue
+                if (bvid.isBlank() || !seen.add(bvid)) continue
                 videos += VideoItem(
                     bvid = bvid,
                     title = item.optString("title"),
@@ -108,11 +119,15 @@ object FeedStore {
                     duration = item.optInt("duration"),
                     description = "",
                     publishedAt = item.optLong("publishedAt"),
-                    cid = item.optLong("cid")
+                    cid = item.optLong("cid"),
+                    aid = item.optLong("aid"),
+                    danmakuCount = item.optLong("danmakuCount"),
+                    rcmdReason = item.optString("rcmdReason"),
+                    charge = item.optBoolean("charge")
                 )
             }
             videos
-        } catch (_: Exception) {
+        } catch (_: JSONException) {
             emptyList()
         }
     }
@@ -129,6 +144,10 @@ object FeedStore {
                 put("duration", video.duration)
                 put("publishedAt", video.publishedAt)
                 put("cid", video.cid)
+                put("aid", video.aid)
+                put("danmakuCount", video.danmakuCount)
+                put("rcmdReason", video.rcmdReason)
+                put("charge", video.charge)
             })
         }
         return array.toString()

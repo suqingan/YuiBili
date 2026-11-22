@@ -3,22 +3,22 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
-    <!-- 所有文件访问：部分国产 ROM 的 MediaStore 不支持硬删（删除只进回收站 .trashed 残留），
-         授予后可直接物理删除相册中的导出副本 -->
-    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:allowBackup="false"
         android:hardwareAccelerated="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
-        android:label="YuiBili"
+        android:label="${appLabel}"
         android:theme="@style/AppTheme">
         <activity
             android:name=".VideoDetailActivity"
+            android:theme="@style/PlayerActivityTheme"
             android:exported="false"
             android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden" />
         <activity android:name=".SearchActivity"
@@ -31,7 +31,34 @@
             android:name=".FavoriteSearchActivity"
             android:windowSoftInputMode="stateVisible|adjustResize"
             android:exported="false" />
+        <activity
+            android:name=".SpaceActivity"
+            android:exported="false" />
+        <activity
+            android:name=".SpaceDynamicDetailActivity"
+            android:exported="false" />
+        <activity
+            android:name=".SpaceSearchActivity"
+            android:windowSoftInputMode="stateVisible|adjustResize"
+            android:exported="false" />
         <activity android:name=".ProfileSubActivity" android:exported="false" />
+        <activity
+            android:name=".PgcDetailActivity"
+            android:theme="@style/PlayerActivityTheme"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden" />
+        <activity
+            android:name=".CoverCropActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden" />
+        <activity
+            android:name=".CreateFavoriteFolderActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+        <activity
+            android:name=".InAppWebActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden" />
         <activity
             android:name=".DownloadPickerActivity"
             android:exported="false"
@@ -40,6 +67,13 @@
             android:name=".DownloadSeasonActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden" />
+        <activity
+            android:name=".AudioPlayerActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden" />
+        <activity
+            android:name=".DownloadManagerActivity"
+            android:exported="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -52,5 +86,14 @@
             android:name=".DownloadManager$DownloadService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <service
+            android:name=".AudioPlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback"
+            android:stopWithTask="false">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

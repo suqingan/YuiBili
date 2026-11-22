@@ -11,13 +11,16 @@ object FeedPagingPolicy {
     const val MAX_REFRESH_SCAN_PAGES = 4
     const val MAX_APPEND_SKIP_PAGES = 2
 
-    fun nextRefreshPage(lastSuccessfulPage: Int): Int =
-        if (lastSuccessfulPage <= 0) 1 else lastSuccessfulPage + 1
+    fun nextRefreshPage(lastScannedPage: Int): Int =
+        if (lastScannedPage <= 0) 1 else lastScannedPage + 1
 
-    fun isTerminalPage(resultSize: Int): Boolean = resultSize == 0
+    fun scannedCursor(candidatePage: Int, endReached: Boolean, rotatingFeed: Boolean): Int =
+        if (rotatingFeed && endReached) 0 else candidatePage
 
     fun trimFromStart(currentSize: Int, additionsSize: Int): Int {
         val total = currentSize.coerceAtLeast(0) + additionsSize.coerceAtLeast(0)
-        return if (total > MAX_IN_MEMORY_ITEMS) total - RETAINED_ITEMS else 0
+        if (total <= MAX_IN_MEMORY_ITEMS) return 0
+        // Trim whole rows so the surviving cards keep their column and scroll anchor.
+        return (total - RETAINED_ITEMS + 1) / 2 * 2
     }
 }

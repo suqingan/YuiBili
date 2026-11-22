@@ -1,42 +1,50 @@
 package com.yuilittle.bili
 
-import android.animation.ValueAnimator
 import android.content.Context
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
-import android.graphics.Typeface
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
-import android.view.animation.PathInterpolator
+import androidx.dynamicanimation.animation.SpringAnimation
 import kotlin.math.abs
 
 /**
- * A compact, dependency-free floating navigation dock with icon + label tabs.
- *
- * The dock uses a quiet warm-white surface, rose active icon/label, and one moving
- * underline. A normal tap selects a destination; holding briefly enters scrub mode,
- * then sliding across 首页 / 下载 / 我的 selects whichever item is under the finger.
+ * 紧凑悬浮胶囊底栏：居中圆角胶囊 Dock + 微描边与轻阴影 + 滑动柔粉选中胶囊。
+ * 全自绘单 Canvas 渲染，支持点击、长按拖拽切换，以及随页面滑动实时联动进度。
  */
 class FrostedBottomNavigation @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
 ) : View(context, attrs) {
 
-    private val glassPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val platePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val pillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
     private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val dockBounds = RectF()
+    private val shadowBounds = RectF()
+    private val pillRect = RectF()
     private val path = Path()
-    private val panelBounds = RectF()
-    private val selection = floatArrayOf(1f, 0f, 0f)
+
     private var selectedIndex = 0
-    // A shared position lets the active underline glide continuously between tabs.
-    private var indicatorPosition = 0f
-    private var selectionAnimator: ValueAnimator? = null
+    /** 连续高亮中心：0.5f = 首页，1.5f = 我的。 */
+    private var frameCenter = 0.5f
+    private var pressScale = 1f
+    private var frameAnimation: SpringAnimation? = null
+    private var pressAnimation: SpringAnimation? = null
     private var destinationListener: ((Int) -> Unit)? = null
+    /** 再次点击当前已选中项时的回调（首页重复点击回顶用）。 */
+    private var destinationReselectedListener: ((Int) -> Unit)? = null
+
     private var downX = 0f
     private var downY = 0f
     private var lastTouchX = 0f
@@ -46,16 +54,10 @@ class FrostedBottomNavigation @JvmOverloads constructor(
     private var gestureMoved = false
     private var scrubIndex = -1
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+    private val density = resources.displayMetrics.density
     private val longPressRunnable = Runnable {
         if (!longPressArmed) return@Runnable
-        updatePanelBounds()
-        // Natural finger drift is allowed while waiting for the long press.
-        // Only leaving the dock vertically cancels activation; horizontal movement
-        // is exactly what this scrub interaction needs.
-        val verticalAllowance = dp(24f)
-        if (lastTouchY < panelBounds.top - verticalAllowance ||
-            lastTouchY > panelBounds.bottom + verticalAllowance
-        ) return@Runnable
+        if (lastTouchY < -dp(24) || lastTouchY > height + dp(24)) return@Runnable
         scrubMode = true
         scrubIndex = itemAt(lastTouchX)
         selectDestination(scrubIndex)
@@ -65,71 +67,206 @@ class FrostedBottomNavigation @JvmOverloads constructor(
         isClickable = true
         isFocusable = true
         contentDescription = "底部导航"
+        frameCenter = 0.5f
     }
 
     fun setOnDestinationSelectedListener(listener: (Int) -> Unit) {
         destinationListener = listener
     }
 
+    fun setOnDestinationReselectedListener(listener: (Int) -> Unit) {
+        destinationReselectedListener = listener
+    }
+
     fun setSelectedIndex(index: Int) {
-        if (index !in 0..2) return
-        val start = selection.copyOf()
-        val startPosition = indicatorPosition
+        if (index !in 0..1) return
         selectedIndex = index
-        selectionAnimator?.cancel()
-        // Already settled on this tab: nothing to animate.
-        if (startPosition == index.toFloat() && start[index] == 1f) return
-        selectionAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = if (scrubMode) 160L else 260L
-            interpolator = PathInterpolator(0.2f, 0.8f, 0.2f, 1f)
-            addUpdateListener { animator ->
-                val progress = animator.animatedValue as Float
-                indicatorPosition = lerp(startPosition, selectedIndex.toFloat(), progress)
-                for (item in 0..2) {
-                    val target = if (item == selectedIndex) 1f else 0f
-                    selection[item] = lerp(start[item], target, progress)
-                }
+        val target = index + 0.5f
+        if (abs(frameCenter - target) < 0.002f && frameAnimation?.isRunning != true) {
+            if (frameCenter != target) {
+                frameCenter = target
                 invalidate()
             }
+            return
+        }
+        frameAnimation?.cancel()
+        if (MotionTokens.isReduced(context)) {
+            frameCenter = target
+            invalidate()
+            return
+        }
+        frameAnimation = SpringAnimation(this, FRAME_CENTER, target).apply {
+            spring = DsSpring.force(
+                target,
+                if (scrubMode) DsSpring.SNAP_STIFFNESS else DsSpring.SETTLE_STIFFNESS,
+                if (scrubMode) DsSpring.SNAP_DAMPING else DsSpring.SETTLE_DAMPING
+            )
             start()
         }
     }
 
+    /** 跟随页面滑动进度（0f..1f）实时同步胶囊位置与高亮权重。 */
+    fun setScrollProgress(progress: Float) {
+        val target = progress.coerceIn(0f, 1f) + 0.5f
+        if (frameAnimation?.isRunning == true) frameAnimation?.cancel()
+        if (abs(frameCenter - target) < 0.001f) return
+        frameCenter = target
+        invalidate()
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        updatePanelBounds()
-        if (panelBounds.width() <= 0f || panelBounds.height() <= 0f) return
+        if (width <= 0 || height <= 0) return
+        val c = Ds.colors
+        val insetH = dp(4f)
+        val insetV = dp(4f)
+        dockBounds.set(insetH, insetV, width - insetH, height - insetV)
+        val radius = dockBounds.height() / 2f
 
-        val radius = dp(22f)
+        // 轻盈落地投影：用极低透明度柔化悬浮边缘，不用模糊渲染
+        shadowBounds.set(
+            dockBounds.left,
+            dockBounds.top + dp(2f),
+            dockBounds.right,
+            dockBounds.bottom + dp(3f)
+        )
+        shadowPaint.color = if (c.isDark) 0x55000000 else 0x12000000
+        canvas.drawRoundRect(shadowBounds, radius, radius, shadowPaint)
 
-        // Quiet floating surface that tracks light / dark theme.
-        glassPaint.shader = null
-        glassPaint.style = Paint.Style.FILL
-        glassPaint.color = COLOR_NAV_FILL
-        canvas.drawRoundRect(panelBounds, radius, radius, glassPaint)
+        // 悬浮胶囊底板 + 细微描边
+        platePaint.style = Paint.Style.FILL
+        platePaint.color = if (c.isDark) 0xF51A1C22.toInt() else 0xF7FFFFFF.toInt()
+        canvas.drawRoundRect(dockBounds, radius, radius, platePaint)
 
-        glassPaint.style = Paint.Style.STROKE
-        glassPaint.strokeWidth = dp(1f)
-        glassPaint.color = COLOR_NAV_STROKE
-        canvas.drawRoundRect(panelBounds, radius, radius, glassPaint)
+        platePaint.style = Paint.Style.STROKE
+        platePaint.strokeWidth = Ds.hairline(context).toFloat()
+        platePaint.color = if (c.isDark) c.line else c.lineSoft
+        canvas.drawRoundRect(dockBounds, radius, radius, platePaint)
 
-        val itemWidth = panelBounds.width() / 3f
-        val iconCenterY = panelBounds.centerY() - dp(7f)
-        val activeCenterX = panelBounds.left + itemWidth * (indicatorPosition + 0.5f)
-        drawActiveIndicator(canvas, activeCenterX, panelBounds.bottom - dp(6.5f))
+        // 内部左右等分区域
+        val innerPad = dp(4f)
+        val contentLeft = dockBounds.left + innerPad
+        val contentWidth = (dockBounds.width() - innerPad * 2f).coerceAtLeast(1f)
+        val itemWidth = contentWidth / 2f
+        val cy = dockBounds.centerY()
 
-        for (item in 0..2) {
-            val centerX = panelBounds.left + itemWidth * (item + 0.5f)
-            drawIcon(canvas, item, centerX, iconCenterY - dp(1f) * selection[item], selection[item])
-            drawLabel(canvas, item, centerX, selection[item])
+        // 选中项柔粉胶囊指示器
+        drawPillIndicator(canvas, contentLeft + itemWidth * frameCenter, itemWidth, dockBounds.height() - innerPad * 2f, cy)
+
+        for (item in 0..1) {
+            val centerX = contentLeft + itemWidth * (item + 0.5f)
+            val dist = abs(frameCenter - (item + 0.5f))
+            val activeWeight = (1f - dist * 2f).coerceIn(0f, 1f)
+            val active = dist < 0.5f
+
+            val save = canvas.save()
+            val scale = if (item == selectedIndex) pressScale else 1f
+            if (scale != 1f) canvas.scale(scale, scale, centerX, cy)
+            drawIcon(canvas, item, centerX, cy - dp(7.5f), active, activeWeight)
+            drawLabel(canvas, item, centerX, cy + dp(13.5f), active, activeWeight)
+            canvas.restoreToCount(save)
+        }
+    }
+
+    private fun drawPillIndicator(
+        canvas: Canvas,
+        centerX: Float,
+        itemWidth: Float,
+        pillHeight: Float,
+        cy: Float
+    ) {
+        val c = Ds.colors
+        val halfWidth = (itemWidth - dp(4f)) / 2f
+        val halfHeight = pillHeight / 2f
+        pillRect.set(
+            centerX - halfWidth,
+            cy - halfHeight,
+            centerX + halfWidth,
+            cy + halfHeight
+        )
+        pillPaint.color = c.accentSoft
+        canvas.drawRoundRect(pillRect, halfHeight, halfHeight, pillPaint)
+    }
+
+    private fun drawIcon(
+        canvas: Canvas,
+        item: Int,
+        x: Float,
+        y: Float,
+        active: Boolean,
+        activeWeight: Float
+    ) {
+        val c = Ds.colors
+        iconPaint.style = Paint.Style.STROKE
+        iconPaint.strokeCap = Paint.Cap.ROUND
+        iconPaint.strokeJoin = Paint.Join.ROUND
+        iconPaint.strokeWidth = (1.6f + 0.35f * activeWeight) * density
+        iconPaint.color = mixColor(c.muted, c.accent, activeWeight)
+        if (item == 0) drawHomeIcon(canvas, x, y) else drawProfileIcon(canvas, x, y)
+    }
+
+    private fun drawLabel(
+        canvas: Canvas,
+        item: Int,
+        x: Float,
+        y: Float,
+        active: Boolean,
+        activeWeight: Float
+    ) {
+        val c = Ds.colors
+        labelPaint.style = Paint.Style.FILL
+        labelPaint.textAlign = Paint.Align.CENTER
+        labelPaint.textSize = 10f * resources.displayMetrics.scaledDensity
+        labelPaint.typeface = Ds.body(active)
+        labelPaint.color = mixColor(c.muted, c.accent, activeWeight)
+        canvas.drawText(if (item == 0) "首页" else "我的", x, y, labelPaint)
+    }
+
+    private fun drawHomeIcon(canvas: Canvas, x: Float, y: Float) {
+        val side = dp(7.6f)
+        val roof = y - dp(6.8f)
+        val floor = y + dp(6.8f)
+        path.rewind()
+        path.moveTo(x - side, y - dp(0.6f))
+        path.lineTo(x, roof)
+        path.lineTo(x + side, y - dp(0.6f))
+        path.moveTo(x - dp(5.8f), y + dp(1.1f))
+        path.lineTo(x - dp(5.8f), floor - dp(1.5f))
+        path.quadTo(x - dp(5.8f), floor, x - dp(4.3f), floor)
+        path.lineTo(x + dp(4.3f), floor)
+        path.quadTo(x + dp(5.8f), floor, x + dp(5.8f), floor - dp(1.5f))
+        path.lineTo(x + dp(5.8f), y + dp(1.1f))
+        canvas.drawPath(path, iconPaint)
+        // 居中门洞/播放小横竖感提升辨识度
+        canvas.drawLine(x, floor - dp(3.6f), x, floor, iconPaint)
+    }
+
+    private fun drawProfileIcon(canvas: Canvas, x: Float, y: Float) {
+        canvas.drawCircle(x, y - dp(3.8f), dp(3.3f), iconPaint)
+        path.rewind()
+        path.moveTo(x - dp(6.8f), y + dp(6.8f))
+        path.cubicTo(
+            x - dp(6.0f), y + dp(1.4f),
+            x + dp(6.0f), y + dp(1.4f),
+            x + dp(6.8f), y + dp(6.8f)
+        )
+        canvas.drawPath(path, iconPaint)
+    }
+
+    private fun animatePress(pressed: Boolean) {
+        if (MotionTokens.isReduced(context)) return
+        pressAnimation?.cancel()
+        val target = if (pressed) 0.94f else 1f
+        pressAnimation = SpringAnimation(this, PRESS_SCALE, target).apply {
+            spring = DsSpring.force(target, DsSpring.SNAP_STIFFNESS, DsSpring.SNAP_DAMPING)
+            start()
         }
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                updatePanelBounds()
-                if (!panelBounds.contains(event.x, event.y)) return false
+                if (event.y < 0f || event.y > height) return false
                 downX = event.x
                 downY = event.y
                 lastTouchX = event.x
@@ -138,6 +275,7 @@ class FrostedBottomNavigation @JvmOverloads constructor(
                 scrubMode = false
                 gestureMoved = false
                 scrubIndex = itemAt(event.x)
+                animatePress(true)
                 removeCallbacks(longPressRunnable)
                 postDelayed(longPressRunnable, ViewConfiguration.getLongPressTimeout().toLong())
                 return true
@@ -146,17 +284,11 @@ class FrostedBottomNavigation @JvmOverloads constructor(
                 lastTouchX = event.x
                 lastTouchY = event.y
                 if (!scrubMode) {
-                    val dx = event.x - downX
-                    val dy = event.y - downY
-                    if (abs(dx) > touchSlop || abs(dy) > touchSlop) {
-                        // Suppress a later tap, but keep horizontal long-press
-                        // activation armed so hold-then-slide works reliably.
+                    if (abs(event.x - downX) > touchSlop || abs(event.y - downY) > touchSlop) {
                         gestureMoved = true
+                        animatePress(false)
                     }
-                    val verticalAllowance = dp(24f)
-                    if (event.y < panelBounds.top - verticalAllowance ||
-                        event.y > panelBounds.bottom + verticalAllowance
-                    ) {
+                    if (event.y < -dp(24) || event.y > height + dp(24)) {
                         longPressArmed = false
                         removeCallbacks(longPressRunnable)
                     }
@@ -171,15 +303,22 @@ class FrostedBottomNavigation @JvmOverloads constructor(
             }
             MotionEvent.ACTION_UP -> {
                 removeCallbacks(longPressRunnable)
-                if (!scrubMode && longPressArmed && !gestureMoved && panelBounds.contains(event.x, event.y)) {
+                animatePress(false)
+                if (!scrubMode && longPressArmed && !gestureMoved) {
                     performClick()
-                    selectDestination(itemAt(event.x))
+                    val tapped = itemAt(event.x)
+                    if (tapped == selectedIndex) {
+                        destinationReselectedListener?.invoke(tapped)
+                    } else {
+                        selectDestination(tapped)
+                    }
                 }
                 finishGesture()
                 return true
             }
             MotionEvent.ACTION_CANCEL -> {
                 removeCallbacks(longPressRunnable)
+                animatePress(false)
                 finishGesture()
                 return true
             }
@@ -191,16 +330,14 @@ class FrostedBottomNavigation @JvmOverloads constructor(
         super.performClick()
         return true
     }
-
-    /** Returns the nearest navigation item, including while the finger drifts past an edge. */
     private fun itemAt(x: Float): Int {
-        updatePanelBounds()
-        val itemWidth = panelBounds.width() / 3f
-        return ((x - panelBounds.left) / itemWidth).toInt().coerceIn(0, 2)
+        val contentLeft = dp(8f)
+        val contentWidth = (width - contentLeft * 2f).coerceAtLeast(1f)
+        return (((x - contentLeft) / (contentWidth / 2f)).toInt()).coerceIn(0, 1)
     }
 
     private fun selectDestination(destination: Int) {
-        if (destination !in 0..2 || destination == selectedIndex) return
+        if (destination !in 0..1 || destination == selectedIndex) return
         destinationListener?.invoke(destination) ?: setSelectedIndex(destination)
     }
 
@@ -211,140 +348,38 @@ class FrostedBottomNavigation @JvmOverloads constructor(
         scrubIndex = -1
     }
 
-    private fun drawActiveIndicator(canvas: Canvas, centerX: Float, centerY: Float) {
-        val indicator = RectF(
-            centerX - dp(8f),
-            centerY - dp(1.4f),
-            centerX + dp(8f),
-            centerY + dp(1.4f)
-        )
-        glassPaint.shader = null
-        glassPaint.style = Paint.Style.FILL
-        glassPaint.color = ACTIVE_ICON
-        canvas.drawRoundRect(indicator, dp(1.4f), dp(1.4f), glassPaint)
+    override fun onDetachedFromWindow() {
+        frameAnimation?.cancel()
+        pressAnimation?.cancel()
+        removeCallbacks(longPressRunnable)
+        super.onDetachedFromWindow()
     }
 
-    private fun drawIcon(
-        canvas: Canvas,
-        item: Int,
-        centerX: Float,
-        centerY: Float,
-        progress: Float
-    ) {
-        iconPaint.style = Paint.Style.STROKE
-        iconPaint.strokeCap = Paint.Cap.ROUND
-        iconPaint.strokeJoin = Paint.Join.ROUND
-        iconPaint.strokeWidth = dp(1.8f) * (1f + progress * 0.08f)
-        iconPaint.color = mixColor(COLOR_NAV_INACTIVE, ACTIVE_ICON, progress)
-        val scale = lerp(0.96f, 1.02f, progress)
-
-        when (item) {
-            0 -> drawHomeIcon(canvas, centerX, centerY, scale)
-            1 -> drawDownloadsIcon(canvas, centerX, centerY, scale)
-            else -> drawProfileIcon(canvas, centerX, centerY, scale)
-        }
+    private fun mixColor(from: Int, to: Int, t: Float): Int {
+        val ratio = t.coerceIn(0f, 1f)
+        val a = (android.graphics.Color.alpha(from) + (android.graphics.Color.alpha(to) - android.graphics.Color.alpha(from)) * ratio).toInt()
+        val r = (android.graphics.Color.red(from) + (android.graphics.Color.red(to) - android.graphics.Color.red(from)) * ratio).toInt()
+        val g = (android.graphics.Color.green(from) + (android.graphics.Color.green(to) - android.graphics.Color.green(from)) * ratio).toInt()
+        val b = (android.graphics.Color.blue(from) + (android.graphics.Color.blue(to) - android.graphics.Color.blue(from)) * ratio).toInt()
+        return android.graphics.Color.argb(a, r, g, b)
     }
 
-    /** Label under each icon; the active one turns rose and bold. */
-    private fun drawLabel(canvas: Canvas, item: Int, centerX: Float, progress: Float) {
-        iconPaint.style = Paint.Style.FILL
-        iconPaint.textAlign = Paint.Align.CENTER
-        iconPaint.textSize = sp(10f)
-        iconPaint.typeface =
-            if (progress > 0.5f) Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            else Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
-        iconPaint.color = mixColor(COLOR_NAV_INACTIVE, ACTIVE_ICON, progress)
-        val label = when (item) {
-            0 -> "首页"
-            1 -> "下载"
-            else -> "我的"
-        }
-        canvas.drawText(label, centerX, panelBounds.centerY() + dp(13.5f), iconPaint)
-    }
-
-    /** A single continuous home outline with a centered doorway. */
-    private fun drawHomeIcon(canvas: Canvas, x: Float, y: Float, scale: Float) {
-        val side = dp(9f) * scale
-        val roof = y - dp(8.8f) * scale
-        val floor = y + dp(8.3f) * scale
-
-        path.reset()
-        path.moveTo(x - side, y - dp(0.7f) * scale)
-        path.lineTo(x, roof)
-        path.lineTo(x + side, y - dp(0.7f) * scale)
-        path.lineTo(x + dp(7.4f) * scale, floor)
-        path.lineTo(x - dp(7.4f) * scale, floor)
-        path.close()
-        canvas.drawPath(path, iconPaint)
-    }
-
-    /** Simple download tray + arrow, matches the rest of the monoline icons. */
-    private fun drawDownloadsIcon(canvas: Canvas, x: Float, y: Float, scale: Float) {
-        val shaftTop = y - dp(8.2f) * scale
-        val shaftBottom = y + dp(2.2f) * scale
-        val arrow = dp(4.4f) * scale
-        canvas.drawLine(x, shaftTop, x, shaftBottom, iconPaint)
-        path.reset()
-        path.moveTo(x - arrow, shaftBottom - arrow)
-        path.lineTo(x, shaftBottom)
-        path.lineTo(x + arrow, shaftBottom - arrow)
-        canvas.drawPath(path, iconPaint)
-
-        val trayLeft = x - dp(7.6f) * scale
-        val trayRight = x + dp(7.6f) * scale
-        val trayTop = y + dp(4.2f) * scale
-        val trayBottom = y + dp(8.6f) * scale
-        path.reset()
-        path.moveTo(trayLeft, trayTop)
-        path.lineTo(trayLeft, trayBottom - dp(1.6f) * scale)
-        path.quadTo(trayLeft, trayBottom, trayLeft + dp(1.6f) * scale, trayBottom)
-        path.lineTo(trayRight - dp(1.6f) * scale, trayBottom)
-        path.quadTo(trayRight, trayBottom, trayRight, trayBottom - dp(1.6f) * scale)
-        path.lineTo(trayRight, trayTop)
-        canvas.drawPath(path, iconPaint)
-    }
-
-    /** A balanced portrait silhouette with a restrained open shoulder curve. */
-    private fun drawProfileIcon(canvas: Canvas, x: Float, y: Float, scale: Float) {
-        val headRadius = dp(3.8f) * scale
-        canvas.drawCircle(x, y - dp(5.3f) * scale, headRadius, iconPaint)
-
-        path.reset()
-        path.moveTo(x - dp(9f) * scale, y + dp(8.5f) * scale)
-        path.cubicTo(
-            x - dp(8.2f) * scale, y + dp(1.8f) * scale,
-            x + dp(8.2f) * scale, y + dp(1.8f) * scale,
-            x + dp(9f) * scale, y + dp(8.5f) * scale
-        )
-        canvas.drawPath(path, iconPaint)
-    }
-
-    private fun updatePanelBounds() {
-        val horizontalInset = dp(10f)
-        panelBounds.set(
-            horizontalInset,
-            dp(6f),
-            width.toFloat() - horizontalInset,
-            height.toFloat() - dp(6f)
-        )
-    }
-
-    private fun mixColor(from: Int, to: Int, amount: Float): Int {
-        val bounded = amount.coerceIn(0f, 1f)
-        return Color.rgb(
-            lerp(Color.red(from).toFloat(), Color.red(to).toFloat(), bounded).toInt(),
-            lerp(Color.green(from).toFloat(), Color.green(to).toFloat(), bounded).toInt(),
-            lerp(Color.blue(from).toFloat(), Color.blue(to).toFloat(), bounded).toInt()
-        )
-    }
-
-    private fun lerp(from: Float, to: Float, amount: Float): Float = from + (to - from) * amount
-
-    private fun dp(value: Float): Float = value * resources.displayMetrics.density
-
-    private fun sp(value: Float): Float = value * resources.displayMetrics.scaledDensity
+    private fun dp(value: Float): Float = value * density
 
     private companion object {
-        val ACTIVE_ICON: Int = Color.rgb(235, 67, 132)
+        val FRAME_CENTER = object : androidx.dynamicanimation.animation.FloatPropertyCompat<FrostedBottomNavigation>("frameCenter") {
+            override fun getValue(target: FrostedBottomNavigation): Float = target.frameCenter
+            override fun setValue(target: FrostedBottomNavigation, value: Float) {
+                target.frameCenter = value
+                target.invalidate()
+            }
+        }
+        val PRESS_SCALE = object : androidx.dynamicanimation.animation.FloatPropertyCompat<FrostedBottomNavigation>("pressScale") {
+            override fun getValue(target: FrostedBottomNavigation): Float = target.pressScale
+            override fun setValue(target: FrostedBottomNavigation, value: Float) {
+                target.pressScale = value
+                target.invalidate()
+            }
+        }
     }
 }

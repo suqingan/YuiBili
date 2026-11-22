@@ -9,7 +9,9 @@ import android.app.Dialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.BroadcastReceiver
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.BitmapShader
@@ -28,19 +30,24 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.BitmapRegionDecoder
 import android.graphics.ImageDecoder
+import android.graphics.Rect
 import android.text.SpannableString
 import android.text.Spanned
+import android.text.TextUtils
 import android.text.style.ReplacementSpan
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
+import android.os.BatteryManager
 import android.os.Bundle
 import android.provider.MediaStore
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.util.LruCache
 import android.view.GestureDetector
 import android.view.ScaleGestureDetector
 import android.view.Gravity
@@ -48,6 +55,7 @@ import android.view.MotionEvent
 import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewGroup
+import android.util.TypedValue
 import android.view.ViewConfiguration
 import android.view.Window
 import android.view.WindowInsets
@@ -55,10 +63,14 @@ import android.view.WindowManager
 import android.view.animation.PathInterpolator
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.AccelerateInterpolator
+import android.widget.AbsListView
+import android.widget.BaseAdapter
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ProgressBar
+import android.widget.ListView
+import android.widget.OverScroller
 import android.widget.PopupWindow
 import android.widget.ScrollView
 import android.widget.Scroller
@@ -71,69 +83,136 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
-import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.dash.DashMediaSource
-import androidx.media3.exoplayer.source.ConcatenatingMediaSource
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
-import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
-import okhttp3.ConnectionPool
-import okhttp3.OkHttpClient
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.io.File
 import java.lang.ref.WeakReference
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.TimeUnit
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import java.util.WeakHashMap
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
 class VideoDetailActivity : Activity() {
     private lateinit var activityRoot: FrameLayout
     private lateinit var page: LinearLayout
+    private var tabletSplitDivider: View? = null
     private lateinit var playerHost: FrameLayout
     private lateinit var playerView: PlayerView
+    private lateinit var danmakuView: DanmakuOverlayView
+    private var danmakuController: DanmakuController? = null
+    private var danmakuSettingsDrawer: DanmakuUi.FullscreenSettingsDrawer? = null
+    private var danmakuToggleBtn: DanmakuUi.ToggleIconView? = null
+    private var danmakuSettingsBtn: DanmakuUi.SettingsIconView? = null
+    private var portraitDanmakuToggle: DanmakuUi.PortraitTabToggle? = null
+    private val danmakuUiSettingsListener: (DanmakuSettingsStore.Snapshot) -> Unit = { s ->
+        danmakuToggleBtn?.setDanmakuEnabled(s.enabled)
+        portraitDanmakuToggle?.updateState(s.enabled)
+    }
     private lateinit var gestureLayer: PlayerGestureView
     private lateinit var fullscreenContainer: FrameLayout
     private lateinit var playerBack: View
-    private lateinit var playerSpinner: ProgressBar
+    private lateinit var playerSpinner: BrandSpinnerView
     private lateinit var playerError: TextView
     private lateinit var infoContent: LinearLayout
     private lateinit var infoState: TextView
     private lateinit var gestureDetector: GestureDetector
     private val handler = Handler(Looper.getMainLooper())
-    private val reducedMotion = MotionTokens.isReduced(this)
+    private val reducedMotion by lazy(LazyThreadSafetyMode.NONE) { MotionTokens.isReduced(this) }
     private var exoPlayer: ExoPlayer? = null
     private var currentBvid = ""
     private var currentAid = 0L
-    private var currentCid: Long = 0L
-    /** 本地下载文件播放模式：不拉详情/评论，只显示标题、大小、时长。 */
+    private var currentCid = 0L
+    private var detailRequest: BiliRequest? = null
+    private var detailGeneration = 0
+    private var detailResponse: Pair<VideoItem, List<VideoPart>>? = null
+    private var detailSession = ""
+    /** 本地下载文件播放模式：支持音视频播放、离线合集分集列表、4 种播放模式。 */
     private var isLocalMode = false
     private var localTaskId = 0L
+    private var localSortOrder = DownloadManager.SeasonSortOrder.DEFAULT
+    private var localPlayMode = DownloadManager.LocalPlayMode.SEASON_SEQUENCE
+    private var localPlaylist: List<DownloadManager.Task> = emptyList()
+    /** 收藏夹「播放全部」队列；非空时播放页以收藏夹列表为准。 */
+    private var favoritePlayback: FavoritePlayback? = null
+    private var favoritePlayMode = DownloadManager.LocalPlayMode.SEASON_SEQUENCE
+    private var localInfoHost: FrameLayout? = null
+    private var localAudioCoverView: ImageView? = null
+    private var localAudioCoverOverlay: FrameLayout? = null
+
+    // ── 全屏合集抽屉（仅全屏且有合集时显示入口箭头） ──
+    private var seasonEntryBtn: View? = null
+    private var seasonDrawerOverlay: FrameLayout? = null
+    private var seasonDrawerPanel: LinearLayout? = null
+    private var seasonDrawerList: ListView? = null
+    private var seasonDrawerCountText: TextView? = null
+    private var seasonDrawerTitleText: TextView? = null
+    private var seasonDrawerAdapter: BaseAdapter? = null
+    private var seasonDrawerOpen = false
+    private var seasonDrawerAnimating = false
+    private var seasonDrawerItems: List<FullscreenSeasonItem> = emptyList()
+    /** 切集请求进行中 currentDetail 会置空，用该缓存保证抽屉仍可展开。 */
+    private var cachedSeason: UgcSeason? = null
     private var isFullscreen = false
     private var currentStream: BiliPlayUrl.DashStream? = null
+    private var streamSession = ""
+    private var streamLoadedAt = 0L
+    private var playbackRequest: BiliRequest? = null
+    private var playerListener: Player.Listener? = null
+    private var segmentTimeline = PlaybackTimeline(emptyList())
     /** The single-track stream actually fed to ExoPlayer (after stable selection). */
     private var playingStream: BiliPlayUrl.DashStream? = null
+    private val failedCodecTracks = HashSet<Pair<Int, String>>()
     private val qualityPrefs by lazy { getSharedPreferences("bili_player", MODE_PRIVATE) }
+    private val localPlaybackPrefs by lazy { getSharedPreferences("bili_local_playback", MODE_PRIVATE) }
     private var requestedQuality = BiliPlayUrl.QUALITY_720
 
     // ── Player control overlay ──
     private lateinit var controlOverlay: ViewGroup
+    private lateinit var topControlsBar: LinearLayout
+    private lateinit var topBarSpacer: View
+    private lateinit var backgroundPlayBtn: BackgroundPlayIcon
+    private var backgroundSwitchLocked = false
+    private var fullscreenStatusBar: LinearLayout? = null
+    private var statusClockText: TextView? = null
+    private var statusBatteryIcon: BatteryStatusIcon? = null
+    private var statusBatteryPercentText: TextView? = null
+    private var statusReceiverRegistered = false
+    private val statusTimeFormat = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue() = SimpleDateFormat("HH:mm", Locale.US)
+    }
+    private val statusReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_TIME_TICK,
+                Intent.ACTION_TIME_CHANGED,
+                Intent.ACTION_TIMEZONE_CHANGED -> updateStatusClock()
+                Intent.ACTION_BATTERY_CHANGED -> applyBatteryState(intent)
+            }
+        }
+    }
+    private lateinit var playerTopTitle: TextView
+    private lateinit var playerSeekHint: TextView
     private lateinit var replayBtn: ReplayIcon
     private lateinit var bottomBar: ViewGroup
     private lateinit var playPauseBtn: PlayPauseIcon
+    private var nextEpisodeBtn: NextEpisodeIcon? = null
     private lateinit var progressContainer: SeekBarView
     private lateinit var infoArea: View
     private lateinit var timeText: TextView
@@ -175,6 +254,7 @@ class VideoDetailActivity : Activity() {
     private var commentLoginHintShown = false
     private var commentsLoading = false
     private var commentsLoaded = false
+    private var commentGeneration = 0
     private var currentDetail: VideoItem? = null
     private var currentTab = 0
 
@@ -186,8 +266,6 @@ class VideoDetailActivity : Activity() {
     private lateinit var introDescWrap: LinearLayout
     private lateinit var introDescClip: FrameLayout
     private var introExpanded = false
-    /** 合集分集列表是否展开：跨简介重建保留，点击选集后列表保持展开状态。 */
-    private var seasonSectionExpanded = false
     private var titleLineHeight = 0
     private var titleFullHeight = 0
     private var introDescHeight = 0
@@ -197,7 +275,10 @@ class VideoDetailActivity : Activity() {
     private var commentSort = 0
     private var commentHasMore = false
     private lateinit var commentBubble: TextView
+    private var commentHeaderBar: CommentSectionUi.CommentHeaderBar? = null
+    private var commentPrefetchHandle: CoverLoader.PrefetchHandle? = null
     private lateinit var commentSortBtn: TextView
+    private lateinit var commentHeaderTitle: TextView
     /** Fixed info-tab navigation row; reply sheets start immediately below it. */
     private var infoTabBarAnchor: View? = null
     /** Comment section header row; used only for the sort row. */
@@ -214,10 +295,56 @@ class VideoDetailActivity : Activity() {
     private var playRetryCount = 0
     private var playbackGeneration = 0
     private var pendingResumePositionMs = 0L
+    /** 切集期间为 true，避免把上一集的位置写回新分集。 */
+    private var switchingLocalTask = false
     private var userWantsPlayback = true
     private var activityResumed = false
+    private var playbackStopped = false
+    private var resumePlayerOnStart = false
+    private var resumeDetailOnStart = false
+    private var resumeSegmentIndex = 0
+    private var restoreEndedState = false
     private var retryScheduled = false
-    private var stablePlaybackStartedAtMs = 0L
+    private var stallRetries = 0
+    /** BUFFERING 看门狗：超过阈值仍未就绪则强制重试，避免无限转圈。 */
+    private val stallWatchdog: Runnable by lazy(LazyThreadSafetyMode.NONE) {
+        Runnable {
+            if (isFinishing || isDestroyed) return@Runnable
+            val player = exoPlayer ?: return@Runnable
+            if (player.playbackState == Player.STATE_BUFFERING && !retryScheduled) {
+                if (stallRetries >= MAX_STALL_RETRIES) {
+                    Log.w("YuiBiliPlayer", "stall watchdog: 已达重试上限，停止重试")
+                    playerSpinner.visibility = View.GONE
+                    showError("加载超时，点这里重试")
+                    return@Runnable
+                }
+                stallRetries++
+                retryScheduled = true
+                Log.w("YuiBiliPlayer", "stall watchdog: BUFFERING 超过 ${STALL_TIMEOUT_MS}ms，第 ${stallRetries} 次重试")
+                playerSpinner.visibility = View.VISIBLE
+                playerError.visibility = View.GONE
+                // 清掉可能越界的续播位置，并从源头重建（用 switchingLocalTask 避免位置被写回）
+                pendingResumePositionMs = 0L
+                resumeSegmentIndex = 0
+                switchingLocalTask = true
+                try {
+                    if (isLocalMode) {
+                        loadLocalPlayer()
+                    } else if (currentBvid.isNotBlank() && currentCid > 0L) {
+                        loadPlayer(bypassCache = true)
+                    }
+                } finally {
+                    switchingLocalTask = false
+                }
+            }
+        }
+    }
+
+    private var lastRequestedQuality = 0
+    private var startupAtMs = 0L
+    private var playPreviewNoticeShown = false
+    private var lastPositionSecond = -1L
+    private var lastDurationSecond = -1L
     private var lastPlaybackError: String? = null
     private var videoLikesCount = 0L
 
@@ -232,6 +359,9 @@ class VideoDetailActivity : Activity() {
     private var gestureStartY = 0f
     private var gestureSeeking = false
     private var gestureSeekStartPos = 0L
+    private var gestureSeekTargetPos = 0L
+    private var gestureSeekDuration = 0L
+    private var gestureSeekWasPlaying = false
     private var longPressBoost = false
     private var longPressDown = false
     private var longPressCandidate = false
@@ -241,30 +371,64 @@ class VideoDetailActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         BiliSessionStore.init(this)
-        currentBvid = intent.getStringExtra(EXTRA_BVID).orEmpty()
-        currentAid = intent.getLongExtra(EXTRA_AID, 0L)
+        DanmakuSettingsStore.init(this)
+        currentBvid = savedInstanceState?.getString(EXTRA_BVID) ?: intent.getStringExtra(EXTRA_BVID).orEmpty()
+        currentAid = savedInstanceState?.getLong(EXTRA_AID) ?: intent.getLongExtra(EXTRA_AID, 0L)
+        currentCid = savedInstanceState?.getLong(EXTRA_CID) ?: intent.getLongExtra(EXTRA_CID, 0L)
+        pendingResumePositionMs = savedInstanceState?.getLong(STATE_PLAY_POSITION) ?: 0L
+        resumeSegmentIndex = savedInstanceState?.getInt(STATE_SEGMENT_INDEX) ?: 0
+        userWantsPlayback = savedInstanceState?.getBoolean(STATE_PLAY_WHEN_READY, true) ?: true
+        restoreEndedState = savedInstanceState?.getBoolean(STATE_PLAY_ENDED) ?: false
+        speedIndex = savedInstanceState?.getInt(STATE_SPEED_INDEX)?.coerceIn(speeds.indices) ?: 1
         localTaskId = intent.getLongExtra(EXTRA_LOCAL_TASK_ID, 0L)
+        localSortOrder = runCatching {
+            DownloadManager.SeasonSortOrder.valueOf(
+                intent.getStringExtra(EXTRA_LOCAL_SORT_ORDER)
+                    ?: localPlaybackPrefs.getString(KEY_LOCAL_SORT_ORDER, "").orEmpty()
+            )
+        }.getOrDefault(DownloadManager.SeasonSortOrder.DEFAULT)
+        localPlayMode = runCatching {
+            DownloadManager.LocalPlayMode.valueOf(
+                localPlaybackPrefs.getString(KEY_LOCAL_PLAY_MODE, "").orEmpty()
+            )
+        }.getOrDefault(DownloadManager.LocalPlayMode.SEASON_SEQUENCE)
         isLocalMode = localTaskId > 0L
+        // 收藏夹「播放全部」入口：携带队列则覆盖 bvid/合集，走收藏夹播放态
+        favoritePlayback = FavoritePlaybackLauncher.read(intent)
+        favoritePlayback?.let { fav ->
+            val entry = fav.entries.getOrNull(fav.startIndex) ?: fav.entries.first()
+            currentBvid = entry.bvid
+            currentAid = entry.aid
+            currentCid = entry.cid
+            pendingResumePositionMs = fav.startPositionMs
+            favoritePlayMode = DownloadManager.LocalPlayMode.SEASON_SEQUENCE
+        }
         requestedQuality = loadQualityPreference()
-        // Keep the big-vip badge state fresh for the quality menu (best effort).
-        BiliSessionStore.refreshVipInfo()
-        if (currentBvid.isBlank() && !isLocalMode) { finish(); return }
+        if (currentBvid.isBlank() && currentAid <= 0L && !isLocalMode) { finish(); return }
+        if (!isLocalMode) {
+            startupAtMs = SystemClock.elapsedRealtime()
+            BiliPlayUrl.prewarm()
+        }
         if (isLocalMode) {
             DownloadManager.init(this)
             val local = DownloadManager.task(localTaskId)
             if (local == null || !local.playable()) { finish(); return }
+            refreshLocalPlaylist(local)
         }
-        // Match the themed content canvas so the status bar is not a detached black strip.
-        Theme.applySystemBars(this)
-        // Detail page is portrait-designed; fullscreen switches to landscape temporarily.
-        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        // 视频播放页顶部紧邻黑色视频窗口，状态栏固定纯黑配白色图标，底栏跟随主题色
+        applyPlayerSystemBars()
+        if (LayoutMode.isTablet) {
+            LayoutMode.applyTabletOrientationIfEnabled(this)
+        } else {
+            // Detail page is portrait-designed; fullscreen switches to landscape temporarily.
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        }
 
         activityRoot = FrameLayout(this).apply { setBackgroundColor(COLOR_BACKGROUND) }
         page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(COLOR_BACKGROUND)
         }
-        val playerHeight = resources.displayMetrics.widthPixels * 9 / 16
 
         // ── Gesture detector ──
         gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
@@ -282,61 +446,134 @@ class VideoDetailActivity : Activity() {
 
         // ── Player host: Media3 PlayerView owns aspect-ratio and video surface ──
         playerHost = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        playerView = PlayerView(this).apply {
-            useController = false
-            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-            setShutterBackgroundColor(Color.BLACK)
-            setKeepContentOnPlayerReset(true)
-            setBackgroundColor(Color.BLACK)
-        }
+        playerView = buildConfiguredPlayerView()
         playerHost.addView(playerView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        // 弹幕层位于视频之上、手势与控制层之下，不拦截触控；本地离线模式不显示弹幕
+        danmakuView = DanmakuOverlayView(this).apply {
+            visibility = if (isLocalMode) View.GONE else View.VISIBLE
+        }
+        playerHost.addView(danmakuView, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        if (!isLocalMode) {
+            danmakuController = DanmakuController(danmakuView)
+            DanmakuSettingsStore.addListener(danmakuUiSettingsListener)
+        }
+        if (isLocalMode) {
+            localAudioCoverOverlay = FrameLayout(this).apply {
+                setBackgroundColor(Color.BLACK)
+                visibility = View.GONE
+            }
+            localAudioCoverView = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+            }
+            localAudioCoverOverlay!!.addView(localAudioCoverView, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            localAudioCoverOverlay!!.addView(View(this).apply {
+                setBackgroundColor(0x45000000)
+            }, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            localAudioCoverOverlay!!.addView(TextView(this).apply {
+                text = "纯音频离线播放"
+                textSize = 11.5f
+                typeface = Ds.body(bold = true)
+                setTextColor(Color.WHITE)
+                background = Ds.pill(this@VideoDetailActivity, 0x80000000.toInt(), 0x33FFFFFF)
+                setPadding(dp(11), dp(4), dp(11), dp(4))
+            }, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.END).apply {
+                topMargin = dp(12); rightMargin = dp(14)
+            })
+            playerHost.addView(localAudioCoverOverlay, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        }
         // Gesture layer stays below all buttons, so it never steals their click events.
         gestureLayer = PlayerGestureView(this)
         playerHost.addView(gestureLayer, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
 
-        playerSpinner = ProgressBar(this).apply {
-            isIndeterminate = true
-            indeterminateTintList = android.content.res.ColorStateList.valueOf(Color.WHITE)
+        playerSpinner = BrandSpinnerView(this, COLOR_ROSE, Color.WHITE).apply {
+            contentDescription = "正在缓冲"
         }
-        playerHost.addView(playerSpinner, FrameLayout.LayoutParams(dp(34), dp(34), Gravity.CENTER))
+        playerHost.addView(playerSpinner, FrameLayout.LayoutParams(dp(38), dp(38), Gravity.CENTER))
 
         playerError = TextView(this).apply {
             visibility = View.GONE
             textSize = 13f
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
-            setBackgroundColor((0xB3000000).toInt())
-            setPadding(dp(18), dp(12), dp(18), dp(12))
+            background = Ds.card(this@VideoDetailActivity, 0xCC14161B.toInt(), 0x26FFFFFF, Ds.Radius.card)
+            setPadding(dp(20), dp(14), dp(20), dp(14))
             isClickable = true
+            Ds.bindPressFeedback(this, 0.96f)
             setOnClickListener { retryPlayer() }
         }
         playerHost.addView(playerError, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER).apply {
+            leftMargin = dp(24); rightMargin = dp(24)
+        })
 
-        // ── Back button (top-left, simple arrow, no background) ──
+        // ── 顶部控制栏：返回键 + 全屏时标题（随控制层同显同隐，按压回弹） ──
+        topControlsBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(8), dp(6), dp(14), dp(6))
+        }
         playerBack = object : View(this) {
             private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.WHITE; style = Paint.Style.STROKE
-                strokeWidth = dpf(2.5f); strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
+                strokeWidth = dpf(2.2f); strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
             }
+            private val path = Path()
             override fun onDraw(canvas: Canvas) {
                 super.onDraw(canvas)
-                val cx = width / 2f; val cy = height / 2f; val len = dpf(9f)
-                canvas.drawLine(cx + len * 0.3f, cy - len * 0.6f, cx - len * 0.7f, cy, paint)
-                canvas.drawLine(cx - len * 0.7f, cy, cx + len * 0.3f, cy + len * 0.6f, paint)
+                val cx = width / 2f; val cy = height / 2f; val arm = dpf(6.5f)
+                path.rewind()
+                path.moveTo(cx + arm * 0.45f, cy - arm)
+                path.lineTo(cx - arm * 0.45f, cy)
+                path.lineTo(cx + arm * 0.45f, cy + arm)
+                canvas.drawPath(path, paint)
             }
         }.apply {
             contentDescription = "返回"
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.88f)
             setOnClickListener { if (isFullscreen) toggleFullscreen() else finish() }
         }
-        // Added to playerHost after createControlOverlay() so it sits above the top scrim.
+        playerTopTitle = TextView(this).apply {
+            textSize = 14.5f
+            typeface = Ds.display(bold = true)
+            setTextColor(Color.WHITE)
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setShadowLayer(dpf(4f), 0f, dpf(1f), 0x80000000.toInt())
+            visibility = View.GONE
+        }
+        topControlsBar.addView(playerBack, LinearLayout.LayoutParams(dp(38), dp(38)))
+        topControlsBar.addView(playerTopTitle, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+            leftMargin = dp(4)
+        })
+        // 标题隐藏时用占位 spacer 把右侧按钮顶到最右，避免小窗下按钮贴到返回键旁边
+        topBarSpacer = View(this).apply { visibility = View.VISIBLE }
+        topControlsBar.addView(topBarSpacer, LinearLayout.LayoutParams(0, 0, 1f))
+
+        // 右上角「后台播放」：转成在线音频页并从当前进度继续
+        backgroundPlayBtn = BackgroundPlayIcon(this).apply {
+            contentDescription = "后台播放"
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.88f)
+            setOnClickListener { enterBackgroundAudioPlayback() }
+        }
+        topControlsBar.addView(backgroundPlayBtn, LinearLayout.LayoutParams(dp(38), dp(38)).apply {
+            leftMargin = dp(6)
+        })
 
         // ── Center replay button (only visible after playback ends) ──
         replayBtn = ReplayIcon(this).apply {
             visibility = View.GONE; alpha = 0f
             isClickable = true
+            Ds.bindPressFeedback(this, 0.90f)
             setOnClickListener { replay() }
         }
         playerHost.addView(replayBtn, FrameLayout.LayoutParams(dp(64), dp(64), Gravity.CENTER))
@@ -344,18 +581,33 @@ class VideoDetailActivity : Activity() {
         // ── Boost indicator: translucent pill shown above the video while long-press boosting ──
         boostIndicator = TextView(this).apply {
             text = "2.0x 倍速播放中"
-            textSize = 13f
-            setTextColor(0xE6FFFFFF.toInt())
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            textSize = 12.5f
+            setTextColor(Color.WHITE)
+            typeface = Ds.body(bold = true)
             gravity = Gravity.CENTER
             setPadding(dp(14), dp(5), dp(14), dp(5))
-            background = rounded(0x26FFFFFF.toInt(), dp(13))
+            background = Ds.pill(this@VideoDetailActivity, 0xA616181D.toInt(), 0x33FFFFFF)
             alpha = 0f
             visibility = View.GONE
         }
         playerHost.addView(boostIndicator, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(52) })
+            Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(18) })
+
+        // ── Seek preview pill: 滑动进度提示胶囊，松手后才真正 seek ──
+        playerSeekHint = TextView(this).apply {
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            typeface = Ds.display(bold = true)
+            gravity = Gravity.CENTER
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            background = Ds.pill(this@VideoDetailActivity, 0xCC14161B.toInt(), 0x33FFFFFF)
+            alpha = 0f
+            visibility = View.GONE
+        }
+        playerHost.addView(playerSeekHint, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER))
 
         // ── Brightness / volume adjustment indicator (center overlay) ──
         adjustIndicator = AdjustIndicator(this).apply {
@@ -369,9 +621,15 @@ class VideoDetailActivity : Activity() {
 
         // ── Control overlay ──
         createControlOverlay()
-        page.addView(playerHost, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, playerHeight))
         infoArea = createInfoArea()
-        page.addView(infoArea, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        tabletSplitDivider = View(this).apply {
+            setBackgroundColor(Ds.colors.lineSoft)
+            visibility = View.GONE
+        }
+        page.addView(playerHost)
+        page.addView(tabletSplitDivider)
+        page.addView(infoArea)
+        applyPageSplitLayout()
         activityRoot.addView(page, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         fullscreenContainer = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -384,6 +642,7 @@ class VideoDetailActivity : Activity() {
             loadLocalPlayer()
         } else {
             loadVideoAndPlayer()
+            BiliSessionStore.refreshVipInfo()
         }
     }
 
@@ -394,47 +653,110 @@ class VideoDetailActivity : Activity() {
     private fun createControlOverlay() {
         bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            // Transparent background — contrast comes from the bottom scrim gradient.
             background = null
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(6), dp(2), dp(6), dp(6))
+            setPadding(dp(8), dp(2), dp(8), dp(6))
         }
 
         // Play/Pause
         playPauseBtn = PlayPauseIcon(this).apply {
             isClickable = true
+            Ds.bindPressFeedback(this, 0.88f)
             setOnClickListener { togglePlayPause() }
         }
         bottomBar.addView(playPauseBtn, LinearLayout.LayoutParams(dp(30), dp(30)).apply { gravity = Gravity.CENTER })
+
+        // Next episode（仅全屏且有下一集时显示，按合集排序顺序）
+        nextEpisodeBtn = NextEpisodeIcon(this).apply {
+            isClickable = true
+            contentDescription = "下一集"
+            visibility = View.GONE
+            Ds.bindPressFeedback(this, 0.88f)
+            setOnClickListener { playNextEpisode() }
+        }
+        bottomBar.addView(nextEpisodeBtn, LinearLayout.LayoutParams(dp(30), dp(30)).apply {
+            gravity = Gravity.CENTER
+            leftMargin = dp(8)
+        })
+
+        // 弹幕开关 + 弹幕设置（仅在线播放且全屏时展示）
+        if (!isLocalMode) {
+            danmakuToggleBtn = DanmakuUi.ToggleIconView(this, onDarkPlayer = true).apply {
+                visibility = View.GONE
+                isClickable = true
+                setDanmakuEnabled(DanmakuSettingsStore.snapshot().enabled)
+                Ds.bindPressFeedback(this, 0.88f)
+                setOnClickListener {
+                    DanmakuSettingsStore.toggleEnabled()
+                    if (exoPlayer?.isPlaying == true) scheduleAutoHide()
+                }
+            }
+            bottomBar.addView(danmakuToggleBtn, LinearLayout.LayoutParams(dp(34), dp(34)).apply {
+                gravity = Gravity.CENTER
+                leftMargin = dp(10)
+            })
+
+            danmakuSettingsBtn = DanmakuUi.SettingsIconView(this).apply {
+                visibility = View.GONE
+                isClickable = true
+                Ds.bindPressFeedback(this, 0.88f)
+                setOnClickListener { openDanmakuSettingsDrawer() }
+            }
+            bottomBar.addView(danmakuSettingsBtn, LinearLayout.LayoutParams(dp(34), dp(34)).apply {
+                gravity = Gravity.CENTER
+                leftMargin = dp(6)
+            })
+        }
 
         // Right side: speed / quality / fullscreen
         bottomBar.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
 
         // Speed
         speedBtn = TextView(this).apply {
-            text = "1.0x"; textSize = 10.5f
-            setTextColor(Color.WHITE); typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            text = "${speeds[speedIndex]}x"; textSize = 11f
+            setTextColor(Color.WHITE); typeface = Ds.body(bold = true)
+            fontFeatureSettings = "tnum"
+            maxLines = 1
+            includeFontPadding = false
             gravity = Gravity.CENTER
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            background = Ds.pill(this@VideoDetailActivity, 0x33000000, 0x2EFFFFFF)
             isClickable = true
+            Ds.bindPressFeedback(this, 0.90f)
             setOnClickListener { cycleSpeed() }
         }
-        bottomBar.addView(speedBtn, LinearLayout.LayoutParams(dp(34), dp(28)).apply { gravity = Gravity.CENTER })
-
-        // Quality (shows the actual playing resolution, e.g. 720p)
-        qualityBtn = TextView(this).apply {
-            text = "自动"; textSize = 10.5f
-            setTextColor(Color.WHITE); typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        bottomBar.addView(speedBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, dp(26)).apply {
             gravity = Gravity.CENTER
+            rightMargin = dp(6)
+        })
+
+        // Quality (shows the actual playing resolution, e.g. 1080p60)
+        qualityBtn = TextView(this).apply {
+            text = "自动"; textSize = 11f
+            setTextColor(Color.WHITE); typeface = Ds.body(bold = true)
+            fontFeatureSettings = "tnum"
+            maxLines = 1
+            includeFontPadding = false
+            gravity = Gravity.CENTER
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            background = Ds.pill(this@VideoDetailActivity, 0x33000000, 0x2EFFFFFF)
             isClickable = true
+            Ds.bindPressFeedback(this, 0.90f)
             setOnClickListener { showQualityMenu(this) }
         }
-        bottomBar.addView(qualityBtn, LinearLayout.LayoutParams(dp(38), dp(28)).apply { gravity = Gravity.CENTER })
+        bottomBar.addView(qualityBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, dp(26)).apply {
+            gravity = Gravity.CENTER
+            rightMargin = dp(6)
+        })
         // 本地文件播放时画质固定，不展示切换按钮
         if (isLocalMode) qualityBtn.visibility = View.GONE
 
         // Fullscreen
         fsBtn = FullscreenIcon(this).apply {
             isClickable = true
+            Ds.bindPressFeedback(this, 0.88f)
             setOnClickListener { toggleFullscreen() }
         }
         bottomBar.addView(fsBtn, LinearLayout.LayoutParams(dp(30), dp(30)).apply { gravity = Gravity.CENTER })
@@ -449,10 +771,9 @@ class VideoDetailActivity : Activity() {
             text = "00:00"
             textSize = 10.5f
             setTextColor(0xE6FFFFFF.toInt())
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            typeface = Ds.body(bold = true)
+            fontFeatureSettings = "tnum"
             includeFontPadding = false
-            // Center the glyph vertically inside its box so it lines up with the
-            // seek bar track (track sits at (height - trackH) / 2).
             gravity = Gravity.CENTER_VERTICAL
         }
         progressRow.addView(timeText, LinearLayout.LayoutParams(
@@ -470,24 +791,34 @@ class VideoDetailActivity : Activity() {
                 when (event.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
                         parent?.requestDisallowInterceptTouchEvent(true)
+                        controlsHideRunnable?.let(handler::removeCallbacks)
                         isDragging = true
                         isSeeking = true
                         seekWasPlaying = p.playWhenReady && userWantsPlayback
                         p.pause()
                         seekToFraction(ratio)
+                        showSeekHint(seekPos, totalDuration)
                     }
-                    MotionEvent.ACTION_MOVE -> seekToFraction(ratio)
+                    MotionEvent.ACTION_MOVE -> {
+                        seekToFraction(ratio)
+                        showSeekHint(seekPos, totalDuration)
+                    }
                     MotionEvent.ACTION_UP -> {
                         seekPlayerGlobal(p, seekPos)
+                        danmakuController?.onSeeked(seekPos)
                         if (seekWasPlaying && activityResumed && userWantsPlayback) p.play()
                         isDragging = false
                         isSeeking = false
+                        hideSeekHint()
+                        if (p.isPlaying || seekWasPlaying) scheduleAutoHide()
                         parent?.requestDisallowInterceptTouchEvent(false)
                     }
                     MotionEvent.ACTION_CANCEL -> {
                         if (seekWasPlaying && activityResumed && userWantsPlayback) p.play()
                         isDragging = false
                         isSeeking = false
+                        hideSeekHint()
+                        if (p.isPlaying || seekWasPlaying) scheduleAutoHide()
                         parent?.requestDisallowInterceptTouchEvent(false)
                     }
                 }
@@ -503,10 +834,10 @@ class VideoDetailActivity : Activity() {
             text = "00:00"
             textSize = 10.5f
             setTextColor(0xE6FFFFFF.toInt())
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            typeface = Ds.body(bold = true)
+            fontFeatureSettings = "tnum"
             gravity = Gravity.CENTER_VERTICAL or Gravity.END
             includeFontPadding = false
-            minWidth = dp(40)
         }
         progressRow.addView(durationText, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT).apply {
@@ -516,76 +847,653 @@ class VideoDetailActivity : Activity() {
             visibility = View.VISIBLE
             background = null
         }
-        // ── Scrim gradients: darken top/bottom so white controls stay readable on any content.
-        // Non-interactive: taps pass straight through to the gesture layer below.
+        // 顶部/底部柔和暗角遮罩（不拦截点击，确保白色控件和文字清晰）
         controlOverlay.addView(View(this).apply {
             isClickable = false
             isFocusable = false
             background = GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(0x8C000000.toInt(), 0x00000000)
+                intArrayOf(0x99000000.toInt(), 0x00000000)
             )
         }, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, dp(92), Gravity.TOP))
+            FrameLayout.LayoutParams.MATCH_PARENT, dp(72), Gravity.TOP))
         controlOverlay.addView(View(this).apply {
             isClickable = false
             isFocusable = false
             background = GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(0x00000000, 0xB0000000.toInt())
+                intArrayOf(0x00000000, 0xCC000000.toInt())
             )
         }, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, dp(128), Gravity.BOTTOM))
+            FrameLayout.LayoutParams.MATCH_PARENT, dp(104), Gravity.BOTTOM))
 
+        controlOverlay.addView(buildFullscreenStatusBar(), FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
+            topMargin = dp(3)
+        })
+        controlOverlay.addView(topControlsBar, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP))
         controlOverlay.addView(progressRow, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, dp(24), Gravity.BOTTOM).apply {
-            leftMargin = dp(10); rightMargin = dp(10); bottomMargin = dp(32)
+            leftMargin = dp(12); rightMargin = dp(12); bottomMargin = dp(32)
         })
         controlOverlay.addView(bottomBar, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+
+        // 右侧合集入口箭头：只在全屏且有合集时显示，随控制层同显同隐
+        seasonEntryBtn = buildSeasonEntryButton().also { btn ->
+            controlOverlay.addView(btn, FrameLayout.LayoutParams(
+                dp(34), dp(52), Gravity.END or Gravity.CENTER_VERTICAL).apply {
+                rightMargin = dp(10)
+            })
+        }
+
         playerHost.addView(controlOverlay, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        // Back button mounts above the control overlay so the top scrim never dims it.
-        playerHost.addView(playerBack, FrameLayout.LayoutParams(
-            dp(40), dp(40), Gravity.START or Gravity.TOP).apply {
-            leftMargin = dp(8); topMargin = dp(8) })
+        playerHost.addView(buildSeasonDrawerOverlay(), FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        if (!isLocalMode) {
+            danmakuSettingsDrawer = DanmakuUi.FullscreenSettingsDrawer(
+                context = this,
+                reducedMotion = reducedMotion,
+                onBeforeOpen = {
+                    if (seasonDrawerOpen) closeSeasonDrawer(immediate = true)
+                    controlsHideRunnable?.let { handler.removeCallbacks(it) }
+                    if (controlsVisible) hideControls()
+                }
+            ).also { drawer ->
+                playerHost.addView(drawer.overlay, FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
+                ))
+            }
+        }
         applyControlSizing()
     }
 
     /**
-     * Control sizing follows the container: compact in the in-feed portrait player,
-     * back to the roomier fullscreen layout once the player re-parents. Keeps the
-     * controls from dominating the small viewport without touching fullscreen.
+     * 控制栏随容器切换紧凑/全屏尺寸，避免在 16:9 小窗中过度抢占画面，也避免全屏时按钮过小。
      */
     private fun applyControlSizing() {
         if (!::bottomBar.isInitialized) return
+        updateSeasonEntryVisibility()
         val compact = !isFullscreen
-        bottomBar.setPadding(dp(6), dp(if (compact) 2 else 8), dp(6), dp(if (compact) 6 else 10))
+        bottomBar.setPadding(dp(if (compact) 8 else 14), dp(if (compact) 2 else 6), dp(if (compact) 8 else 14), dp(if (compact) 6 else 12))
         playPauseBtn.layoutParams = LinearLayout.LayoutParams(
             dp(if (compact) 30 else 36), dp(if (compact) 30 else 36)).apply { gravity = Gravity.CENTER }
+        nextEpisodeBtn?.layoutParams = LinearLayout.LayoutParams(
+            dp(if (compact) 30 else 36), dp(if (compact) 30 else 36)).apply {
+            gravity = Gravity.CENTER
+            leftMargin = dp(8)
+        }
+        val showFullscreenDanmaku = isFullscreen && !isLocalMode
+        danmakuToggleBtn?.apply {
+            visibility = if (showFullscreenDanmaku) View.VISIBLE else View.GONE
+            layoutParams = LinearLayout.LayoutParams(dp(34), dp(34)).apply {
+                gravity = Gravity.CENTER
+                leftMargin = dp(10)
+            }
+        }
+        danmakuSettingsBtn?.apply {
+            visibility = if (showFullscreenDanmaku) View.VISIBLE else View.GONE
+            layoutParams = LinearLayout.LayoutParams(dp(34), dp(34)).apply {
+                gravity = Gravity.CENTER
+                leftMargin = dp(6)
+            }
+        }
         speedBtn.layoutParams = LinearLayout.LayoutParams(
-            dp(if (compact) 34 else 40), dp(if (compact) 28 else 36)).apply { gravity = Gravity.CENTER }
-        speedBtn.textSize = if (compact) 10.5f else 11f
+            LinearLayout.LayoutParams.WRAP_CONTENT, dp(if (compact) 26 else 30)).apply {
+            gravity = Gravity.CENTER; rightMargin = dp(if (compact) 6 else 8)
+        }
+        speedBtn.minWidth = dp(if (compact) 40 else 48)
+        speedBtn.setPadding(dp(if (compact) 8 else 11), 0, dp(if (compact) 8 else 11), 0)
+        speedBtn.textSize = if (compact) 11f else 12f
         qualityBtn.layoutParams = LinearLayout.LayoutParams(
-            dp(if (compact) 38 else 44), dp(if (compact) 28 else 36)).apply { gravity = Gravity.CENTER }
-        qualityBtn.textSize = if (compact) 10.5f else 11f
+            LinearLayout.LayoutParams.WRAP_CONTENT, dp(if (compact) 26 else 30)).apply {
+            gravity = Gravity.CENTER; rightMargin = dp(if (compact) 6 else 8)
+        }
+        qualityBtn.minWidth = dp(if (compact) 46 else 56)
+        qualityBtn.setPadding(dp(if (compact) 10 else 13), 0, dp(if (compact) 10 else 13), 0)
+        qualityBtn.textSize = if (compact) 11f else 12f
         fsBtn.layoutParams = LinearLayout.LayoutParams(
             dp(if (compact) 30 else 36), dp(if (compact) 30 else 36)).apply { gravity = Gravity.CENTER }
         if (::progressRow.isInitialized) {
             progressRow.layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, dp(if (compact) 24 else 28), Gravity.BOTTOM).apply {
-                leftMargin = dp(10); rightMargin = dp(10); bottomMargin = dp(if (compact) 32 else 44)
+                leftMargin = dp(if (compact) 12 else 18)
+                rightMargin = dp(if (compact) 12 else 18)
+                bottomMargin = dp(if (compact) 32 else 46)
             }
-            timeText.textSize = if (compact) 10.5f else 11f
-            durationText.textSize = if (compact) 10.5f else 11f
+            timeText.textSize = if (compact) 10.5f else 11.5f
+            durationText.textSize = if (compact) 10.5f else 11.5f
         }
-        if (::playerBack.isInitialized) {
-            playerBack.layoutParams = FrameLayout.LayoutParams(
-                dp(if (compact) 40 else 44), dp(if (compact) 40 else 44),
-                Gravity.START or Gravity.TOP).apply {
-                leftMargin = dp(8); topMargin = dp(if (compact) 8 else 12)
+        if (::topControlsBar.isInitialized) {
+            topControlsBar.setPadding(dp(if (compact) 8 else 14), dp(if (compact) 6 else 14), dp(if (compact) 8 else 14), dp(6))
+            val topBtnSize = dp(if (compact) 38 else 42)
+            playerBack.layoutParams = LinearLayout.LayoutParams(topBtnSize, topBtnSize)
+            backgroundPlayBtn.layoutParams = LinearLayout.LayoutParams(topBtnSize, topBtnSize).apply {
+                leftMargin = dp(6)
+            }
+            backgroundPlayBtn.setCompact(compact)
+            val showTitle = isFullscreen && !playerTopTitle.text.isNullOrBlank()
+            playerTopTitle.visibility = if (showTitle) View.VISIBLE else View.GONE
+            topBarSpacer.visibility = if (showTitle) View.GONE else View.VISIBLE
+            updateBackgroundPlayVisibility()
+        }
+        updateFullscreenStatusVisibility()
+    }
+
+    // ─────────────────────────────────────────────────
+    //  Fullscreen status bar (clock + battery)
+    // ─────────────────────────────────────────────────
+
+    /** 顶部居中的系统时间 + 电池电量，仅横屏全屏且控制面板可见时展示。 */
+    private fun buildFullscreenStatusBar(): View {
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = false
+            isFocusable = false
+            visibility = View.GONE
+        }
+        val clock = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11f)
+            typeface = Ds.body(bold = true)
+            fontFeatureSettings = "tnum"
+            includeFontPadding = false
+            maxLines = 1
+            setTextColor(0xE6FFFFFF.toInt())
+            setShadowLayer(dpf(2.5f), 0f, dpf(1f), 0x80000000.toInt())
+        }
+        bar.addView(clock)
+        val battery = BatteryStatusIcon(this)
+        bar.addView(battery, LinearLayout.LayoutParams(dp(20), dp(11)).apply {
+            leftMargin = dp(6)
+        })
+        val percentText = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10f)
+            typeface = Ds.body(bold = true)
+            fontFeatureSettings = "tnum"
+            includeFontPadding = false
+            maxLines = 1
+            setTextColor(0xCCFFFFFF.toInt())
+            setShadowLayer(dpf(2.5f), 0f, dpf(1f), 0x80000000.toInt())
+            visibility = View.GONE
+        }
+        bar.addView(percentText, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            leftMargin = dp(3)
+        })
+        fullscreenStatusBar = bar
+        statusClockText = clock
+        statusBatteryIcon = battery
+        statusBatteryPercentText = percentText
+        updateStatusClock()
+        return bar
+    }
+
+    private fun updateStatusClock() {
+        val clock = statusClockText ?: return
+        val pattern = if (android.text.format.DateFormat.is24HourFormat(this)) "HH:mm" else "h:mm"
+        val format = statusTimeFormat.get() ?: return
+        if (format.toPattern() != pattern) format.applyPattern(pattern)
+        clock.text = format.format(Date())
+    }
+
+    private fun applyBatteryState(intent: Intent) {
+        val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+        val percent = if (level >= 0 && scale > 0) (level * 100 / scale).coerceIn(0, 100) else -1
+        val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+        val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+        val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == BatteryManager.BATTERY_STATUS_FULL || plugged != 0
+        statusBatteryIcon?.update(percent, charging)
+        val percentText = statusBatteryPercentText ?: return
+        if (percent < 0) {
+            percentText.visibility = View.GONE
+            return
+        }
+        percentText.visibility = View.VISIBLE
+        percentText.text = "$percent%"
+        percentText.setTextColor(
+            when {
+                charging -> 0xFF70C493.toInt()
+                percent <= 20 -> 0xFFEB6F79.toInt()
+                else -> 0xCCFFFFFF.toInt()
+            }
+        )
+    }
+
+    private fun refreshBatteryState() {
+        val intent = runCatching {
+            registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        }.getOrNull() ?: return
+        applyBatteryState(intent)
+    }
+
+    /** 横屏全屏才显示；需在 enterFullscreen / onConfigurationChanged / applyControlSizing 处同步。 */
+    private fun updateFullscreenStatusVisibility() {
+        val bar = fullscreenStatusBar ?: return
+        val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        bar.visibility = if (isFullscreen && landscape) View.VISIBLE else View.GONE
+    }
+
+    private fun registerStatusReceiver() {
+        if (statusReceiverRegistered) return
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_TIME_TICK)
+            addAction(Intent.ACTION_TIME_CHANGED)
+            addAction(Intent.ACTION_TIMEZONE_CHANGED)
+            addAction(Intent.ACTION_BATTERY_CHANGED)
+        }
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                registerReceiver(statusReceiver, filter)
+            }
+            statusReceiverRegistered = true
+        }
+    }
+
+    private fun unregisterStatusReceiver() {
+        if (!statusReceiverRegistered) return
+        runCatching { unregisterReceiver(statusReceiver) }
+        statusReceiverRegistered = false
+    }
+
+    // ─────────────────────────────────────────────────
+    //  Fullscreen season drawer
+    // ─────────────────────────────────────────────────
+    /** 全屏抽屉统一条目：在线合集用 UgcEpisode，本地合集用 taskId。 */
+    private data class FullscreenSeasonItem(
+        val label: String,
+        val title: String,
+        val isCurrent: Boolean,
+        val episode: UgcEpisode? = null,
+        val localTaskId: Long = 0L
+    )
+
+    private fun buildSeasonEntryButton(): View = object : View(this) {
+        private val density = resources.displayMetrics.density
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+            strokeWidth = 1.8f * density
+            color = 0xE6FFFFFF.toInt()
+        }
+        private val path = Path()
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            // 左指折线箭头：表达从右侧滑出抽屉
+            path.rewind()
+            path.moveTo(w * 0.36f, h * 0.36f)
+            path.lineTo(w * 0.18f, h * 0.50f)
+            path.lineTo(w * 0.36f, h * 0.64f)
+            canvas.drawPath(path, paint)
+            // 右侧三条等距列表线
+            canvas.drawLine(w * 0.50f, h * 0.36f, w * 0.84f, h * 0.36f, paint)
+            canvas.drawLine(w * 0.50f, h * 0.50f, w * 0.84f, h * 0.50f, paint)
+            canvas.drawLine(w * 0.50f, h * 0.64f, w * 0.74f, h * 0.64f, paint)
+        }
+    }.apply {
+        background = Ds.card(this@VideoDetailActivity, 0x7314161B, 0x38FFFFFF, Ds.Radius.round)
+        isClickable = true
+        contentDescription = "合集列表"
+        visibility = View.GONE
+        Ds.bindPressFeedback(this, 0.90f)
+        setOnClickListener { openSeasonDrawer() }
+    }
+
+    private fun buildSeasonDrawerOverlay(): View {
+        val overlay = FrameLayout(this).apply {
+            setBackgroundColor(0x4D000000)
+            visibility = View.GONE
+            isClickable = true
+            setOnClickListener { closeSeasonDrawer() }
+        }
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Ds.plate(0xC414161B.toInt(), 0x2EFFFFFF, Ds.hairline(this@VideoDetailActivity), dp(18).toFloat())
+            isClickable = true
+            Ds.clipRounded(this, 18)
+        }
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(10), dp(10), dp(10))
+        }
+        val headerTitle = TextView(this).apply {
+            text = "合集"
+            textSize = 13f
+            typeface = Ds.display(bold = true)
+            setTextColor(Color.WHITE)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            maxWidth = dp(150)
+        }
+        seasonDrawerTitleText = headerTitle
+        header.addView(headerTitle, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        seasonDrawerCountText = TextView(this).apply {
+            text = ""
+            textSize = 12f
+            typeface = Ds.body(bold = true)
+            fontFeatureSettings = "tnum"
+            setTextColor(0xFFF27D9E.toInt())
+        }
+        header.addView(seasonDrawerCountText, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            leftMargin = dp(8)
+        })
+        header.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
+        header.addView(Ds.closeIcon(this, 0xB3FFFFFF.toInt(), 1.7f).apply {
+            isClickable = true
+            setOnClickListener { closeSeasonDrawer() }
+        }, LinearLayout.LayoutParams(dp(28), dp(28)))
+        panel.addView(header, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        panel.addView(View(this).apply { setBackgroundColor(0x1FFFFFFF) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, Ds.hairline(this)))
+
+        val drawerAdapter = seasonDrawerAdapter()
+        seasonDrawerAdapter = drawerAdapter
+        val list = ListView(this).apply {
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            divider = ColorDrawable(Color.TRANSPARENT)
+            dividerHeight = dp(4)
+            setSelector(android.R.color.transparent)
+            setPadding(dp(8), dp(6), dp(8), dp(10))
+            clipToPadding = false
+            adapter = drawerAdapter
+        }
+        seasonDrawerList = list
+        panel.addView(list, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        overlay.addView(panel, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.MATCH_PARENT,
+            Gravity.END or Gravity.CENTER_VERTICAL).apply {
+            topMargin = dp(12); bottomMargin = dp(12); rightMargin = dp(12)
+        })
+        seasonDrawerOverlay = overlay
+        seasonDrawerPanel = panel
+        return overlay
+    }
+
+    private fun seasonDrawerAdapter(): BaseAdapter = object : BaseAdapter() {
+        override fun getCount(): Int = seasonDrawerItems.size
+        override fun getItem(position: Int): FullscreenSeasonItem = seasonDrawerItems[position]
+        override fun getItemId(position: Int): Long = position.toLong()
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+            val item = seasonDrawerItems[position]
+            val row = (convertView as? LinearLayout) ?: LinearLayout(this@VideoDetailActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(10), dp(9), dp(10), dp(9))
+                isClickable = true
+                Ds.bindPressFeedback(this, 0.97f)
+                addView(TextView(this@VideoDetailActivity).apply {
+                    textSize = 12f
+                    typeface = Ds.body(bold = true)
+                    fontFeatureSettings = "tnum"
+                    includeFontPadding = false
+                    maxLines = 1
+                    minWidth = dp(34)
+                    tag = "label"
+                }, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                    rightMargin = dp(8)
+                })
+                addView(TextView(this@VideoDetailActivity).apply {
+                    textSize = 13f
+                    maxLines = 2
+                    ellipsize = TextUtils.TruncateAt.END
+                    includeFontPadding = false
+                    setLineSpacing(dpf(2f), 1f)
+                    tag = "title"
+                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            }
+            val labelTv = row.findViewWithTag<TextView>("label")
+            val titleTv = row.findViewWithTag<TextView>("title")
+            val accent = 0xFFF27D9E.toInt()
+            // 收藏夹态不写 P 编号，当前项前改用动态音柱图标
+            val inFavorite = favoritePlayback != null
+            labelTv.text = if (inFavorite) "" else item.label
+            labelTv.setCompoundDrawablesWithIntrinsicBounds(
+                if (inFavorite && item.isCurrent) PlayingBarsDrawable(0xFFF27D9E.toInt(), dp(11)) else null,
+                null, null, null
+            )
+            labelTv.compoundDrawablePadding = dp(4)
+            labelTv.minWidth = if (inFavorite) 0 else dp(34)
+            titleTv.text = item.title
+            if (item.isCurrent) {
+                row.background = Ds.card(
+                    this@VideoDetailActivity, 0x2BF27D9E, accent, Ds.Radius.control,
+                    Ds.hairline(this@VideoDetailActivity)
+                )
+                labelTv.setTextColor(accent)
+                titleTv.setTextColor(accent)
+                titleTv.typeface = Ds.body(bold = true)
+            } else {
+                row.background = null
+                labelTv.setTextColor(0x99FFFFFF.toInt())
+                titleTv.setTextColor(0xEBFFFFFF.toInt())
+                titleTv.typeface = Ds.body(bold = false)
+            }
+            row.setOnClickListener {
+                if (item.isCurrent) {
+                    closeSeasonDrawer()
+                    return@setOnClickListener
+                }
+                closeSeasonDrawer()
+                item.episode?.let(::selectEpisode) ?: switchLocalTask(item.localTaskId)
+            }
+            return row
+        }
+    }
+
+    private fun hasFullscreenSeason(): Boolean = collectSeasonItems().size > 1
+
+    private fun collectSeasonItems(): List<FullscreenSeasonItem> {
+        // 收藏夹播放态：列表以收藏夹为准，屏蔽视频自身的 ugc_season
+        favoritePlayback?.let { fav ->
+            val currentIdx = fav.entries.indexOfFirst { it.bvid == currentBvid }
+            return fav.entries.mapIndexed { index, episode ->
+                FullscreenSeasonItem(
+                    label = "${index + 1}",
+                    title = episode.title,
+                    episode = episode,
+                    isCurrent = index == currentIdx
+                )
             }
         }
+        if (isLocalMode) {
+            return localPlaylist.mapIndexed { index, task ->
+                FullscreenSeasonItem(
+                    label = if (task.episodeNo > 0) "P${task.episodeNo}" else "P${index + 1}",
+                    title = task.title,
+                    localTaskId = task.id,
+                    isCurrent = task.id == localTaskId
+                )
+            }
+        }
+        val episodes = (currentDetail?.season ?: cachedSeason)?.episodes.orEmpty()
+        val currentIndex = episodes.indexOfFirst { currentCid > 0L && it.cid == currentCid }.takeIf { it >= 0 }
+            ?: episodes.indexOfFirst { it.cid <= 0L && it.bvid == currentBvid && it.aid == currentAid }
+        return episodes.mapIndexed { index, episode ->
+            FullscreenSeasonItem(
+                label = "P${index + 1}",
+                title = episode.title,
+                episode = episode,
+                isCurrent = index == currentIndex
+            )
+        }
+    }
+
+    /** 合集排序中的下一集（不受播放模式影响，手动切换专用）。 */
+    private sealed class NextSeasonTarget {
+        data class Online(val episode: UgcEpisode) : NextSeasonTarget()
+        data class Local(val taskId: Long) : NextSeasonTarget()
+    }
+
+    private fun resolveNextSeasonTarget(): NextSeasonTarget? {
+        favoritePlayback?.let { fav ->
+            val idx = fav.entries.indexOfFirst { it.bvid == currentBvid }
+            if (idx < 0) return null
+            val next = when (favoritePlayMode) {
+                DownloadManager.LocalPlayMode.SHUFFLE -> {
+                    if (fav.entries.size <= 1) null
+                    else fav.entries.filterIndexed { i, _ -> i != idx }.random()
+                }
+                DownloadManager.LocalPlayMode.LIST_LOOP ->
+                    fav.entries[(idx + 1) % fav.entries.size]
+                DownloadManager.LocalPlayMode.SINGLE_LOOP -> fav.entries[idx]
+                DownloadManager.LocalPlayMode.SEASON_SEQUENCE ->
+                    fav.entries.getOrNull(idx + 1)
+            }
+            return next?.let { NextSeasonTarget.Online(it) }
+        }
+        if (isLocalMode) {
+            val idx = localPlaylist.indexOfFirst { it.id == localTaskId }
+            if (idx < 0 || idx >= localPlaylist.lastIndex) return null
+            return NextSeasonTarget.Local(localPlaylist[idx + 1].id)
+        }
+        val episodes = (currentDetail?.season ?: cachedSeason)?.episodes.orEmpty()
+        if (episodes.size <= 1) return null
+        val idx = episodes.indexOfFirst { currentCid > 0L && it.cid == currentCid }.takeIf { it >= 0 }
+            ?: episodes.indexOfFirst { it.cid <= 0L && it.bvid == currentBvid && it.aid == currentAid }
+        if (idx < 0 || idx >= episodes.lastIndex) return null
+        return NextSeasonTarget.Online(episodes[idx + 1])
+    }
+
+    private fun playNextEpisode() {
+        val target = resolveNextSeasonTarget() ?: return
+        if (seasonDrawerOpen) closeSeasonDrawer(immediate = true)
+        when (target) {
+            is NextSeasonTarget.Online -> {
+                val episode = target.episode
+                if (episode.bvid.isBlank() && episode.aid <= 0L) return
+                selectEpisode(episode)
+            }
+            is NextSeasonTarget.Local -> switchLocalTask(target.taskId)
+        }
+    }
+
+    private fun updateSeasonEntryVisibility() {
+        val btn = seasonEntryBtn ?: return
+        val show = isFullscreen && hasFullscreenSeason()
+        btn.visibility = if (show) View.VISIBLE else View.GONE
+        if (!show && seasonDrawerOpen) closeSeasonDrawer()
+        updateNextEpisodeVisibility()
+    }
+
+    /** 下一集按钮：仅全屏且存在合集排序中的下一集时显示。 */
+    private fun updateNextEpisodeVisibility() {
+        val btn = nextEpisodeBtn ?: return
+        btn.visibility = if (isFullscreen && resolveNextSeasonTarget() != null) View.VISIBLE else View.GONE
+    }
+
+    /** 抽屉展开期间发生切集（含自动连播）时，同步刷新条目与当前集高亮。 */
+    private fun refreshSeasonDrawerSelection() {
+        updateSeasonEntryVisibility()
+        if (!seasonDrawerOpen) return
+        seasonDrawerItems = collectSeasonItems()
+        val currentIndex = seasonDrawerItems.indexOfFirst { it.isCurrent }
+        seasonDrawerTitleText?.text = favoritePlayback?.folderName?.takeIf { it.isNotBlank() } ?: "合集"
+        val unit = if (favoritePlayback != null) "个" else "集"
+        seasonDrawerCountText?.text = if (currentIndex >= 0) {
+            "${currentIndex + 1}/${seasonDrawerItems.size}"
+        } else "共 ${seasonDrawerItems.size} $unit"
+        seasonDrawerAdapter?.notifyDataSetChanged()
+        if (currentIndex >= 0) {
+            seasonDrawerList?.post {
+                seasonDrawerList?.setSelectionFromTop(
+                    currentIndex, ((seasonDrawerList?.height ?: 0) / 3).coerceAtLeast(0))
+            }
+        }
+    }
+
+    private fun openSeasonDrawer() {
+        if (seasonDrawerOpen || seasonDrawerAnimating) return
+        val overlay = seasonDrawerOverlay ?: return
+        val panel = seasonDrawerPanel ?: return
+        val list = seasonDrawerList ?: return
+        seasonDrawerItems = collectSeasonItems()
+        if (seasonDrawerItems.size <= 1) return
+        val currentIndex = seasonDrawerItems.indexOfFirst { it.isCurrent }
+        seasonDrawerTitleText?.text = favoritePlayback?.folderName?.takeIf { it.isNotBlank() } ?: "合集"
+        val unit = if (favoritePlayback != null) "个" else "集"
+        seasonDrawerCountText?.text = if (currentIndex >= 0) {
+            "${currentIndex + 1}/${seasonDrawerItems.size}"
+        } else "共 ${seasonDrawerItems.size} $unit"
+        seasonDrawerAdapter?.notifyDataSetChanged()
+
+        controlsHideRunnable?.let { handler.removeCallbacks(it) }
+        if (controlsVisible) hideControls()
+
+        val panelWidth = computeSeasonPanelWidth()
+        panel.layoutParams = (panel.layoutParams as FrameLayout.LayoutParams).apply { width = panelWidth }
+        panel.requestLayout()
+
+        seasonDrawerOpen = true
+        overlay.visibility = View.VISIBLE
+        overlay.alpha = if (reducedMotion) 1f else 0f
+        panel.translationX = if (reducedMotion) 0f else panelWidth.toFloat()
+        if (reducedMotion) {
+            seasonDrawerAnimating = false
+        } else {
+            seasonDrawerAnimating = true
+            overlay.animate().alpha(1f).setDuration(MotionTokens.panelMs)
+                .setInterpolator(MotionTokens.easeOut).start()
+            panel.animate().translationX(0f).setDuration(MotionTokens.panelMs)
+                .setInterpolator(MotionTokens.drawer).withEndAction { seasonDrawerAnimating = false }.start()
+        }
+        if (currentIndex >= 0) {
+            list.post { list.setSelectionFromTop(currentIndex, (list.height / 3).coerceAtLeast(0)) }
+        }
+    }
+
+    private fun closeSeasonDrawer(immediate: Boolean = false) {
+        if (!seasonDrawerOpen) return
+        seasonDrawerOpen = false
+        val overlay = seasonDrawerOverlay ?: return
+        val panel = seasonDrawerPanel ?: return
+        if (immediate || reducedMotion) {
+            overlay.visibility = View.GONE
+            overlay.alpha = 1f
+            panel.translationX = 0f
+            seasonDrawerAnimating = false
+            return
+        }
+        seasonDrawerAnimating = true
+        val panelWidth = computeSeasonPanelWidth()
+        panel.animate().translationX(panelWidth.toFloat()).setDuration(MotionTokens.smallMs)
+            .setInterpolator(MotionTokens.easeOut).start()
+        overlay.animate().alpha(0f).setDuration(MotionTokens.smallMs)
+            .setInterpolator(MotionTokens.easeOut).withEndAction {
+                overlay.visibility = View.GONE
+                overlay.alpha = 1f
+                panel.translationX = 0f
+                seasonDrawerAnimating = false
+            }.start()
+    }
+
+    /** 面板宽度按横屏实际宽高实时计算，避免旋转未完成时按竖屏宽度算窄。 */
+    private fun computeSeasonPanelWidth(): Int {
+        val host = if (::playerHost.isInitialized) playerHost else null
+        val base = host?.let { maxOf(it.width, it.height) }?.takeIf { it > 0 }
+            ?: resources.displayMetrics.widthPixels
+        return (base * 0.38f).toInt().coerceIn(dp(248), dp(320))
     }
 
     // ─────────────────────────────────────────────────
@@ -600,73 +1508,81 @@ class VideoDetailActivity : Activity() {
             setBackgroundColor(COLOR_BACKGROUND)
         }
 
-        // ── Tab bar: 简介 / 评论 ──
+        // ── Tab bar: 简介 / 评论 + 极细底部分割线 ──
         val tabBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(18), 0, dp(18), 0)
         }
-        fun buildTab(label: String, active: Boolean): Pair<TextView, View> {
+        fun buildTab(label: String, active: Boolean, withBadge: Boolean = false): Pair<TextView, View> {
             val container = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER_HORIZONTAL
-                setPadding(dp(1), 0, dp(1), 0)
+                setPadding(dp(2), 0, dp(2), 0)
                 isClickable = true
             }
-            val text = TextView(this).apply {
+            val labelRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(10), 0, dp(7))
+            }
+            val labelView = TextView(this).apply {
                 text = label; textSize = 15f
-                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                typeface = Ds.display(bold = true)
                 gravity = Gravity.CENTER
-                // Theme-aware from the first frame; default TextView ink is black.
-                setTextColor(if (active) COLOR_INK else COLOR_MUTED)
-                setPadding(0, dp(12), 0, dp(10))
+                setTextColor(if (active) COLOR_ROSE else COLOR_MUTED)
+            }
+            labelRow.addView(labelView, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            if (withBadge) {
+                commentBubble = TextView(this).apply {
+                    textSize = 11.5f
+                    typeface = Ds.body(bold = false)
+                    fontFeatureSettings = "tnum"
+                    setTextColor(COLOR_MUTED)
+                    text = ""
+                    visibility = View.GONE
+                }
+                labelRow.addView(commentBubble, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                    leftMargin = dp(4)
+                })
             }
             val indicator = View(this).apply {
-                setBackgroundColor(COLOR_ROSE)
+                background = Ds.pill(this@VideoDetailActivity, COLOR_ROSE)
                 alpha = if (active) 1f else 0f
             }
-            container.addView(text, LinearLayout.LayoutParams(
+            container.addView(labelRow, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-            container.addView(indicator, LinearLayout.LayoutParams(dp(36), dp(3)))
-            return text to indicator
+            container.addView(indicator, LinearLayout.LayoutParams(dp(20), dp(3)))
+            return labelView to indicator
         }
         val introTab = buildTab("简介", active = true)
-        val commentTab = buildTab("评论", active = false)
+        val commentTab = buildTab("评论", active = false, withBadge = true)
         tabIntro = introTab.first
         tabIntroIndicator = introTab.second
         tabComment = commentTab.first
         tabCommentIndicator = commentTab.second
-        tabIntro.setOnClickListener { selectTab(0) }
-        tabComment.setOnClickListener { selectTab(1) }
-        (introTab.first.parent as? View)?.setOnClickListener { selectTab(0) }
-        (commentTab.first.parent as? View)?.setOnClickListener { selectTab(1) }
-        tabBar.addView(introTab.first.parent as View, LinearLayout.LayoutParams(
+        (introTab.second.parent as? View)?.setOnClickListener { selectTab(0) }
+        (commentTab.second.parent as? View)?.setOnClickListener { selectTab(1) }
+        tabBar.addView(introTab.second.parent as View, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        tabBar.addView(commentTab.first.parent as View, LinearLayout.LayoutParams(
+        tabBar.addView(commentTab.second.parent as View, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             leftMargin = dp(28)
         })
-
-        // ── Comment total badge: only visible while the comment page is active ──
-        commentBubble = TextView(this).apply {
-            textSize = 10f
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setPadding(dp(7), dp(2), dp(7), dp(2))
-            background = rounded(COLOR_ROSE, dp(9))
-            text = "9999+"
-            visibility = View.INVISIBLE   // occupies space so the bar never jumps
-            alpha = 0f
-            scaleX = 0f
-            pivotX = 0f
+        tabBar.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
+        portraitDanmakuToggle = DanmakuUi.PortraitTabToggle(this).apply {
+            updateState(DanmakuSettingsStore.snapshot().enabled)
+            setOnClickListener { DanmakuSettingsStore.toggleEnabled() }
         }
-        tabBar.addView(commentBubble, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-            leftMargin = dp(8)
-            gravity = Gravity.CENTER_VERTICAL
-        })
+        tabBar.addView(portraitDanmakuToggle, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { gravity = Gravity.CENTER_VERTICAL })
         root.addView(tabBar, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        root.addView(View(this).apply { setBackgroundColor(COLOR_BORDER) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, Ds.hairline(this)))
         infoTabBarAnchor = tabBar
 
         // ── Intro tab content ──
@@ -676,7 +1592,7 @@ class VideoDetailActivity : Activity() {
         }
         infoContent = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(18), dp(18), dp(36))
+            setPadding(dp(16), dp(14), dp(16), dp(36))
         }
         infoState = TextView(this).apply {
             text = "正在加载简介…"
@@ -702,31 +1618,16 @@ class VideoDetailActivity : Activity() {
         val commentWrap = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
-        // Sort toggle lives at the top-right of the comment list (not on the tab bar):
-        // a drawn sort icon + label, no background.
-        val sortIcon = SortIconView(this)
-        commentSortBtn = TextView(this).apply {
-            text = "高赞"
-            textSize = 12f
-            setTextColor(COLOR_MUTED)
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(5), dp(4), dp(4), dp(4))
-            isClickable = true
-            setOnClickListener { toggleCommentSort() }
-        }
-        commentWrap.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(18), dp(10), dp(18), dp(2))
-            addView(View(this@VideoDetailActivity), LinearLayout.LayoutParams(0, 0, 1f))
-            addView(sortIcon, LinearLayout.LayoutParams(dp(20), dp(20)))
-            addView(commentSortBtn, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        }.also { commentHeaderAnchor = it }, LinearLayout.LayoutParams(
+        val headerBar = CommentSectionUi.CommentHeaderBar(this) { toggleCommentSort() }
+        commentHeaderBar = headerBar
+        commentHeaderTitle = headerBar.titleView
+        commentSortBtn = headerBar.sortLabel
+        commentHeaderAnchor = headerBar
+        commentWrap.addView(headerBar, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         commentContent = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(6), dp(18), dp(24))
+            setPadding(dp(16), dp(2), dp(16), dp(28))
         }
         commentState = TextView(this).apply {
             text = "正在加载评论…"
@@ -764,9 +1665,16 @@ class VideoDetailActivity : Activity() {
     }
 
     private fun selectTab(index: Int) {
+        if (index == 1) ensureCommentsStarted()
         if (currentTab == index) return
         infoPager.scrollToPage(index, smooth = true)
         // Tab visuals follow the pager via pageProgressListener; updateTabUI fires on settle.
+    }
+
+    private fun ensureCommentsStarted() {
+        if (!commentsLoaded && !commentsLoading && currentDetail != null) {
+            loadComments(reset = true)
+        }
     }
 
     private fun updateTabUI(index: Int) {
@@ -776,46 +1684,43 @@ class VideoDetailActivity : Activity() {
         }
         currentTab = index
         syncTabVisuals(index)
-        if (index == 1 && !commentsLoaded) loadComments(reset = true)
+        if (index == 1) ensureCommentsStarted()
     }
 
     /** Final visual state once the pager has settled on a page. */
     private fun syncTabVisuals(index: Int) {
         val intro = index == 0
-        tabIntro.setTextColor(if (intro) COLOR_INK else COLOR_MUTED)
-        tabComment.setTextColor(if (intro) COLOR_MUTED else COLOR_INK)
+        tabIntro.setTextColor(if (intro) COLOR_ROSE else COLOR_MUTED)
+        tabComment.setTextColor(if (intro) COLOR_MUTED else COLOR_ROSE)
         tabIntroIndicator.alpha = if (intro) 1f else 0f
         tabCommentIndicator.alpha = if (intro) 0f else 1f
-        commentBubble.visibility = if (intro) View.INVISIBLE else View.VISIBLE
-        commentBubble.alpha = if (intro) 0f else 1f
-        commentBubble.scaleX = if (intro) 0f else 1f
+        if (::commentBubble.isInitialized) {
+            commentBubble.setTextColor(if (intro) COLOR_MUTED else COLOR_ROSE)
+        }
     }
 
     /** Live tab visuals while the pager is being dragged: fade + color lerp follow the finger. */
     private fun syncTabProgress(progress: Float) {
         val p = progress.coerceIn(0f, 1f)
-        tabIntro.setTextColor(lerpColor(COLOR_INK, COLOR_MUTED, p))
-        tabComment.setTextColor(lerpColor(COLOR_MUTED, COLOR_INK, p))
+        // 横滑明确朝评论页移动时立即提前发评论请求，省去切页动画结束后再等的 260ms
+        if (p > 0.18f) ensureCommentsStarted()
+        tabIntro.setTextColor(lerpColor(COLOR_ROSE, COLOR_MUTED, p))
+        tabComment.setTextColor(lerpColor(COLOR_MUTED, COLOR_ROSE, p))
         tabIntroIndicator.alpha = 1f - p
         tabCommentIndicator.alpha = p
-        commentBubble.visibility = if (p > 0.05f) View.VISIBLE else View.INVISIBLE
-        commentBubble.alpha = p
-        commentBubble.scaleX = p
+        if (::commentBubble.isInitialized) {
+            commentBubble.setTextColor(lerpColor(COLOR_MUTED, COLOR_ROSE, p))
+        }
     }
 
     private fun lerpColor(from: Int, to: Int, t: Float): Int =
         (android.animation.ArgbEvaluator().evaluate(t.coerceIn(0f, 1f), from, to) as Int)
 
-    /** Swap comment order: 高赞 (hot) <-> 最新 (newest), then reload from page 1. */
+    /** Swap comment order: 按热度 (hot) <-> 按时间 (newest), then reload from page 1. */
     private fun toggleCommentSort() {
         if (commentsLoading) return
         commentSort = if (commentSort == 0) 1 else 0
-        commentSortBtn.text = if (commentSort == 0) "高赞" else "最新"
-        commentSortBtn.setTextColor(if (commentSort == 0) COLOR_MUTED else COLOR_ROSE)
-        commentSortBtn.animate().scaleX(0.86f).scaleY(0.86f).setDuration(90)
-            .withEndAction {
-                commentSortBtn.animate().scaleX(1f).scaleY(1f).setDuration(140).start()
-            }.start()
+        commentHeaderBar?.applySort(commentSort)
         loadComments(reset = true)
     }
 
@@ -930,8 +1835,8 @@ class VideoDetailActivity : Activity() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = rounded(COLOR_CARD, dp(20), COLOR_CARD_BORDER, 1)
-            setPadding(dp(18), dp(18), dp(18), dp(14))
+            background = Ds.card(this@VideoDetailActivity, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.dialog)
+            setPadding(dp(20), dp(20), dp(20), dp(16))
         }
         root.addView(TextView(this).apply {
             text = "收藏到文件夹"
@@ -959,10 +1864,10 @@ class VideoDetailActivity : Activity() {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                background = rounded(
+                background = Ds.card(this@VideoDetailActivity,
                     if (checked[index]) COLOR_ROSE_SOFT else COLOR_SOFT_FILL,
-                    dp(14)
-                )
+                    if (checked[index]) COLOR_ROSE else Ds.colors.lineSoft,
+                    dp(14))
                 setPadding(dp(14), dp(13), dp(14), dp(13))
                 isClickable = true
                 isFocusable = true
@@ -1008,10 +1913,10 @@ class VideoDetailActivity : Activity() {
             fun applyChecked(on: Boolean) {
                 checked[index] = on
                 check.invalidate()
-                row.background = rounded(
+                row.background = Ds.card(this@VideoDetailActivity,
                     if (on) COLOR_ROSE_SOFT else COLOR_SOFT_FILL,
-                    dp(14)
-                )
+                    if (on) COLOR_ROSE else Ds.colors.lineSoft,
+                    dp(14))
             }
             row.setOnClickListener { applyChecked(!checked[index]) }
             row.addView(check, LinearLayout.LayoutParams(dp(22), dp(22)))
@@ -1095,22 +2000,15 @@ class VideoDetailActivity : Activity() {
         root.addView(btnRow)
 
         dialog.setContentView(root)
-        val w = (resources.displayMetrics.widthPixels * 0.86f).toInt()
-        dialog.window?.setLayout(w, WindowManager.LayoutParams.WRAP_CONTENT)
+        LayoutMode.applyDialogWidth(dialog, this, maxTabletDp = 440)
         dialog.show()
-        // 入场：轻微放大 + 淡入，避免生硬弹出。
+        // 入场：轻微上浮 + 淡入
         root.alpha = 0f
-        root.scaleX = 0.92f
-        root.scaleY = 0.92f
-        root.animate().alpha(1f).scaleX(1f).scaleY(1f)
-            .setDuration(160)
+        root.translationY = dp(14).toFloat()
+        root.animate().alpha(1f).translationY(0f)
+            .setDuration(200)
             .setInterpolator(PathInterpolator(0.22f, 1f, 0.36f, 1f))
             .start()
-        dialog.show()
-        // 入场：轻微上浮淡入
-        root.alpha = 0f
-        root.translationY = dp(16).toFloat()
-        root.animate().alpha(1f).translationY(0f).setDuration(220).start()
     }
 
     /**
@@ -1123,7 +2021,11 @@ class VideoDetailActivity : Activity() {
             showSnackbar("该视频为充电/付费视频，禁止下载")
             return
         }
-        val cached = currentStream
+        if (item.bvid.isBlank() || item.cid <= 0L) {
+            showSnackbar("无法获取分集信息")
+            return
+        }
+        val cached = currentStream?.takeIf { streamSession == BiliSessionStore.cookie() }
         if (cached != null && cached.acceptedQualities.isNotEmpty()) {
             launchDownloadPicker(item, cached.acceptedQualities)
             return
@@ -1151,11 +2053,13 @@ class VideoDetailActivity : Activity() {
         }
     }
 
-    /** 携带视频信息与可用画质跳转下载页。 */
+    /** 携带视频信息与可用画质跳转下载页。收藏夹播放态同时带上收藏夹队列。 */
     private fun launchDownloadPicker(item: VideoItem, acceptedQualities: List<Int>) {
-        startActivity(Intent(this, DownloadPickerActivity::class.java)
+        val intent = Intent(this, DownloadPickerActivity::class.java)
             .putExtra(DownloadPickerActivity.EXTRA_ITEM_JSON, DownloadPickerActivity.itemToJson(item))
-            .putExtra(DownloadPickerActivity.EXTRA_ACCEPTED_QNS, acceptedQualities.toIntArray()))
+            .putExtra(DownloadPickerActivity.EXTRA_ACCEPTED_QNS, acceptedQualities.toIntArray())
+        favoritePlayback?.let { FavoritePlaybackLauncher.writeTo(intent, it) }
+        startActivity(intent)
     }
 
     /**
@@ -1169,33 +2073,33 @@ class VideoDetailActivity : Activity() {
     ): Dialog {
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = rounded(COLOR_CARD, dp(18), COLOR_CARD_BORDER, 1)
+            background = Ds.card(this@VideoDetailActivity, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.dialog)
             setPadding(dp(22), dp(20), dp(22), dp(20))
             gravity = Gravity.CENTER
         }
         body.addView(TextView(this).apply {
             text = title
-            textSize = 16f
-            typeface = Typeface.DEFAULT_BOLD
+            textSize = 19f
+            typeface = Ds.display()
             setTextColor(COLOR_INK)
             gravity = Gravity.CENTER
         })
         body.addView(TextView(this).apply {
             text = message
             textSize = 13f
+            typeface = Ds.body()
             setTextColor(COLOR_MUTED)
             gravity = Gravity.CENTER
         }, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = dp(10)
+            topMargin = dp(Ds.Space.md)
         })
         val dialog = Dialog(this)
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
         dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         dialog.setCanceledOnTouchOutside(true)
         dialog.setContentView(body)
-        val w = (resources.displayMetrics.widthPixels * 0.72f).toInt()
-        dialog.window?.setLayout(w, WindowManager.LayoutParams.WRAP_CONTENT)
+        LayoutMode.applyDialogWidth(dialog, this, maxTabletDp = 340, phoneMarginDp = 72)
         dialog.show()
         return dialog
     }
@@ -1244,9 +2148,10 @@ class VideoDetailActivity : Activity() {
 
     private fun applyFollowUi(btn: TextView, followed: Boolean) {
         btn.text = if (followed) "已关注" else "关注"
-        btn.setTextColor(if (followed) COLOR_MUTED else COLOR_ROSE)
-        btn.background = if (followed) rounded(COLOR_FOLLOWED_CHIP, dp(14))
-        else rounded(0x00FFFFFF.toInt(), dp(14), COLOR_ROSE, dp(1))
+        btn.typeface = Ds.body(true)
+        btn.setTextColor(if (followed) COLOR_MUTED else COLOR_ON_ROSE)
+        btn.background = if (followed) Ds.pill(this, COLOR_FOLLOWED_CHIP, Ds.colors.lineSoft)
+        else Ds.pill(this, COLOR_ROSE)
     }
 
     /** 进入详情后异步查询真实关注关系，并叠加最近一次成功操作。 */
@@ -1278,58 +2183,341 @@ class VideoDetailActivity : Activity() {
     //  Player Lifecycle
     // ─────────────────────────────────────────────────
 
-    // ── 本地下载文件播放（复用同一套播放器，只展示标题/大小/时长） ──
+    // ── 本地下载文件播放（支持视频与纯音频、已下载合集列表切换、4 种播放模式） ──
+
+    private fun refreshLocalPlaylist(current: DownloadManager.Task) {
+        val raw = if (current.groupId.isBlank()) {
+            listOf(current)
+        } else {
+            DownloadManager.snapshot()
+                .filter { it.groupId == current.groupId && it.type == current.type && it.playable() }
+                .ifEmpty { listOf(current) }
+        }
+        localPlaylist = DownloadManager.sortTasks(raw, localSortOrder)
+    }
+
+    /** 切换合集排序：播放列表立即按新顺序重建，顺序播放随即可按该顺序调度。 */
+    private fun setLocalSortOrder(order: DownloadManager.SeasonSortOrder) {
+        if (localSortOrder == order) return
+        localSortOrder = order
+        localPlaybackPrefs.edit().putString(KEY_LOCAL_SORT_ORDER, order.name).apply()
+        rebuildLocalInfoArea()
+        refreshSeasonDrawerSelection()
+    }
+
+    /** 切换播放模式（顺序 / 单集循环 / 随机）。 */
+    private fun setLocalPlayMode(mode: DownloadManager.LocalPlayMode) {
+        if (localPlayMode == mode) return
+        localPlayMode = mode
+        localPlaybackPrefs.edit().putString(KEY_LOCAL_PLAY_MODE, mode.name).apply()
+        rebuildLocalInfoArea()
+    }
+
+    private fun switchLocalTask(targetId: Long) {
+        val target = DownloadManager.task(targetId) ?: return
+        if (!target.playable()) {
+            showSnackbar("该分集尚未缓存完成")
+            return
+        }
+        localTaskId = targetId
+        pendingResumePositionMs = 0L
+        resumeSegmentIndex = 0
+        endedState = false
+        restoreEndedState = false
+        refreshLocalPlaylist(target)
+        rebuildLocalInfoArea()
+        switchingLocalTask = true
+        try {
+            loadLocalPlayer()
+        } finally {
+            switchingLocalTask = false
+        }
+        refreshSeasonDrawerSelection()
+    }
 
     private fun createLocalInfoArea(): View {
-        val task = DownloadManager.task(localTaskId)
+        val host = FrameLayout(this).apply {
+            setBackgroundColor(COLOR_BACKGROUND)
+        }
+        localInfoHost = host
+        rebuildLocalInfoArea()
+        return host
+    }
+
+    private fun rebuildLocalInfoArea() {
+        val host = localInfoHost ?: return
+        host.removeAllViews()
+        val task = DownloadManager.task(localTaskId) ?: return
+        refreshLocalPlaylist(task)
+
+        val scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isFillViewport = true
+        }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(COLOR_BACKGROUND)
+            setPadding(0, 0, 0, dp(24))
         }
         root.addView(View(this).apply { setBackgroundColor(COLOR_BORDER) },
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)))
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, Ds.hairline(this)))
+
+        // ── 1. 基本信息区（标题 + 类型/UP主/大小/时长 + 播放模式切换） ──
         val inner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(14), dp(18), dp(18))
+            setPadding(dp(18), dp(14), dp(18), dp(10))
         }
         inner.addView(TextView(this).apply {
-            text = task?.title?.ifBlank { "本地视频" } ?: "本地视频"
+            text = task.title.ifBlank { if (task.type == DownloadManager.TYPE_AUDIO) "本地音频" else "本地视频" }
             textSize = 17f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            typeface = Ds.display(bold = true)
             setTextColor(COLOR_INK)
-        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            setLineSpacing(dpf(3f), 1f)
+        })
 
-        fun infoRow(label: String, value: String) {
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(7), 0, 0)
-            }
-            row.addView(TextView(this).apply {
-                text = label
-                textSize = 13f
-                setTextColor(COLOR_MUTED)
-            }, LinearLayout.LayoutParams(dp(56), LinearLayout.LayoutParams.WRAP_CONTENT))
-            row.addView(TextView(this).apply {
-                text = value
-                textSize = 13f
-                setTextColor(COLOR_INK)
-            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            inner.addView(row, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        val metaChips = mutableListOf<String>()
+        if (task.owner.isNotBlank()) metaChips.add(task.owner)
+        metaChips.add(if (task.type == DownloadManager.TYPE_AUDIO) "纯音频" else task.qualityLabel.ifBlank { "本地视频" })
+        metaChips.add(DownloadUiShared.formatBytes(DownloadManager.taskDiskBytes(task)))
+        if (task.durationMs > 0L) metaChips.add(localFormatDuration(task.durationMs))
+
+        inner.addView(TextView(this).apply {
+            text = metaChips.joinToString(" · ")
+            textSize = 12.5f
+            fontFeatureSettings = "tnum"
+            setTextColor(COLOR_MUTED)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(8)
+        })
+
+        // ── 2. 播放模式、排序与分集切换统一由下方合集区承担 ──
+        root.addView(inner)
+
+        // ── 3. 本地合集分集列表（样式与在线合集选集保持一致，支持横向滚动与全部展开） ──
+        if (localPlaylist.size > 1 || task.groupId.isNotBlank()) {
+            root.addView(buildLocalSeasonSection(task))
         }
 
-        val sizeBytes = localTaskSizeBytes(task)
-        infoRow("画质", task?.qualityLabel?.ifBlank { "本地文件" } ?: "本地文件")
-        infoRow("大小", localFormatBytes(sizeBytes))
-        infoRow("时长", localFormatDuration(task?.durationMs ?: 0L))
-        root.addView(inner, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        // 其余留白：后续功能再填充
-        root.addView(View(this), LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
-        return root
+        scroll.addView(root)
+        host.addView(scroll, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
     }
+
+    /** 本地合集区：合集标题 + 排序/播放模式图标胶囊 + 竖向分集列表（封面、标题、发布日期、时长）。 */
+    private fun buildLocalSeasonSection(currentTask: DownloadManager.Task): View {
+        val currentIdx = localPlaylist.indexOfFirst { it.id == currentTask.id }.coerceAtLeast(0)
+        val section = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(10), dp(18), dp(8))
+        }
+        section.addView(View(this).apply { setBackgroundColor(COLOR_BORDER) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, Ds.hairline(this)).apply {
+                bottomMargin = dp(12)
+            })
+
+        // ── 合集标题行 ──
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(10))
+        }
+        val prefix = if (currentTask.type == DownloadManager.TYPE_AUDIO) "音频合集" else "视频合集"
+        header.addView(TextView(this).apply {
+            text = "$prefix · ${currentTask.groupTitle.ifBlank { currentTask.title }}"
+            textSize = 14f
+            typeface = Ds.display(bold = true)
+            setTextColor(COLOR_INK)
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        header.addView(TextView(this).apply {
+            text = "${currentIdx + 1}/${localPlaylist.size}"
+            textSize = 12f
+            typeface = Ds.body(bold = true)
+            fontFeatureSettings = "tnum"
+            setTextColor(COLOR_ROSE)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            leftMargin = dp(8)
+        })
+        section.addView(header)
+
+        // ── 排序 + 播放模式图标胶囊 ──
+        val controlRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(10))
+        }
+        val modeIcon = Ds.playModeIcon(this@VideoDetailActivity, localPlayMode, modeTint(localPlayMode))
+        val modeLabel = TextView(this).apply {
+            text = localPlayMode.seasonLabel()
+            textSize = 11.5f
+            typeface = Ds.body(bold = true)
+            setTextColor(modeTint(localPlayMode))
+        }
+        val modeBtn = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), 0, dp(12), 0)
+            minimumHeight = dp(30)
+            background = modeChipBackground(localPlayMode)
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.94f)
+            setOnClickListener {
+                setLocalPlayMode(localPlayMode.nextSeasonMode())
+            }
+        }
+        modeBtn.addView(modeIcon, LinearLayout.LayoutParams(dp(14), dp(14)).apply { rightMargin = dp(4) })
+        modeBtn.addView(modeLabel)
+        controlRow.addView(modeBtn)
+
+        val sortIcon = Ds.sortOrderIcon(this@VideoDetailActivity, localSortOrder, sortTint(localSortOrder))
+        val sortLabel = TextView(this).apply {
+            text = localSortOrder.seasonLabel()
+            textSize = 11.5f
+            typeface = Ds.body(bold = true)
+            setTextColor(sortTint(localSortOrder))
+        }
+        val sortBtn = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), 0, dp(12), 0)
+            minimumHeight = dp(30)
+            background = sortChipBackground(localSortOrder)
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.94f)
+            setOnClickListener {
+                setLocalSortOrder(localSortOrder.nextOrder())
+            }
+        }
+        sortBtn.addView(sortIcon, LinearLayout.LayoutParams(dp(14), dp(14)).apply { rightMargin = dp(4) })
+        sortBtn.addView(sortLabel)
+        controlRow.addView(sortBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            leftMargin = dp(8)
+        })
+
+        controlRow.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
+        section.addView(controlRow)
+
+        // ── 竖向分集列表 ──
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        localPlaylist.forEachIndexed { idx, ep ->
+            list.addView(buildLocalEpisodeRow(ep, idx, ep.id == currentTask.id),
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                    bottomMargin = dp(8)
+                })
+        }
+        section.addView(list)
+        return section
+    }
+
+    /** 单条本地分集：左侧封面（含时长角标），右侧标题与「P号 · 发布日期」。 */
+    private fun buildLocalEpisodeRow(ep: DownloadManager.Task, index: Int, isCurrent: Boolean): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(8), dp(12), dp(8))
+            minimumHeight = dp(74)
+            background = Ds.card(
+                this@VideoDetailActivity,
+                fill = if (isCurrent) COLOR_ROSE_SOFT else Ds.colors.surface,
+                border = if (isCurrent) COLOR_ROSE else Ds.colors.lineSoft,
+                radiusDp = Ds.Radius.control,
+                borderPx = Ds.hairline(this@VideoDetailActivity)
+            )
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.985f)
+            setOnClickListener { if (!isCurrent) switchLocalTask(ep.id) }
+        }
+
+        val thumbHost = FrameLayout(this).apply {
+            setBackgroundColor(Ds.colors.cover)
+            Ds.clipRounded(this, Ds.Radius.chip)
+        }
+        val thumb = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+        thumbHost.addView(thumb, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        DownloadUiShared.loadTaskCover(thumb, ep)
+        if (ep.durationMs > 0L) {
+            thumbHost.addView(TextView(this).apply {
+                text = DownloadUiShared.formatDurationMs(ep.durationMs)
+                textSize = 9.5f
+                typeface = Ds.body(bold = true)
+                fontFeatureSettings = "tnum"
+                setTextColor(Color.WHITE)
+                background = Ds.card(this@VideoDetailActivity, 0xAD000000.toInt(), null, 4, 0)
+                setPadding(dp(5), dp(1), dp(5), dp(1))
+            }, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.END).apply {
+                rightMargin = dp(4); bottomMargin = dp(4)
+            })
+        }
+        row.addView(thumbHost, LinearLayout.LayoutParams(dp(100), dp(60)))
+
+        val infoCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        infoCol.addView(TextView(this).apply {
+            text = ep.title
+            textSize = 13.5f
+            typeface = Ds.body(bold = isCurrent)
+            setTextColor(if (isCurrent) COLOR_ROSE else COLOR_INK)
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            includeFontPadding = false
+            setLineSpacing(dpf(2f), 1f)
+        })
+        infoCol.addView(TextView(this).apply {
+            text = buildLocalEpisodeMeta(ep, index)
+            textSize = 11.5f
+            fontFeatureSettings = "tnum"
+            setTextColor(if (isCurrent) COLOR_ROSE else COLOR_MUTED)
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(5)
+        })
+        row.addView(infoCol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+            leftMargin = dp(10)
+        })
+        return row
+    }
+
+    private fun buildLocalEpisodeMeta(ep: DownloadManager.Task, index: Int): String {
+        val parts = ArrayList<String>(2)
+        parts.add(if (ep.episodeNo > 0) "P${ep.episodeNo}" else "P${index + 1}")
+        val publishedMs = ep.publishedAt.takeIf { it > 0L }?.times(1000L)
+            ?: ep.createdAt.takeIf { it > 0L }
+        if (publishedMs != null) parts.add(DownloadUiShared.formatDateTimeMs(publishedMs))
+        return parts.joinToString(" · ")
+    }
+
+    private fun modeTint(mode: DownloadManager.LocalPlayMode): Int =
+        if (mode == DownloadManager.LocalPlayMode.SEASON_SEQUENCE) COLOR_MUTED else COLOR_ROSE
+
+    private fun modeChipBackground(mode: DownloadManager.LocalPlayMode) =
+        if (mode == DownloadManager.LocalPlayMode.SEASON_SEQUENCE) {
+            Ds.pill(this, Ds.colors.surfaceRaised, Ds.colors.lineSoft)
+        } else {
+            Ds.pill(this, COLOR_ROSE_SOFT, COLOR_ROSE)
+        }
+
+    private fun sortTint(order: DownloadManager.SeasonSortOrder): Int =
+        if (order == DownloadManager.SeasonSortOrder.DEFAULT) COLOR_MUTED else COLOR_ROSE
+
+    private fun sortChipBackground(order: DownloadManager.SeasonSortOrder) =
+        if (order == DownloadManager.SeasonSortOrder.DEFAULT) {
+            Ds.pill(this, Ds.colors.surfaceRaised, Ds.colors.lineSoft)
+        } else {
+            Ds.pill(this, COLOR_ROSE_SOFT, COLOR_ROSE)
+        }
 
     private fun localTaskSizeBytes(task: DownloadManager.Task?): Long = when {
         task == null -> 0L
@@ -1343,126 +2531,78 @@ class VideoDetailActivity : Activity() {
         else -> task.singlePaths.sumOf { File(it).length() }.takeIf { it > 0L } ?: task.bytesTotal
     }
 
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private fun buildConfiguredPlayerView(): PlayerView = PlayerView(this).apply {
+        useController = false
+        resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+        setShutterBackgroundColor(Color.BLACK)
+        setKeepContentOnPlayerReset(true)
+        setBackgroundColor(Color.BLACK)
+    }
+
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     private fun loadLocalPlayer() {
         val task = DownloadManager.task(localTaskId) ?: run { finish(); return }
-        val generation = ++playbackGeneration
-        retryScheduled = false
-        exoPlayer?.let { old ->
-            pendingResumePositionMs = maxOf(pendingResumePositionMs, playerGlobalPosition(old))
-            playerView.player = null
-            exoPlayer = null
-            old.release()
+        if (!task.playable()) {
+            showError("本地文件尚未完成或已缺失，请返回下载页检查")
+            return
         }
-        playerSpinner.visibility = View.VISIBLE
-        playerError.visibility = View.GONE
-        val mediaSource: MediaSource
+        if (::playerTopTitle.isInitialized) {
+            playerTopTitle.text = task.title.ifBlank { "本地播放" }
+            playerTopTitle.visibility = if (isFullscreen) View.VISIBLE else View.GONE
+        }
+        // 纯音频模式展示封面图覆盖黑屏区域（置于 playerHost 层，全屏时也同步隐藏/显示）
+        localAudioCoverOverlay?.let { overlay ->
+            if (task.type == DownloadManager.TYPE_AUDIO) {
+                overlay.visibility = View.VISIBLE
+                localAudioCoverView?.let { iv ->
+                    DownloadUiShared.loadTaskCover(iv, task)
+                }
+            } else {
+                overlay.visibility = View.GONE
+            }
+        }
+        val generation = beginPlaybackChange()
+        val localSources = DefaultDataSource.Factory(this)
+        val mediaSources: List<MediaSource>
         try {
-            mediaSource = when {
+            segmentTimeline = PlaybackTimeline(emptyList())
+            mediaSources = when {
                 task.mpdPath.isNotBlank() && File(task.mpdPath).exists() -> {
                     val item = MediaItem.Builder()
                         .setUri(Uri.fromFile(File(task.mpdPath)))
                         .setMimeType(MimeTypes.APPLICATION_MPD)
                         .build()
-                    DashMediaSource.Factory(DefaultDataSource.Factory(this)).createMediaSource(item)
+                    listOf(DashMediaSource.Factory(localSources).createMediaSource(item))
                 }
                 task.audioPath.isNotBlank() && File(task.audioPath).exists() -> {
                     val item = MediaItem.Builder()
                         .setUri(Uri.fromFile(File(task.audioPath)))
                         .setMimeType(MimeTypes.APPLICATION_MP4)
                         .build()
-                    ProgressiveMediaSource.Factory(DefaultDataSource.Factory(this)).createMediaSource(item)
+                    listOf(ProgressiveMediaSource.Factory(localSources).createMediaSource(item))
                 }
                 else -> {
                     val paths = task.singlePaths.filter { File(it).exists() }
-                    if (paths.isEmpty()) {
+                    if (paths.size != task.singlePaths.size || paths.isEmpty()) {
                         showError("本地文件缺失，请返回下载页删除该任务")
                         return
                     }
-                    val sources = paths.map { path ->
+                    val factory = ProgressiveMediaSource.Factory(localSources)
+                    paths.map { path ->
                         val item = MediaItem.Builder()
                             .setUri(Uri.fromFile(File(path)))
                             .setMimeType(MimeTypes.APPLICATION_MP4)
                             .build()
-                        ProgressiveMediaSource.Factory(DefaultDataSource.Factory(this)).createMediaSource(item)
+                        factory.createMediaSource(item)
                     }
-                    if (sources.size == 1) sources.first() else ConcatenatingMediaSource(true, *sources.toTypedArray())
                 }
             }
         } catch (e: Exception) {
             showError("本地播放初始化失败：${e.message ?: "未知错误"}\n\n点这里重试")
             return
         }
-        startLocalPlayer(mediaSource, generation)
-    }
-
-    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
-    private fun startLocalPlayer(mediaSource: MediaSource, generation: Int) {
-        if (generation != playbackGeneration || isFinishing || isDestroyed) return
-        endedState = false
-        playPauseBtn.setEnded(false)
-        showReplay(false)
-        cancelLongPressBoost()
-        val renderersFactory = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
-        val player = ExoPlayer.Builder(this, renderersFactory)
-            .setLoadControl(
-                DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(30_000, 90_000, 5_000, 10_000)
-                    .setTargetBufferBytes(64 * 1024 * 1024)
-                    .build()
-            )
-            .build()
-        playerView.player = player
-        player.setMediaSource(mediaSource)
-        player.repeatMode = Player.REPEAT_MODE_OFF
-        if (pendingResumePositionMs > 0L) player.seekTo(pendingResumePositionMs)
-        player.playWhenReady = userWantsPlayback && activityResumed
-        player.addListener(object : Player.Listener {
-            override fun onPlaybackStateChanged(state: Int) {
-                if (generation != playbackGeneration || player !== exoPlayer) return
-                when (state) {
-                    Player.STATE_READY -> {
-                        playerSpinner.visibility = View.GONE
-                        playerError.visibility = View.GONE
-                        pendingResumePositionMs = 0L
-                        playPauseBtn.setEnded(false)
-                        playPauseBtn.setPlaying(player.isPlaying)
-                        if (!isSeeking && player.isPlaying) { showReplay(false); scheduleAutoHide() }
-                    }
-                    Player.STATE_BUFFERING -> if (!isSeeking) playerSpinner.visibility = View.VISIBLE
-                    Player.STATE_ENDED -> {
-                        playerSpinner.visibility = View.GONE
-                        cancelLongPressBoost()
-                        endedState = true
-                        playPauseBtn.setEnded(true)
-                        playPauseBtn.setPlaying(false)
-                        showReplay(true)
-                        showControls()
-                    }
-                }
-            }
-            override fun onIsPlayingChanged(isPlaying: Boolean) {
-                if (generation != playbackGeneration || player !== exoPlayer) return
-                if (isPlaying) {
-                    endedState = false
-                    playPauseBtn.setEnded(false)
-                    playPauseBtn.setPlaying(true)
-                    showReplay(false)
-                    scheduleAutoHide()
-                } else {
-                    playPauseBtn.setEnded(false)
-                    playPauseBtn.setPlaying(false)
-                    showControls()
-                }
-            }
-            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                if (generation != playbackGeneration || player !== exoPlayer) return
-                showError("本地文件播放失败：${error.message ?: error.errorCodeName}\n\n点这里重试")
-            }
-        })
-        player.prepare()
-        exoPlayer = player
-        handler.removeCallbacks(progressUpdater)
-        handler.post(progressUpdater)
+        bindPlayerSource(mediaSources, generation)
     }
 
     private fun localFormatBytes(bytes: Long): String {
@@ -1485,40 +2625,124 @@ class VideoDetailActivity : Activity() {
     }
 
     private fun loadVideoAndPlayer() {
-        BiliPlayUrl.prewarm()
-        // When switching a multi-P video, bvid/aid stay the same but cid changes.
-        // Preserve the requested cid while refreshing the common detail payload.
-        val requestedCid = currentCid
-        BiliApi.fetchDetail(currentBvid, currentAid) { item, parts, error ->
-            if (isFinishing || isDestroyed) return@fetchDetail
-            handler.post {
-                if (item != null) {
-                    val selectedPart = requestedCid.takeIf { it > 0L }
-                        ?.let { cid -> parts.firstOrNull { it.cid == cid } }
-                    val selectedItem = if (selectedPart != null && selectedPart.cid != item.cid) {
-                        item.copy(
-                            title = selectedPart.title,
-                            duration = selectedPart.duration,
-                            cid = selectedPart.cid
-                        )
-                    } else {
-                        item
-                    }
-                    currentDetail = selectedItem
-                    currentCid = selectedPart?.cid ?: item.cid
-                    // Record local watch history (deduped, newest first).
-                    HistoryStore.add(this, selectedItem.bvid, selectedItem.title,
-                        selectedItem.owner, selectedItem.cover)
-                    renderIntroduction(selectedItem)
-                } else {
-                    infoState.text = "简介加载失败：${error ?: "未知错误"}\n\n点这里重试"
-                    infoState.isClickable = true
-                    infoState.setOnClickListener { loadVideoAndPlayer() }
-                }
-                playRetryCount = 0
-                loadPlayer()
-            }
+        val session = BiliSessionStore.cookie()
+        if (currentBvid.isNotBlank() && currentCid > 0L && playbackRequest == null && playerListener == null &&
+            playerError.visibility != View.VISIBLE
+        ) loadPlayer()
+        val cached = detailResponse
+        if (cached != null && detailSession == session && cached.first.bvid == currentBvid) {
+            applyDetail(cached.first, cached.second)
+            return
         }
+        detailRequest?.cancel()
+        val generation = ++detailGeneration
+        infoState.text = "正在加载简介…"
+        infoState.setOnClickListener(null)
+        detailRequest = BiliApi.fetchDetail(currentBvid, currentAid) { item, parts, error ->
+            if (isFinishing || isDestroyed || generation != detailGeneration) return@fetchDetail
+            detailRequest = null
+            if (session != BiliSessionStore.cookie()) {
+                if (!playbackStopped) loadVideoAndPlayer()
+                return@fetchDetail
+            }
+            if (item == null) {
+                infoState.text = "简介加载失败：${error ?: "未知错误"}\n\n点这里重试"
+                infoState.setOnClickListener { loadVideoAndPlayer() }
+                if (currentCid <= 0L || currentBvid.isBlank()) showError("无法获取视频信息，点这里重试")
+                return@fetchDetail
+            }
+            detailResponse = item to parts
+            detailSession = session
+            applyDetail(item, parts)
+        }
+    }
+
+    private fun applyDetail(item: VideoItem, parts: List<VideoPart>) {
+        val part = selectPlaybackPart(parts, currentCid, item.cid)
+        val cid = part?.cid ?: item.cid.takeIf { it > 0L } ?: currentCid
+        val previousCid = currentCid
+        val previousBvid = currentBvid
+        val aid = item.aid.takeIf { it > 0L } ?: currentAid
+        val selected = item.copy(
+            aid = aid,
+            cid = cid,
+            title = if (part != null && cid != item.cid) part.title else item.title,
+            duration = part?.duration?.takeIf { it > 0 } ?: item.duration
+        )
+        currentBvid = item.bvid.ifBlank { currentBvid }
+        currentAid = aid
+        currentCid = cid
+        currentDetail = selected
+        // 收藏夹播放态下屏蔽视频自身合集，列表只以收藏夹为准
+        cachedSeason = if (favoritePlayback != null) null else selected.season
+        if (::playerTopTitle.isInitialized) {
+            playerTopTitle.text = selected.title
+            playerTopTitle.visibility = if (isFullscreen && selected.title.isNotBlank()) View.VISIBLE else View.GONE
+        }
+        val corrected = previousCid > 0L && previousCid != cid || previousBvid.isNotBlank() && previousBvid != currentBvid
+        if (corrected) {
+            clearPlaybackForMediaChange()
+            loadPlayer()
+        } else if (previousCid <= 0L || previousBvid.isBlank()) {
+            loadPlayer()
+        }
+        bindDanmakuForCurrentMedia()
+        if (currentBvid.isBlank() || currentCid <= 0L) showError("无法获取视频信息，点这里重试")
+        renderIntroduction(selected)
+        HistoryStore.add(applicationContext, selected.bvid, selected.title, selected.owner, selected.cover)
+        if (currentTab == 1 && !commentsLoaded) loadComments(reset = true)
+        playingStream?.let(::showPreviewNotice)
+        refreshSeasonDrawerSelection()
+    }
+
+    private fun selectEpisode(episode: UgcEpisode) {
+        reportPlayHistory(status = 2)
+        val sameVideo = episode.bvid.isNotBlank() && episode.bvid == currentBvid ||
+            episode.aid > 0L && episode.aid == currentAid
+        currentBvid = episode.bvid.ifBlank { if (sameVideo) currentBvid else "" }
+        currentAid = episode.aid
+        currentCid = episode.cid
+        detailGeneration++
+        detailRequest?.cancel()
+        detailRequest = null
+        currentDetail = null
+        if (!sameVideo) resetComments()
+        clearPlaybackForMediaChange()
+        infoContent.removeAllViews()
+        infoContent.addView(infoState)
+        startupAtMs = SystemClock.elapsedRealtime()
+        loadVideoAndPlayer()
+        refreshSeasonDrawerSelection()
+    }
+
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private fun clearPlaybackForMediaChange() {
+        playbackGeneration++
+        playbackRequest?.cancel()
+        playbackRequest = null
+        currentStream = null
+        playingStream = null
+        failedCodecTracks.clear()
+        segmentTimeline = PlaybackTimeline(emptyList())
+        pendingResumePositionMs = 0L
+        resumeSegmentIndex = 0
+        restoreEndedState = false
+        endedState = false
+        showReplay(false)
+        playPauseBtn.setEnded(false)
+        playPauseBtn.setPlaying(false)
+        lastPositionSecond = -1L
+        lastDurationSecond = -1L
+        playPreviewNoticeShown = false
+        playRetryCount = 0
+        retryScheduled = false
+        lastPlaybackError = null
+        playerView.setKeepContentOnPlayerReset(false)
+        stopPlayerSource()
+        danmakuController?.clearMedia()
+        playerView.player = null
+        playerSpinner.visibility = View.VISIBLE
+        playerError.visibility = View.GONE
     }
 
     // ─────────────────────────────────────────────────
@@ -1531,73 +2755,38 @@ class VideoDetailActivity : Activity() {
         introExpanded = false
         titleHeightAnimator?.cancel()
         descHeightAnimator?.cancel()
-        // Comment total badge on the tab bar.
+        // Comment total inline beside 评论 tab label.
         if (::commentBubble.isInitialized) {
-            commentBubble.text = if (item.replyCount > 0L) formatViews(item.replyCount) else "0"
+            if (item.replyCount > 0L) {
+                commentBubble.text = formatViews(item.replyCount)
+                commentBubble.visibility = View.VISIBLE
+            } else {
+                commentBubble.visibility = View.GONE
+            }
         }
 
-        // ── Collapsible body: title row (with chevron) + UP row + stats + description.
-        //    Collapsed by default; tapping the title/arrow expands with a height animation.
+        // ── 1. UP 主行放在最顶部（参考官方布局：头像 + 名称/粉丝 + 关注按钮）──
         introExpandWrap = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
 
-        // ── Title row: single-line ellipsized title + chevron arrow ──
-        val titleRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            isClickable = true
-            setOnClickListener { toggleIntro() }
-        }
-        titleText = TextView(this).apply {
-            text = item.title
-            textSize = 18f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            setTextColor(COLOR_INK)
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            includeFontPadding = false
-        }
-        // Clip wrapper: the title expands from 1 line to full height with a smooth
-        // height animation instead of popping to multiple lines instantly.
-        titleClip = FrameLayout(this).apply {
-            clipChildren = true
-        }
-        titleClip.addView(titleText, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP))
-        titleArrow = object : View(this) {
-            private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = COLOR_MUTED; style = Paint.Style.STROKE
-                strokeWidth = dpf(1.8f); strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
-            }
-            private val path = Path()
-            override fun onDraw(canvas: Canvas) {
-                super.onDraw(canvas)
-                val cx = width / 2f; val cy = height / 2f; val s = dpf(4.5f)
-                path.reset()
-                path.moveTo(cx - s, cy - s * 0.55f)
-                path.lineTo(cx, cy + s * 0.55f)
-                path.lineTo(cx + s, cy - s * 0.55f)
-                canvas.drawPath(path, paint)
-            }
-        }
-        titleRow.addView(titleClip, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-            gravity = Gravity.CENTER_VERTICAL
-        })
-        titleRow.addView(titleArrow, LinearLayout.LayoutParams(dp(26), dp(26)).apply {
-            leftMargin = dp(4)
-        })
-        introExpandWrap.addView(titleRow, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-
-        // ── UP row: avatar (two text lines tall) + name + fans ──
         val upRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(12), 0, dp(12))
+            setPadding(0, 0, 0, dp(12))
+        }
+        val upInfoTap = View.OnClickListener {
+            if (item.ownerMid > 0L) {
+                SpaceActivity.open(this@VideoDetailActivity, item.ownerMid, item.owner, item.ownerAvatar)
+            }
         }
         val avatar = RoundImageView(this).apply {
             setBackgroundColor(COLOR_COVER)
+            if (item.ownerMid > 0L) {
+                isClickable = true
+                Ds.bindPressFeedback(this, 0.94f)
+                setOnClickListener(upInfoTap)
+            }
         }
         if (item.ownerAvatar.isNotBlank()) {
             CoverLoader.load(avatar, item.ownerAvatar + "@52w_52h_1c.webp")
@@ -1607,31 +2796,38 @@ class VideoDetailActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(10), 0, 0, 0)
+            if (item.ownerMid > 0L) {
+                isClickable = true
+                setOnClickListener(upInfoTap)
+            }
         }
         upText.addView(TextView(this).apply {
             text = item.owner.ifBlank { "哔哩哔哩用户" }
-            textSize = 13.5f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            setTextColor(COLOR_INK)
+            textSize = 14f
+            typeface = Ds.body(bold = true)
+            setTextColor(COLOR_ROSE)
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
         }, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         val fansText = TextView(this).apply {
             text = "粉丝数加载中…"
-            textSize = 11f; setTextColor(COLOR_MUTED)
-            setPadding(0, dp(1), 0, 0)
+            textSize = 11.5f; setTextColor(COLOR_MUTED)
+            fontFeatureSettings = "tnum"
+            setPadding(0, dp(2), 0, 0)
         }
         upText.addView(fansText, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         upRow.addView(upText, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        // ── Follow button on the right edge of the UP row ──
-        // 初始态先用桥接/默认，再异步拉真实关系，避免假本地关注。
         val initialFollowed = LikeStateBridge.resolveFollow(item.ownerMid, item.following)
         currentFollowed = initialFollowed
         val followBtn = TextView(this).apply {
-            textSize = 12f
+            textSize = 12.5f
+            typeface = Ds.body(bold = true)
             gravity = Gravity.CENTER
-            setPadding(dp(14), dp(5), dp(14), dp(5))
+            setPadding(dp(15), dp(6), dp(15), dp(6))
             isClickable = true
+            Ds.bindPressFeedback(this, 0.94f)
         }
         applyFollowUi(followBtn, initialFollowed)
         followBtnRef = followBtn
@@ -1644,15 +2840,64 @@ class VideoDetailActivity : Activity() {
         introExpandWrap.addView(upRow, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
-        // ── Stats line: views | publish time | online count ──
+        // ── 2. 标题行：默认单行省略，点击整行平滑展开多行完整标题 + 简介 ──
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.TOP
+            isClickable = true
+            setOnClickListener { toggleIntro() }
+        }
+        titleText = TextView(this).apply {
+            text = item.title
+            textSize = 16.5f
+            typeface = Ds.display(bold = true)
+            letterSpacing = -0.01f
+            setLineSpacing(dpf(3f), 1f)
+            setTextColor(COLOR_INK)
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            includeFontPadding = false
+        }
+        titleClip = FrameLayout(this).apply {
+            clipChildren = true
+        }
+        titleClip.addView(titleText, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP))
+        titleArrow = object : View(this) {
+            private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = COLOR_MUTED; style = Paint.Style.STROKE
+                strokeWidth = dpf(1.7f); strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
+            }
+            private val path = Path()
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                val cx = width / 2f; val cy = height / 2f; val s = dpf(4.5f)
+                path.reset()
+                path.moveTo(cx - s, cy - s * 0.55f)
+                path.lineTo(cx, cy + s * 0.55f)
+                path.lineTo(cx + s, cy - s * 0.55f)
+                canvas.drawPath(path, paint)
+            }
+        }
+        titleRow.addView(titleClip, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        titleRow.addView(titleArrow, LinearLayout.LayoutParams(dp(24), dp(22)).apply {
+            leftMargin = dp(6)
+        })
+        introExpandWrap.addView(titleRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        // ── 3. 数据行（紧贴标题下方，点击也可展开/收起简介，手势更顺手）──
         val statsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(4))
+            isClickable = true
+            setOnClickListener { toggleIntro() }
         }
         statsRow.addView(object : View(this) {
             private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = COLOR_MUTED; style = Paint.Style.STROKE
-                strokeWidth = dpf(1.4f); strokeCap = Paint.Cap.ROUND
+                strokeWidth = dpf(1.3f); strokeCap = Paint.Cap.ROUND
             }
             private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = COLOR_MUTED; style = Paint.Style.FILL
@@ -1664,27 +2909,30 @@ class VideoDetailActivity : Activity() {
                 canvas.drawOval(RectF(w / 2f - r * 1.45f, h / 2f - r, w / 2f + r * 1.45f, h / 2f + r), paint)
                 canvas.drawCircle(w / 2f, h / 2f, r * 0.32f, dotPaint)
             }
-        }, LinearLayout.LayoutParams(dp(16), dp(11)).apply { gravity = Gravity.CENTER_VERTICAL })
+        }, LinearLayout.LayoutParams(dp(15), dp(10)).apply { gravity = Gravity.CENTER_VERTICAL })
 
         val viewsText = TextView(this).apply {
             text = formatViews(item.views)
-            textSize = 13f; setTextColor(COLOR_MUTED)
-            setPadding(dp(4), 0, dp(10), 0)
+            textSize = 12f; setTextColor(COLOR_MUTED)
+            fontFeatureSettings = "tnum"
+            setPadding(dp(5), 0, dp(10), 0)
         }
         statsRow.addView(viewsText, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         val dateText = TextView(this).apply {
             text = formatPublish(item.publishedAt)
-            textSize = 13f; setTextColor(COLOR_MUTED)
+            textSize = 12f; setTextColor(COLOR_MUTED)
+            fontFeatureSettings = "tnum"
         }
         statsRow.addView(dateText, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         val onlineText = TextView(this).apply {
-            text = " · 正在加载观看人数"
-            textSize = 13f; setTextColor(COLOR_MUTED)
-            setPadding(dp(10), 0, 0, 0)
+            text = ""
+            textSize = 12f; setTextColor(COLOR_MUTED)
+            fontFeatureSettings = "tnum"
+            setPadding(dp(8), 0, 0, 0)
             maxLines = 1
         }
         statsRow.addView(onlineText, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
@@ -1693,10 +2941,40 @@ class VideoDetailActivity : Activity() {
         introExpandWrap.addView(statsRow, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
-        // ── Action bar below the stats: like / favorite / download / share ──
-        // view.req_user is often missing; has/like is the flag authority.
-        // stat.like can lag a few seconds after archive/like, so overlay the
-        // short-lived bridge from a just-confirmed action (not a disk store).
+        // ── 4. 可折叠简介正文（紧随数据行下方，展开时自然衔接在操作栏上方）──
+        introDescWrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+        }
+        if (item.bvid.isNotBlank()) {
+            introDescWrap.addView(TextView(this).apply {
+                text = item.bvid
+                textSize = 12f
+                fontFeatureSettings = "tnum"
+                setTextColor(COLOR_MUTED)
+                setTextIsSelectable(true)
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(4)
+            })
+        }
+        introDescWrap.addView(TextView(this).apply {
+            text = item.description.ifBlank { "暂无简介" }
+            textSize = 13f
+            setTextColor(COLOR_MUTED)
+            setLineSpacing(dpf(3f), 1f)
+            setTextIsSelectable(true)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        introDescClip = FrameLayout(this).apply {
+            clipChildren = true
+        }
+        introDescClip.addView(introDescWrap, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP))
+        introExpandWrap.addView(introDescClip, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        // ── 5. 轻盈开放式操作栏（无硬边框盒子，紧贴在简介下方）──
         run {
             val bridged = LikeStateBridge.resolveVideo(item.aid, item.liked, item.likes)
             videoLiked = bridged.first
@@ -1740,37 +3018,13 @@ class VideoDetailActivity : Activity() {
         val actionBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, dp(4), 0, dp(6))
+            setPadding(0, dp(10), 0, dp(4))
         }
         listOf(likeBtn, favBtn, dlBtn, shareBtn).forEach { btn ->
+            Ds.bindPressFeedback(btn, 0.92f)
             actionBar.addView(btn, LinearLayout.LayoutParams(0, dp(52), 1f))
         }
         introExpandWrap.addView(actionBar, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-
-        // ── Description block (the only part that collapses; UP/stats rows stay visible) ──
-        introDescWrap = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        introDescWrap.addView(View(this).apply {
-            setBackgroundColor(COLOR_BORDER)
-        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)).apply {
-            topMargin = dp(10); bottomMargin = dp(10)
-        })
-        introDescWrap.addView(TextView(this).apply {
-            text = item.description.ifBlank { "暂无简介" }
-            textSize = 13f; setTextColor(COLOR_MUTED)
-            setLineSpacing(dp(2).toFloat(), 1f); setTextIsSelectable(true)
-        }, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        // Clip wrapper: description height animates 0 <-> full while the content is
-        // revealed line by line (no per-frame re-measure of the multi-line text).
-        introDescClip = FrameLayout(this).apply {
-            clipChildren = true
-        }
-        introDescClip.addView(introDescWrap, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP))
-        introExpandWrap.addView(introDescClip, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         infoContent.addView(introExpandWrap, LinearLayout.LayoutParams(
@@ -1779,22 +3033,26 @@ class VideoDetailActivity : Activity() {
         // 合集/多 P：视频属于官方合集或同 BV 的 pages 多 P 时展示。
         renderSeasonSection(item)
 
-        // Measure heights: title one line / full lines, and the description block.
-        val availWidth = if (infoContent.width > 0) infoContent.width
-        else resources.displayMetrics.widthPixels - dp(36)
+        // Measure heights: title width excludes the 30dp chevron+margin so multi-line
+        // measurement matches actual laid-out height accurately!
+        val availWidth = if (infoContent.width > 0) {
+            infoContent.width - infoContent.paddingLeft - infoContent.paddingRight
+        } else {
+            resources.displayMetrics.widthPixels - dp(32)
+        }
+        val titleWidth = (availWidth - dp(30)).coerceAtLeast(dp(120))
         val unconstrained = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
         titleText.maxLines = 1
         titleClip.measure(
-            View.MeasureSpec.makeMeasureSpec(availWidth, View.MeasureSpec.EXACTLY), unconstrained)
+            View.MeasureSpec.makeMeasureSpec(titleWidth, View.MeasureSpec.EXACTLY), unconstrained)
         titleLineHeight = titleClip.measuredHeight
         titleText.maxLines = Int.MAX_VALUE
         titleText.ellipsize = null
         titleClip.measure(
-            View.MeasureSpec.makeMeasureSpec(availWidth, View.MeasureSpec.EXACTLY), unconstrained)
+            View.MeasureSpec.makeMeasureSpec(titleWidth, View.MeasureSpec.EXACTLY), unconstrained)
         titleFullHeight = titleClip.measuredHeight
         titleText.maxLines = 1
         titleText.ellipsize = android.text.TextUtils.TruncateAt.END
-        // Keep weight=1 so the chevron stays on the row; only the height animates.
         titleClip.layoutParams = LinearLayout.LayoutParams(0, titleLineHeight, 1f)
         introDescWrap.measure(
             View.MeasureSpec.makeMeasureSpec(availWidth, View.MeasureSpec.EXACTLY), unconstrained)
@@ -1813,8 +3071,8 @@ class VideoDetailActivity : Activity() {
         }
         if (item.aid > 0L && item.cid > 0L) {
             BiliApi.fetchOnline(item.aid, item.cid) { online, _ ->
-                if (isFinishing || isDestroyed || currentDetail?.bvid != item.bvid) return@fetchOnline
-                onlineText.text = if (online != null && online > 0L) " · ${online} 人正在看" else ""
+                if (isFinishing || isDestroyed || currentDetail !== item) return@fetchOnline
+                onlineText.text = if (online != null && online > 0L) "${online}人正在看" else ""
             }
         } else {
             onlineText.text = ""
@@ -1824,255 +3082,651 @@ class VideoDetailActivity : Activity() {
     private fun toggleIntro() = setIntroExpanded(!introExpanded)
 
     /**
-     * 简介下方的「合集分集」卡片：视频属于合集(ugc_season)时渲染，
-     * 无合集直接 return（整体不占空间）。默认收起只显示头部，
-     * 点头部展开全部分集列表；点击某一集切到对应视频。
+     * 简介下方的「合集/选集」区块（重写设计）：
+     * - 头部一行式收起控制：标题 + 玫瑰粉高亮当前进度（如 `3 / 12`）+「全部 ›」展开全集弹窗，简洁无冗余盒子。
+     * - 默认直接暴露横向选集卡片流（HorizontalScrollView）：展示集数编号 / 标题（最多两行）/ 时长，
+     *   当前集用柔和玫瑰底与粉描边高亮并自动居左滚动定位，滑动不跟外层 简介/评论 HorizontalPagerView 冲突。
+     * - 点击头部右侧「全部 ›」弹出底部半屏选集清单，长合集也能一秒定位跳集。
      */
+    /** 当前播放项前的动态音柱图标（Drawable 版本，便于放到 TextView 左侧）。 */
+    private class PlayingBarsDrawable(
+        private val tint: Int,
+        private val sizePx: Int
+    ) : android.graphics.drawable.Drawable(), Runnable {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = tint
+            style = Paint.Style.FILL
+        }
+        private var phase = 0f
+
+        init {
+            setBounds(0, 0, sizePx, sizePx)
+        }
+
+        override fun draw(canvas: Canvas) {
+            val b = bounds
+            val h = b.height().toFloat()
+            val barW = b.width() / 5f
+            for (i in 0 until 3) {
+                val wave = kotlin.math.sin(phase + i * 1.1f) * 0.5f + 0.5f
+                val barH = h * (0.35f + 0.55f * wave)
+                val left = b.left + i * barW * 1.9f + barW * 0.3f
+                canvas.drawRoundRect(
+                    left, b.bottom - barH, left + barW, b.bottom.toFloat(),
+                    barW * 0.5f, barW * 0.5f, paint
+                )
+            }
+        }
+
+        override fun run() {
+            phase += 0.12f
+            if (phase > (2 * Math.PI).toFloat()) phase -= (2 * Math.PI).toFloat()
+            invalidateSelf()
+            scheduleSelf(this, android.os.SystemClock.uptimeMillis() + 40L)
+        }
+
+        override fun setVisible(visible: Boolean, restart: Boolean): Boolean {
+            unscheduleSelf(this)
+            if (visible) scheduleSelf(this, android.os.SystemClock.uptimeMillis() + 40L)
+            return super.setVisible(visible, restart)
+        }
+
+        override fun setAlpha(alpha: Int) {
+            paint.alpha = alpha
+        }
+
+        override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) {
+            paint.colorFilter = colorFilter
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = android.graphics.PixelFormat.TRANSLUCENT
+    }
+
     private fun renderSeasonSection(item: VideoItem) {
-        val season = item.season ?: return
+        // 收藏夹播放态：把收藏夹包装成虚拟合集，完全复用合集渲染与底部弹窗
+        val favorite = favoritePlayback
+        val season = if (favorite != null) {
+            UgcSeason(
+                id = favorite.folderId,
+                title = favorite.folderName,
+                cover = "",
+                episodes = favorite.entries,
+                isMultiPage = false
+            )
+        } else {
+            item.season ?: return
+        }
         if (isFinishing || isDestroyed || season.episodes.isEmpty()) return
         val episodes = season.episodes
-        // 单行高度：行布局(标题 20dp + 上下留白)固定，供展开后定位当前集计算用。
-        val rowHeight = dp(38)
-        val currentIndex = episodes.indexOfFirst {
-            (it.cid > 0L && it.cid == item.cid) ||
-                (it.bvid.isNotBlank() && it.bvid == item.bvid && it.aid > 0L && it.aid == item.aid)
+        val currentIndex = if (favorite != null) {
+            episodes.indexOfFirst { it.bvid == item.bvid }
+        } else {
+            episodes.indexOfFirst { item.cid > 0L && it.cid == item.cid }.takeIf { it >= 0 }
+                ?: episodes.indexOfFirst { it.cid <= 0L && it.bvid == item.bvid && it.aid == item.aid }
         }
 
-        val card = LinearLayout(this).apply {
+        val section = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(6), dp(14), dp(10))
-            background = rounded(COLOR_CARD, dp(14), COLOR_CARD_BORDER, 1)
+            setPadding(0, dp(14), 0, dp(4))
         }
-        infoContent.addView(card, LinearLayout.LayoutParams(
+        infoContent.addView(section, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = dp(14)
+            topMargin = dp(8)
         })
 
-        // ── 头部行：合集徽标 + 标题 + 集数 + 展开箭头 ──
+        // 顶部细分割线，视觉上把“简介与操作”与“合集/选集”自然区隔开
+        section.addView(View(this).apply { setBackgroundColor(COLOR_BORDER) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, Ds.hairline(this)).apply {
+                bottomMargin = dp(12)
+            })
+
+        // ── 头部行：合集标题（左） + 集数进度 / 全部入口（右）──
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(8), 0, dp(8))
+            // 按基线对齐：标题 14sp、计数/全部 12sp、chip 带内边距，
+            // 用 CENTER_VERTICAL 会按盒子中心对齐导致基线错开，必须走基线对齐。
+            isBaselineAligned = true
+            setPadding(0, 0, 0, dp(10))
             isClickable = true
+            Ds.bindPressFeedback(this, 0.98f)
+            setOnClickListener { showSeasonSheet(season, episodes, currentIndex) }
         }
+        val titlePrefix = if (favorite != null) "收藏夹" else if (season.isMultiPage) "分集" else "合集"
         header.addView(TextView(this).apply {
-            text = "合集"
-            textSize = 10f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            setTextColor(COLOR_ROSE)
-            gravity = Gravity.CENTER
-            background = rounded(COLOR_ROSE_SOFT, dp(6))
-            setPadding(dp(7), dp(3), dp(7), dp(3))
-        }, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        header.addView(TextView(this).apply {
-            text = season.title
+            text = "$titlePrefix · ${season.title}"
             textSize = 14f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            typeface = Ds.display(bold = true)
             setTextColor(COLOR_INK)
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
             includeFontPadding = false
-        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-            leftMargin = dp(8)
-        })
-        header.addView(TextView(this).apply {
-            text = "共 ${episodes.size} 集"
-            textSize = 11f
-            setTextColor(COLOR_MUTED)
-        }, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-            leftMargin = dp(6)
-        })
-        val arrow = object : View(this) {
-            private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = COLOR_MUTED; style = Paint.Style.STROKE
-                strokeWidth = dpf(1.8f); strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
-            }
-            private val path = Path()
-            override fun onDraw(canvas: Canvas) {
-                super.onDraw(canvas)
-                val cx = width / 2f; val cy = height / 2f; val s = dpf(4.5f)
-                path.reset()
-                path.moveTo(cx - s, cy + s * 0.55f)
-                path.lineTo(cx, cy - s * 0.55f)
-                path.lineTo(cx + s, cy + s * 0.55f)
-                canvas.drawPath(path, paint)
-            }
-        }
-        header.addView(arrow, LinearLayout.LayoutParams(dp(26), dp(26)).apply {
-            leftMargin = dp(2)
-        })
-        card.addView(header, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-
-        // ── 分集列表（默认收起，高度 0；展开时显示全部）──
-        fun buildRow(ep: UgcEpisode, isCurrent: Boolean): View {
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        // 收藏夹播放态：四种播放模式切换（放在下方区块，不放进控制面板）
+        if (favorite != null) {
+            val modeChip = TextView(this).apply {
+                text = favoritePlayMode.label()
+                textSize = 11.5f
+                typeface = Ds.body(bold = true)
+                includeFontPadding = false
                 gravity = Gravity.CENTER_VERTICAL
-                // 默认 baselineAligned=true 会把子 TextView 按基线对齐，导致右侧时长
-                // 相对标题下沉；关闭后 gravity=CENTER_VERTICAL 才能垂直居中。
-                isBaselineAligned = false
+                setTextColor(COLOR_ROSE)
+                background = Ds.pill(this@VideoDetailActivity, COLOR_ROSE_SOFT)
+                setPadding(dp(9), dp(4), dp(9), dp(4))
                 isClickable = true
+                Ds.bindPressFeedback(this, 0.94f)
                 setOnClickListener {
-                    if (!isCurrent && (ep.bvid.isNotBlank() || ep.aid > 0L)) {
-                        currentBvid = ep.bvid
-                        currentAid = ep.aid
-                        loadVideoAndPlayer()
-                    }
+                    favoritePlayMode = favoritePlayMode.nextMode()
+                    text = favoritePlayMode.label()
+                    refreshSeasonDrawerSelection()
                 }
             }
-            // 标题过长时单行省略（不再自动滚动，保持列表简洁）。
-            val title = TextView(this).apply {
-                text = ep.title
-                textSize = 13f
-                setTextColor(if (isCurrent) COLOR_ROSE else COLOR_INK)
+            // chip 自带内边距，TextView.getBaseline() 已含 paddingTop，
+            // 基线对齐会自动让它内部文字与标题落在同一基线。
+            val chipLp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                rightMargin = dp(6)
+            }
+            header.addView(modeChip, chipLp)
+        }
+        if (currentIndex >= 0) {
+            header.addView(TextView(this).apply {
+                text = "${currentIndex + 1}/${episodes.size}"
+                textSize = 12f
+                typeface = Ds.body(bold = true)
+                fontFeatureSettings = "tnum"
                 includeFontPadding = false
-                setSingleLine(true)
-                ellipsize = android.text.TextUtils.TruncateAt.END
+                gravity = Gravity.CENTER_VERTICAL
+                setTextColor(COLOR_ROSE)
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                leftMargin = dp(8)
+            })
+        }
+        header.addView(TextView(this).apply {
+            text = if (currentIndex >= 0) "· 全部 ›" else "共 ${episodes.size} 集 ›"
+            textSize = 12f
+            fontFeatureSettings = "tnum"
+            includeFontPadding = false
+            gravity = Gravity.CENTER_VERTICAL
+            setTextColor(COLOR_MUTED)
+            setPadding(dp(4), 0, 0, 0)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        section.addView(header, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        // ── 横向分集卡片流（拦截外层 HorizontalPagerView 横滑，大合集采用视口按需虚拟化渲染，避免一次性创建上百视图卡顿）──
+        val cardW = dp(148)
+        val cardGap = dp(8)
+        val stepPx = cardW + cardGap
+        val totalStripW = (episodes.size * stepPx - cardGap).coerceAtLeast(cardW)
+        val cardHeightEstimate = dp(66)
+
+        val strip = object : FrameLayout(this) {
+            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                super.onMeasure(
+                    MeasureSpec.makeMeasureSpec(totalStripW, MeasureSpec.EXACTLY),
+                    heightMeasureSpec
+                )
             }
-            row.addView(title, LinearLayout.LayoutParams(0, dp(20), 1f))
-            // 播放中的那一集右侧不显示时长（已有"播放中"标签，避免时长误导）。
-            if (ep.duration > 0 && !isCurrent) {
-                row.addView(TextView(this).apply {
-                    text = formatDuration(ep.duration)
+        }
+
+        val activePool = HashMap<Int, LinearLayout>()
+        val recycledPool = ArrayDeque<LinearLayout>()
+
+        fun acquireCard(): LinearLayout {
+            val recycled = recycledPool.removeFirstOrNull()
+            if (recycled != null) return recycled
+            return LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(11), dp(9), dp(11), dp(9))
+                isClickable = true
+                Ds.bindPressFeedback(this, 0.96f)
+                val metaRow = LinearLayout(this@VideoDetailActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                }
+                val indexTv = TextView(this@VideoDetailActivity).apply {
                     textSize = 11f
-                    setTextColor(COLOR_MUTED)
-                }, LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                    leftMargin = dp(8)
+                    fontFeatureSettings = "tnum"
+                }
+                val statusTv = TextView(this@VideoDetailActivity).apply {
+                    textSize = 10.5f
+                    fontFeatureSettings = "tnum"
+                }
+                metaRow.addView(indexTv, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                metaRow.addView(statusTv, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                addView(metaRow, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                val titleTv = TextView(this@VideoDetailActivity).apply {
+                    textSize = 12.5f
+                    maxLines = 2
+                    minLines = 2
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    setLineSpacing(dpf(2f), 1f)
+                    includeFontPadding = false
+                }
+                addView(titleTv, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                    topMargin = dp(5)
                 })
+                tag = arrayOf(indexTv, statusTv, titleTv)
             }
-            if (isCurrent) {
-                row.addView(TextView(this).apply {
-                    text = "播放中"
-                    textSize = 10f
-                    setTextColor(Color.WHITE)
-                    gravity = Gravity.CENTER
-                    background = rounded(COLOR_ROSE, dp(8))
-                    setPadding(dp(6), dp(2), dp(6), dp(2))
-                }, LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                    leftMargin = dp(8)
-                })
+        }
+
+        fun bindCard(card: LinearLayout, index: Int) {
+            val episode = episodes[index]
+            val isCurrent = index == currentIndex
+            @Suppress("UNCHECKED_CAST")
+            val views = card.tag as Array<TextView>
+            val indexTv = views[0]
+            val statusTv = views[1]
+            val titleTv = views[2]
+            card.background = Ds.card(
+                this@VideoDetailActivity,
+                fill = if (isCurrent) COLOR_ROSE_SOFT else COLOR_SOFT_FILL,
+                border = if (isCurrent) COLOR_ROSE else null,
+                radiusDp = Ds.Radius.control,
+                borderPx = Ds.hairline(this@VideoDetailActivity)
+            )
+            // 保留 P 编号；收藏夹当前项在编号前加动态音柱图标
+            indexTv.text = "P${index + 1}"
+            indexTv.typeface = Ds.body(bold = true)
+            indexTv.setTextColor(if (isCurrent) COLOR_ROSE else COLOR_MUTED)
+            indexTv.setCompoundDrawablesWithIntrinsicBounds(
+                if (favorite != null && isCurrent) PlayingBarsDrawable(COLOR_ROSE, dp(11)) else null,
+                null, null, null
+            )
+            indexTv.compoundDrawablePadding = dp(4)
+            statusTv.text = when {
+                isCurrent -> "播放中"
+                episode.duration > 0 -> formatDuration(episode.duration)
+                else -> ""
             }
-            return row
+            statusTv.typeface = Ds.body(bold = isCurrent)
+            statusTv.setTextColor(if (isCurrent) COLOR_ROSE else Ds.colors.subtle)
+            titleTv.text = episode.title
+            titleTv.typeface = Ds.body(bold = isCurrent)
+            titleTv.setTextColor(if (isCurrent) COLOR_ROSE else COLOR_INK)
+            card.setOnClickListener {
+                if (!isCurrent && (episode.bvid.isNotBlank() || episode.aid > 0L)) {
+                    selectEpisode(episode)
+                }
+            }
         }
-        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        episodes.forEachIndexed { index, ep ->
-            list.addView(buildRow(ep, index == currentIndex), LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, rowHeight))
-        }
-        // 列表内部滚动：几百集的合集也不会把简介撑爆，超过上限高度后只滚列表。
-        // 不能用 setOnTouchListener 设 disallow：列表行是 clickable 的，DOWN 事件被行
-        // 消费后 scroll 的 onTouchEvent 不再触发；必须重写 dispatchTouchEvent，
-        // 让任何事件（无论子 view 是否消费）都先经过这里禁止外层简介区拦截手势。
-        val scroll = object : ScrollView(this) {
-            override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-                when (ev.actionMasked) {
-                    MotionEvent.ACTION_DOWN ->
-                        parent?.requestDisallowInterceptTouchEvent(true)
-                    MotionEvent.ACTION_MOVE -> {
-                        // 列表完全不能滚时才交还手势，让外层页面继续滚动。
-                        if (!canScrollVertically(1) && !canScrollVertically(-1)) {
-                            parent?.requestDisallowInterceptTouchEvent(false)
-                        }
+
+        var lastFirst = -1
+        var lastLast = -1
+        fun syncVisibleCards(scrollX: Int, viewportWidth: Int) {
+            val width = if (viewportWidth > 0) viewportWidth else resources.displayMetrics.widthPixels
+            val buffer = 2
+            val first = ((scrollX / stepPx) - buffer).coerceIn(0, episodes.lastIndex)
+            val last = (((scrollX + width) / stepPx) + buffer).coerceIn(0, episodes.lastIndex)
+            if (first == lastFirst && last == lastLast && activePool.isNotEmpty()) return
+            lastFirst = first
+            lastLast = last
+            val iterator = activePool.entries.iterator()
+            while (iterator.hasNext()) {
+                val (idx, view) = iterator.next()
+                if (idx < first || idx > last) {
+                    strip.removeView(view)
+                    recycledPool.addLast(view)
+                    iterator.remove()
+                }
+            }
+            for (idx in first..last) {
+                if (idx !in activePool) {
+                    val card = acquireCard()
+                    bindCard(card, idx)
+                    val lp = FrameLayout.LayoutParams(cardW, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
+                        leftMargin = idx * stepPx
                     }
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
-                        parent?.requestDisallowInterceptTouchEvent(false)
+                    strip.addView(card, lp)
+                    activePool[idx] = card
+                }
+            }
+        }
+
+        val hScroll = object : HorizontalScrollView(this) {
+            override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+                if (canScrollHorizontally(-1) || canScrollHorizontally(1)) {
+                    when (ev.actionMasked) {
+                        MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE ->
+                            parent?.requestDisallowInterceptTouchEvent(true)
+                        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                            parent?.requestDisallowInterceptTouchEvent(false)
+                    }
                 }
                 return super.dispatchTouchEvent(ev)
             }
-        }.apply {
-            isVerticalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-            clipToPadding = false
-        }
-        scroll.addView(list, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
-        val clip = FrameLayout(this).apply { clipChildren = true }
-        clip.addView(scroll, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        card.addView(clip, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, 0))
 
-        // 提前测量展开高度：超过上限时列表内部滚动。
-        val availWidth = if (infoContent.width > 0) infoContent.width - dp(28)
-        else resources.displayMetrics.widthPixels - dp(36) - dp(28)
-        val unconstrained = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
-        list.measure(
-            View.MeasureSpec.makeMeasureSpec(availWidth, View.MeasureSpec.EXACTLY), unconstrained)
-        val fullHeight = list.measuredHeight
-        val maxListHeight = minOf(fullHeight, dp(320))
-        clip.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
-            if (seasonSectionExpanded) maxListHeight else 0)
-        arrow.rotation = if (seasonSectionExpanded) 180f else 0f
-
-        header.setOnClickListener {
-            seasonSectionExpanded = !seasonSectionExpanded
-            animateHeight(clip,
-                if (seasonSectionExpanded) maxListHeight else 0,
-                if (seasonSectionExpanded) 240L else 200L)
-            arrow.animate().rotation(if (seasonSectionExpanded) 180f else 0f).setDuration(200L).start()
-            if (seasonSectionExpanded && currentIndex >= 0) {
-                // 展开后把正在播放的那一集滚到可视区域附近，方便快捷点击确认。
-                scroll.post {
-                    scroll.smoothScrollTo(0,
-                        (currentIndex * rowHeight - (maxListHeight - rowHeight) / 2)
-                            .coerceAtLeast(0))
-                }
+            override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
+                super.onScrollChanged(l, t, oldl, oldt)
+                syncVisibleCards(l, width)
             }
+
+            override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+                super.onSizeChanged(w, h, oldw, oldh)
+                syncVisibleCards(scrollX, w)
+            }
+        }.apply {
+            isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(strip, FrameLayout.LayoutParams(totalStripW, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
+                minimumHeight = cardHeightEstimate
+            })
         }
-        // 切换分集后简介会重建：保持展开状态并重新定位到新播放的那一集。
-        if (seasonSectionExpanded && currentIndex >= 0) {
-            scroll.post {
-                scroll.smoothScrollTo(0,
-                    (currentIndex * rowHeight - (maxListHeight - rowHeight) / 2)
-                        .coerceAtLeast(0))
+        section.addView(hScroll, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        val initialScroll = if (currentIndex > 0) {
+            val estWidth = (resources.displayMetrics.widthPixels - dp(32)).coerceAtLeast(cardW)
+            (currentIndex * stepPx - (estWidth - cardW) / 2).coerceIn(0, (totalStripW - estWidth).coerceAtLeast(0))
+        } else 0
+        syncVisibleCards(initialScroll, resources.displayMetrics.widthPixels)
+
+        if (currentIndex > 0) {
+            hScroll.post {
+                val scrollTarget = (currentIndex * stepPx - (hScroll.width - cardW) / 2)
+                    .coerceIn(0, (totalStripW - hScroll.width).coerceAtLeast(0))
+                hScroll.scrollTo(scrollTarget, 0)
+                syncVisibleCards(scrollTarget, hScroll.width)
             }
         }
     }
+
+    /** 底部半屏全集选择清单（点击头部「全部 ›」呼出）。 */
+    private fun showSeasonSheet(season: UgcSeason, episodes: List<UgcEpisode>, currentIndex: Int) {
+        if (isFinishing || isDestroyed) return
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val overlay = FrameLayout(this).apply {
+            setBackgroundColor(0x2E000000)
+        }
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedTop(COLOR_BACKGROUND, dp(18))
+            isClickable = true
+        }
+        // Drag handle
+        panel.addView(View(this).apply {
+            background = Ds.pill(this@VideoDetailActivity, COLOR_BORDER)
+        }, LinearLayout.LayoutParams(dp(34), dp(4)).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            topMargin = dp(8)
+        })
+        // Sheet header
+        panel.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(10), dp(12), dp(10))
+            addView(LinearLayout(this@VideoDetailActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(TextView(this@VideoDetailActivity).apply {
+                    text = season.title
+                    textSize = 15.5f
+                    typeface = Ds.display(bold = true)
+                    setTextColor(COLOR_INK)
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                })
+                addView(TextView(this@VideoDetailActivity).apply {
+                    text = if (currentIndex >= 0) "正在播放第 ${currentIndex + 1} 集 · 共 ${episodes.size} 集"
+                    else "共 ${episodes.size} 集"
+                    textSize = 11.5f
+                    fontFeatureSettings = "tnum"
+                    setTextColor(COLOR_MUTED)
+                    setPadding(0, dp(2), 0, 0)
+                })
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(TextView(this@VideoDetailActivity).apply {
+                text = "✕"
+                textSize = 14f
+                typeface = Ds.body(bold = true)
+                setTextColor(COLOR_MUTED)
+                gravity = Gravity.CENTER
+                background = Ds.pill(this@VideoDetailActivity, COLOR_CARD, Ds.colors.lineSoft)
+                Ds.bindPressFeedback(this, 0.92f)
+                setOnClickListener { dialog.dismiss() }
+            }, LinearLayout.LayoutParams(dp(30), dp(30)).apply {
+                leftMargin = dp(10)
+            })
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        panel.addView(View(this).apply { setBackgroundColor(COLOR_BORDER) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, Ds.hairline(this)))
+
+        val rowHeight = dp(76)
+        val thumbW = dp(96)
+        val thumbH = dp(56)
+        val list = ListView(this).apply {
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            divider = ColorDrawable(COLOR_BORDER)
+            dividerHeight = Ds.hairline(this@VideoDetailActivity)
+            setSelector(android.R.color.transparent)
+            adapter = object : BaseAdapter() {
+                override fun getCount() = episodes.size
+                override fun getItem(position: Int) = episodes[position]
+                override fun getItemId(position: Int) = position.toLong()
+                override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+                    val row = (convertView as? LinearLayout) ?: LinearLayout(this@VideoDetailActivity).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        setPadding(dp(16), dp(10), dp(16), dp(10))
+                        layoutParams = AbsListView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, rowHeight)
+
+                        val thumbHost = FrameLayout(this@VideoDetailActivity).apply {
+                            background = rounded(COLOR_COVER, dp(7))
+                            Ds.clipRounded(this, 7)
+                        }
+                        val thumb = ImageView(this@VideoDetailActivity).apply {
+                            scaleType = ImageView.ScaleType.CENTER_CROP
+                        }
+                        val durationBadge = TextView(this@VideoDetailActivity).apply {
+                            textSize = 9.5f
+                            typeface = Ds.body(bold = true)
+                            fontFeatureSettings = "tnum"
+                            setTextColor(Color.WHITE)
+                            background = rounded(0x99000000.toInt(), dp(4))
+                            setPadding(dp(4), dp(1), dp(4), dp(1))
+                        }
+                        thumbHost.addView(thumb, FrameLayout.LayoutParams(
+                            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+                        thumbHost.addView(durationBadge, FrameLayout.LayoutParams(
+                            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                            Gravity.BOTTOM or Gravity.END).apply {
+                            rightMargin = dp(4)
+                            bottomMargin = dp(4)
+                        })
+
+                        val textCol = LinearLayout(this@VideoDetailActivity).apply {
+                            orientation = LinearLayout.VERTICAL
+                            gravity = Gravity.CENTER_VERTICAL
+                        }
+                        val title = TextView(this@VideoDetailActivity).apply {
+                            textSize = 13.5f
+                            maxLines = 2
+                            ellipsize = android.text.TextUtils.TruncateAt.END
+                            setLineSpacing(dpf(2f), 1f)
+                            includeFontPadding = false
+                        }
+                        val sub = TextView(this@VideoDetailActivity).apply {
+                            textSize = 11.5f
+                            fontFeatureSettings = "tnum"
+                            maxLines = 1
+                            ellipsize = android.text.TextUtils.TruncateAt.END
+                        }
+                        textCol.addView(title, LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                        textCol.addView(sub, LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                            topMargin = dp(4)
+                        })
+
+                        addView(thumbHost, LinearLayout.LayoutParams(thumbW, thumbH))
+                        addView(textCol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                            leftMargin = dp(12)
+                        })
+                        tag = EpisodeSheetRow(thumb, durationBadge, title, sub)
+                    }
+                    val holder = row.tag as EpisodeSheetRow
+                    val episode = getItem(position)
+                    val isCurrent = position == currentIndex
+                    row.setBackgroundColor(if (isCurrent) COLOR_ROSE_SOFT else Color.TRANSPARENT)
+
+                    val coverUrl = episode.cover.ifBlank { season.cover }
+                    if (coverUrl.isNotBlank()) {
+                        CoverLoader.load(holder.thumb, coverUrl, cropThumb = true)
+                    } else {
+                        CoverLoader.clear(holder.thumb)
+                    }
+                    if (episode.duration > 0) {
+                        holder.durationBadge.text = formatDuration(episode.duration)
+                        holder.durationBadge.visibility = View.VISIBLE
+                    } else {
+                        holder.durationBadge.visibility = View.GONE
+                    }
+
+                    holder.title.text = episode.title
+                    holder.title.typeface = Ds.body(bold = isCurrent)
+                    holder.title.setTextColor(if (isCurrent) COLOR_ROSE else COLOR_INK)
+
+                    val metaText = buildString {
+                        if (isCurrent) append("播放中")
+                        if (episode.publishedAt > 0L) {
+                            if (isNotEmpty()) append(" · ")
+                            append(formatPublishedDate(episode.publishedAt))
+                        }
+                        if (isEmpty()) append(if (favoritePlayback != null) "" else "第 ${position + 1} 集")
+                    }
+                    holder.sub.text = metaText
+                    holder.sub.setTextColor(if (isCurrent) COLOR_ROSE else COLOR_MUTED)
+                    return row
+                }
+            }
+            setOnItemClickListener { _, _, index, _ ->
+                val episode = episodes[index]
+                dialog.dismiss()
+                if (index != currentIndex && (episode.bvid.isNotBlank() || episode.aid > 0L)) {
+                    selectEpisode(episode)
+                }
+            }
+        }
+        panel.addView(list, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        val useSideDrawer = LayoutMode.isWideScreen(this)
+        val anchorTop = infoTabBarAnchor?.let { anchor ->
+            val pos = IntArray(2)
+            anchor.getLocationOnScreen(pos)
+            pos[1]
+        } ?: (resources.displayMetrics.widthPixels * 9 / 16)
+        val sheetHeight = (resources.displayMetrics.heightPixels - anchorTop).coerceAtLeast(dp(300))
+
+        if (useSideDrawer) {
+            val drawerW = (resources.displayMetrics.widthPixels * 0.38f).toInt().coerceIn(dp(360), dp(460))
+            panel.background = Ds.card(this, COLOR_BACKGROUND, Ds.colors.lineSoft, 0, Ds.hairline(this))
+            overlay.addView(panel, FrameLayout.LayoutParams(
+                drawerW, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.END))
+            overlay.setOnClickListener { dialog.dismiss() }
+            dialog.setContentView(overlay)
+            dialog.window?.apply {
+                setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+                setGravity(Gravity.END)
+                setBackgroundDrawable(ColorDrawable(0x00000000))
+                clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            }
+            dialog.show()
+            if (currentIndex >= 0) {
+                list.post { list.setSelectionFromTop(currentIndex, (resources.displayMetrics.heightPixels - dp(120) - rowHeight) / 2) }
+            }
+            panel.translationX = drawerW.toFloat()
+            panel.animate().translationX(0f).setDuration(220L).setInterpolator(DecelerateInterpolator()).start()
+        } else {
+            overlay.addView(panel, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, sheetHeight, Gravity.BOTTOM))
+            overlay.setOnClickListener { dialog.dismiss() }
+            dialog.setContentView(overlay)
+            dialog.window?.apply {
+                setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+                setGravity(Gravity.BOTTOM)
+                setBackgroundDrawable(ColorDrawable(0x00000000))
+                clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            }
+            dialog.show()
+            if (currentIndex >= 0) {
+                list.post { list.setSelectionFromTop(currentIndex, (sheetHeight - dp(90) - rowHeight) / 2) }
+            }
+            panel.translationY = sheetHeight.toFloat()
+            panel.animate().translationY(0f).setDuration(220L).setInterpolator(DecelerateInterpolator()).start()
+        }
+    }
+
+    private data class EpisodeSheetRow(
+        val thumb: ImageView,
+        val durationBadge: TextView,
+        val title: TextView,
+        val sub: TextView
+    )
 
     private fun setIntroExpanded(expanded: Boolean) {
         if (introExpanded == expanded || !::introDescWrap.isInitialized) return
         introExpanded = expanded
-        titleArrow.animate().rotation(if (expanded) 180f else 0f).setDuration(220)
+        titleArrow.animate().rotation(if (expanded) 180f else 0f).setDuration(240)
             .setInterpolator(DecelerateInterpolator()).start()
-        // Both clips animate height via ValueAnimator + layoutParams. Their children
-        // are pre-measured and clipped, so no per-frame text re-measure happens:
-        // the title lines reveal smoothly and the description no longer stutters.
         titleHeightAnimator?.cancel()
         descHeightAnimator?.cancel()
+        // Measure current actual height BEFORE starting collapse so we never jump from
+        // WRAP_CONTENT (-2) to 0 in a single frame!
+        val curDescH = if (introDescClip.height > 0) introDescClip.height else introDescHeight
         if (expanded) {
             titleText.maxLines = Int.MAX_VALUE
             titleText.ellipsize = null
-        } else {
-            titleText.maxLines = 1
-            titleText.ellipsize = android.text.TextUtils.TruncateAt.END
-        }
-        titleHeightAnimator = animateHeight(titleClip, if (expanded) titleFullHeight else titleLineHeight,
-            if (expanded) 280L else 200L)
-        descHeightAnimator = animateHeight(introDescClip, if (expanded) introDescHeight else 0,
-            if (expanded) 300L else 220L).apply {
-            // After expanding, release the fixed height so long descriptions are
-            // fully laid out and the surrounding ScrollView scrolls naturally
-            // (no boxed-in region).
-            addListener(object : android.animation.AnimatorListenerAdapter() {
-                override fun onAnimationEnd(animation: android.animation.Animator) {
-                    if (introExpanded) {
-                        introDescClip.layoutParams = LinearLayout.LayoutParams(
-                            LinearLayout.LayoutParams.MATCH_PARENT,
-                            LinearLayout.LayoutParams.WRAP_CONTENT)
+            if (introDescClip.layoutParams.height < 0) {
+                introDescClip.layoutParams = introDescClip.layoutParams.apply { height = curDescH }
+            }
+            titleHeightAnimator = animateHeight(titleClip, titleFullHeight, 260L)
+            descHeightAnimator = animateHeight(introDescClip, introDescHeight, 280L).apply {
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        if (introExpanded) {
+                            introDescClip.layoutParams = LinearLayout.LayoutParams(
+                                LinearLayout.LayoutParams.MATCH_PARENT,
+                                LinearLayout.LayoutParams.WRAP_CONTENT)
+                        }
                     }
-                }
-            })
+                })
+            }
+        } else {
+            val curTitleH = if (titleClip.height > 0) titleClip.height else titleFullHeight
+            if (titleClip.layoutParams.height < 0) {
+                titleClip.layoutParams = titleClip.layoutParams.apply { height = curTitleH }
+            }
+            // Pin introDescClip to its actual pixel height before animating down to 0
+            // (previously layoutParams.height was WRAP_CONTENT == -2, causing ValueAnimator
+            // ofInt(-2, 0) to snap shut instantly!).
+            introDescClip.layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, curDescH)
+            titleHeightAnimator = animateHeight(titleClip, titleLineHeight, 220L).apply {
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        if (!introExpanded) {
+                            titleText.maxLines = 1
+                            titleText.ellipsize = android.text.TextUtils.TruncateAt.END
+                        }
+                    }
+                })
+            }
+            descHeightAnimator = animateHeight(introDescClip, 0, 240L)
         }
     }
 
-    private fun animateHeight(view: View, target: Int, duration: Long): ValueAnimator =
-        ValueAnimator.ofInt(view.layoutParams.height, target).apply {
+    private fun animateHeight(view: View, target: Int, duration: Long): ValueAnimator {
+        val start = if (view.layoutParams.height >= 0) view.layoutParams.height else view.height
+        return ValueAnimator.ofInt(start, target).apply {
             this.duration = duration
             interpolator = DecelerateInterpolator()
             addUpdateListener { va ->
@@ -2082,6 +3736,7 @@ class VideoDetailActivity : Activity() {
             }
             start()
         }
+    }
 
     /** 粉丝数：万以下显示具体数字，万以上显示 "1 万粉丝"（最多一位小数）。 */
     private fun formatFans(count: Long): String {
@@ -2100,6 +3755,24 @@ class VideoDetailActivity : Activity() {
     // ─────────────────────────────────────────────────
     //  Comment Tab
     // ─────────────────────────────────────────────────
+
+    private fun resetComments() {
+        commentGeneration++
+        commentPrefetchHandle?.cancel()
+        commentPrefetchHandle = null
+        commentsLoading = false
+        commentsLoaded = false
+        commentHasMore = false
+        commentLoginHintShown = false
+        seenCommentRpids.clear()
+        commentContent.removeAllViews()
+        commentContent.addView(commentState)
+        commentState.text = "正在加载评论…"
+        commentState.visibility = View.VISIBLE
+        commentState.setOnClickListener(null)
+        commentMore.visibility = View.GONE
+        commentScroll.scrollTo(0, 0)
+    }
 
     private fun loadComments(reset: Boolean) {
         val item = currentDetail ?: return
@@ -2124,8 +3797,9 @@ class VideoDetailActivity : Activity() {
         } else {
             commentMore.text = "正在加载更多…"
         }
+        val generation = commentGeneration
         BiliApi.fetchComments(item.aid, commentCursor, commentSort) { list, next, error ->
-            if (isFinishing || isDestroyed) return@fetchComments
+            if (isFinishing || isDestroyed || generation != commentGeneration) return@fetchComments
             commentsLoading = false
             commentState.visibility = View.GONE
             if (error != null) {
@@ -2147,10 +3821,13 @@ class VideoDetailActivity : Activity() {
             // Deduplicate by rpid: even if the cursor were ever wrong, already
             // rendered comments are never appended a second time.
             val fresh = list.filter { seenCommentRpids.add(it.id) }
+            if (reset && fresh.isNotEmpty()) {
+                commentPrefetchHandle?.cancel()
+                commentPrefetchHandle = CommentSectionUi.prefetchCommentTopMedia(this, fresh)
+            }
             fresh.forEachIndexed { index, comment ->
-                if (index > 0) {
-                    commentContent.addView(View(this).apply { setBackgroundColor(COLOR_BORDER) },
-                        LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)))
+                if (index > 0 || !reset) {
+                    commentContent.addView(CommentSectionUi.buildCommentDivider(this))
                 }
                 commentContent.addView(buildCommentRow(comment))
             }
@@ -2200,1368 +3877,254 @@ class VideoDetailActivity : Activity() {
         loadComments(reset = false)
     }
 
-    private fun buildCommentRow(comment: VideoComment): View {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.TOP
-            setPadding(0, dp(12), 0, dp(12))
-        }
-        val avatar = RoundImageView(this).apply { setBackgroundColor(COLOR_COVER) }
-        if (comment.avatar.isNotBlank()) {
-            CoverLoader.load(avatar, comment.avatar + "@52w_52h_1c.webp")
-        }
-        row.addView(avatar, LinearLayout.LayoutParams(dp(36), dp(36)))
-        val body = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(10), 0, 0, 0)
-        }
-        body.addView(TextView(this).apply {
-            text = comment.user
-            textSize = 13f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            setTextColor(COLOR_INK)
-        }, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        body.addView(TextView(this).apply {
-            text = formatCommentTime(comment.publishedAt)
-            textSize = 11f; setTextColor(COLOR_MUTED)
-            setPadding(0, dp(3), 0, 0)
-        }, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        // Long comments start collapsed so one wall of text does not dominate the list.
-        body.addView(
-            buildExpandableCommentText(comment.content, comment.emotes, textSizeSp = 14f),
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-            )
+    private fun buildCommentRow(comment: VideoComment): View =
+        CommentSectionUi.buildUnifiedCommentItem(
+            activity = this,
+            comment = comment,
+            ownerMid = currentDetail?.ownerMid ?: 0L,
+            targetOid = (currentDetail?.aid ?: 0L).toString(),
+            commentType = 1,
+            isSheet = false,
+            showRootTag = false,
+            onOpenReplySheet = { root -> showReplySheet(root) },
+            onFeedback = { msg -> showSnackbar(msg) }
         )
-        // User-uploaded comment photos. Fixed (non-scrolling) layout: every
-        // card is always visible, so taps map 1:1 to the picture order.
-        if (comment.pictures.isNotEmpty()) {
-            body.addView(buildPicturesRow(comment.pictures), LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        }
-        body.addView(LikeButton(this, comment), LinearLayout.LayoutParams(dp(64), dp(26)).apply {
-            topMargin = dp(7)
-        })
-        // In-floor (sub) replies preview with a "view all replies" sheet entry.
-        if (comment.replies.isNotEmpty() || comment.replyCount > 0L) {
-            val floor = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                // Softer, quieter surface than the generic skeleton fill so
-                // collapsed previews do not look like loading placeholders.
-                background = rounded(
-                    if (Theme.isDark) 0x1AFFFFFF.toInt() else 0x0F000000.toInt(),
-                    dp(10)
-                )
-                setPadding(dp(10), dp(8), dp(10), dp(8))
-                isClickable = true
-                // Whole preview opens the full reply sheet; matches official UX.
-                setOnClickListener { showReplySheet(comment) }
-            }
-            comment.replies.take(2).forEach { sub ->
-                floor.addView(buildSubCommentItem(sub))
-            }
-            val moreLabel = when {
-                comment.replyCount > comment.replies.size ->
-                    "共 ${comment.replyCount} 条回复，点击查看"
-                comment.replies.isNotEmpty() ->
-                    "查看全部回复"
-                else -> "查看回复"
-            }
-            floor.addView(TextView(this).apply {
-                text = moreLabel
-                textSize = 12f
-                setTextColor(COLOR_ROSE)
-                setPadding(0, if (comment.replies.isEmpty()) 0 else dp(4), 0, 0)
-            }, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-            body.addView(floor, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                topMargin = dp(8)
-            })
-        }
-        row.addView(body, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        return row
-    }
 
-    /**
-     * Long comments collapse past 50 characters so one wall of text does not
-     * dominate the list. Tap 「展开」 / 「收起」 to toggle; short comments stay full.
-     */
-    private fun buildExpandableCommentText(
-        content: String,
-        emotes: Map<String, String>,
-        textSizeSp: Float
-    ): View {
-        val fullText = commentSpannable(content, emotes)
-        val needsCollapse = content.length > COMMENT_COLLAPSE_CHARS
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(6), 0, 0)
-        }
-        val body = TextView(this).apply {
-            textSize = textSizeSp
-            setTextColor(COLOR_INK)
-            setLineSpacing(dp(3).toFloat(), 1f)
-            setTextIsSelectable(true)
-        }
-        val toggle = TextView(this).apply {
-            textSize = 12f
-            setTextColor(COLOR_ROSE)
-            setPadding(0, dp(4), 0, 0)
-            visibility = View.GONE
-        }
-        fun applyState(expanded: Boolean) {
-            if (!needsCollapse || expanded) {
-                body.text = fullText
-                body.maxLines = Integer.MAX_VALUE
-                body.ellipsize = null
-                toggle.visibility = if (needsCollapse) View.VISIBLE else View.GONE
-                toggle.text = "收起"
-            } else {
-                // Keep the full spannable so emotes in the first lines still
-                // render, then cap the visible height with maxLines.
-                body.text = fullText
-                body.maxLines = COMMENT_COLLAPSE_LINES
-                body.ellipsize = android.text.TextUtils.TruncateAt.END
-                toggle.visibility = View.VISIBLE
-                toggle.text = "展开"
-            }
-            attachEmoteSpans(body)
-        }
-        var expanded = false
-        applyState(expanded = false)
-        if (needsCollapse) {
-            toggle.setOnClickListener {
-                expanded = !expanded
-                applyState(expanded)
-            }
-            body.setOnClickListener {
-                if (!expanded) {
-                    expanded = true
-                    applyState(expanded)
-                }
-            }
-        }
-        box.addView(body, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        box.addView(toggle, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        return box
-    }
-
-    /** Comment photo row: fixed, non-scrolling, so every tap maps 1:1 to the
-     *  picture order. A single photo keeps its natural aspect ratio and sits
-     *  left-aligned; 2+ photos share the row width evenly, with the remainder
-     *  collapsed into a "+N" card that opens the viewer at the third picture. */
-    private fun buildPicturesRow(pics: List<CommentPicture>): LinearLayout {
-        val shown = minOf(2, pics.size)
-        val extraCount = pics.size - shown
-        val gap = dp(6)
-        // Body width = screen minus avatar (36dp) and its margin (10dp).
-        val bodyW = resources.displayMetrics.widthPixels - dp(46)
-        val cardCount = shown + (if (extraCount > 0) 1 else 0)
-        val cardW = if (pics.size == 1) {
-            val p = pics[0]
-            val h = dp(120)
-            if (p.width > 0 && p.height > 0)
-                (h.toFloat() * p.width / p.height).toInt().coerceIn(dp(60), dp(240))
-            else h
-        } else {
-            (bodyW - gap * (cardCount - 1)) / cardCount
-        }
-        val cardH = if (pics.size == 1) dp(120) else
-            pics.take(shown).map { picture ->
-                if (picture.width > 0 && picture.height > 0)
-                    (cardW.toFloat() * picture.height / picture.width).toInt().coerceIn(dp(80), dp(170))
-                else dp(120)
-            }.maxOrNull() ?: dp(120)
-        val imageRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(8), 0, 0)
-        }
-        pics.take(shown).forEachIndexed { index, picture ->
-            val image = ImageView(this).apply {
-                // CENTER_CROP fills the card so FIT_CENTER no longer leaves a
-                // pale letterbox halo around GIFs on the dark canvas.
-                scaleType = ImageView.ScaleType.CENTER_CROP
-                background = rounded(COLOR_COVER, dp(8))
-                clipToOutline = true
-                outlineProvider = object : android.view.ViewOutlineProvider() {
-                    override fun getOutline(view: View, outline: android.graphics.Outline) {
-                        outline.setRoundRect(0, 0, view.width, view.height, dp(8).toFloat())
-                    }
-                }
-                setOnClickListener {
-                    showImagesDialog(pics.map { it.url }, index)
-                }
-            }
-            // cropThumb = false keeps the full picture (no 16:9 centre-crop).
-            CoverLoader.load(image, picture.url, cropThumb = false)
-            imageRow.addView(image, LinearLayout.LayoutParams(cardW, cardH).apply {
-                rightMargin = gap
-            })
-        }
-        if (extraCount > 0) {
-            // Use the third picture itself as the more-card background, then lay a
-            // soft dark veil and "+N" on top so it feels continuous with the gallery.
-            val moreHost = FrameLayout(this).apply {
-                background = rounded(COLOR_COVER, dp(8))
-                clipToOutline = true
-                outlineProvider = object : android.view.ViewOutlineProvider() {
-                    override fun getOutline(view: View, outline: android.graphics.Outline) {
-                        outline.setRoundRect(0, 0, view.width, view.height, dp(8).toFloat())
-                    }
-                }
-                setOnClickListener {
-                    showImagesDialog(pics.map { it.url }, shown)
-                }
-            }
-            val moreImage = ImageView(this).apply {
-                scaleType = ImageView.ScaleType.CENTER_CROP
-            }
-            CoverLoader.load(moreImage, pics[shown].url, cropThumb = false)
-            moreHost.addView(moreImage, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-            moreHost.addView(View(this).apply {
-                setBackgroundColor(0x66000000.toInt())
-            }, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-            moreHost.addView(TextView(this).apply {
-                text = "+$extraCount"
-                textSize = 20f
-                setTextColor(Color.WHITE)
-                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-                gravity = Gravity.CENTER
-                setShadowLayer(dp(4).toFloat(), 0f, dp(1).toFloat(), 0x99000000.toInt())
-            }, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-            imageRow.addView(moreHost, LinearLayout.LayoutParams(cardW, cardH).apply {
-                rightMargin = gap
-            })
-        }
-        return imageRow
-    }
-
-    /** One sub (in-floor) reply: small text line, name + content, collapsed to 2 lines. */
-    private fun buildSubCommentItem(sub: VideoComment): View {
-        val line = TextView(this).apply {
-            // Name stays slightly stronger so the preview is scannable; body is muted.
-            val span = android.text.SpannableStringBuilder()
-            val nameStart = span.length
-            span.append(sub.user)
-            span.setSpan(
-                android.text.style.ForegroundColorSpan(COLOR_INK),
-                nameStart, span.length,
-                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-            )
-            span.append("：")
-            span.append(commentSpannable(sub.content, sub.emotes))
-            text = span
-            textSize = 12.5f
-            setTextColor(COLOR_MUTED)
-            setLineSpacing(dpf(1.5f), 1f)
-            setPadding(0, dp(2), 0, dp(2))
-            // Preview rows are tappable via the parent floor; keep them non-selectable
-            // so a long-press does not steal the open-sheet gesture.
-            setTextIsSelectable(false)
-            // Long sub replies must not fill the floor: collapse them.
-            maxLines = 2
-            ellipsize = android.text.TextUtils.TruncateAt.END
-        }
-        attachEmoteSpans(line)
-        return line
-    }
-
-    /** Opens the reply bottom sheet: the root (楼主) comment on top, replies below. */
     private fun showReplySheet(root: VideoComment) {
-        if (root.id <= 0L) return
-        ReplySheetDialog(root).show()
+        val aid = currentDetail?.aid ?: 0L
+        if (root.id <= 0L || aid <= 0L) return
+        CommentSectionUi.ReplySheetDialog(
+            activity = this,
+            root = root,
+            targetOid = aid.toString(),
+            commentType = 1,
+            ownerMid = currentDetail?.ownerMid ?: 0L,
+            anchorTopProvider = {
+                val anchor = infoTabBarAnchor
+                if (anchor == null) dp(64) else {
+                    val pos = IntArray(2)
+                    anchor.getLocationOnScreen(pos)
+                    pos[1] + anchor.height
+                }
+            },
+            onFeedback = { msg -> showSnackbar(msg) }
+        ).show()
     }
 
-    /** Bottom sheet listing the root comment first, then its replies with full rows. */
-    private inner class ReplySheetDialog(private val root: VideoComment) : Dialog(this@VideoDetailActivity) {
-        private var page = 1
-        private var hasMore = true
-        private var loading = false
-        private var loadedRoot = false
-        private var hasReplyRows = false
-        private var pagesToLoad = 0
-        private var generation = 0
-        private var closing = false
-        private var panelHeightPx = 0
-        private var panelTopPx = 0
-        private var panelPositioned = false
-        private var openAnimationStarted = false
-        private lateinit var overlayView: FrameLayout
-        private val seenReplyIds = HashSet<Long>()
-        private lateinit var listBox: LinearLayout
-        private lateinit var scroll: ScrollView
-        private lateinit var panel: LinearLayout
-        private var skeletonBox: LinearLayout? = null
-        private var skeletonAnimator: ValueAnimator? = null
-        private var retryView: TextView? = null
-        private val sheetTopY: Int
-            get() {
-                val anchor = infoTabBarAnchor ?: return dp(64)
-                val pos = IntArray(2)
-                anchor.getLocationOnScreen(pos)
-                // The panel begins directly below the fixed 简介/评论 tab row.
-                return (pos[1] + anchor.height).coerceIn(0, resources.displayMetrics.heightPixels - dp(260))
-            }
-
-        private val sheetHeight: Int
-            get() = (resources.displayMetrics.heightPixels - sheetTopY)
-                .coerceAtLeast(dp(260))
-
-        init {
-            requestWindowFeature(Window.FEATURE_NO_TITLE)
-            setCancelable(false)
-            window?.setBackgroundDrawable(ColorDrawable(0x00000000))
-            window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+    private fun loadPlayer(quality: Int = effectiveQuality(), bypassCache: Boolean = false) {
+        if (playbackStopped) {
+            resumePlayerOnStart = true
+            return
         }
-
-        override fun onStart() {
-            super.onStart()
-            // The dialog itself is a transparent full-screen host; the panel is
-            // the only visible surface and is anchored to the physical bottom.
-            window?.setLayout(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT
-            )
-            window?.setGravity(Gravity.BOTTOM)
-            window?.setBackgroundDrawable(ColorDrawable(0x00000000))
-            window?.setWindowAnimations(0)
-            window?.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+        if (currentBvid.isBlank() || currentCid <= 0L) {
+            showError("无法获取视频信息，点这里重试")
+            return
         }
-
-        override fun onCreate(savedInstanceState: Bundle?) {
-            super.onCreate(savedInstanceState)
-            val overlay = FrameLayout(this@VideoDetailActivity).apply {
-                setBackgroundColor(0x2E000000)
-                setOnClickListener { dismissWithAnim() }
-            }
-            overlayView = overlay
-            panel = LinearLayout(this@VideoDetailActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                background = roundedTop(COLOR_BACKGROUND, dp(18))
-                // Keep the panel out of the first frame. It is positioned from
-                // its measured height below, then only translated upward.
-                visibility = View.INVISIBLE
-                translationY = 0f
-            }
-            // Header: title + close.
-            panel.addView(LinearLayout(this@VideoDetailActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(16), dp(12), dp(8), dp(6))
-                addView(TextView(this@VideoDetailActivity).apply {
-                    text = "全部回复 · ${root.replyCount}"
-                    textSize = 15f; typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-                    setTextColor(COLOR_INK)
-                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-                addView(TextView(this@VideoDetailActivity).apply {
-                    text = "✕"; textSize = 18f; setTextColor(COLOR_MUTED)
-                    setPadding(dp(12), dp(4), dp(12), dp(4))
-                    setOnClickListener { dismissWithAnim() }
-                })
-            }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-            scroll = ScrollView(this@VideoDetailActivity).apply {
-                isFillViewport = false
-                clipToPadding = false
-                overScrollMode = View.OVER_SCROLL_NEVER
-            }
-            listBox = LinearLayout(this@VideoDetailActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(14), 0, dp(14), dp(12))
-            }
-            scroll.addView(listBox, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
-            panel.addView(scroll, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
-            overlay.addView(panel, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, sheetHeight, Gravity.BOTTOM))
-            setContentView(overlay)
-            // Position the panel's top edge exactly below the fixed tab bar in
-            // the dialog coordinate space, then animate only translationY.
-            panel.post {
-                val screenHeight = resources.displayMetrics.heightPixels
-                val location = IntArray(2)
-                overlay.getLocationOnScreen(location)
-                val overlayTop = location[1]
-                val overlayHeight = overlay.height.coerceAtLeast(dp(260))
-                panelTopPx = (sheetTopY - overlayTop)
-                    .coerceIn(0, (overlayHeight - dp(260)).coerceAtLeast(0))
-                panelHeightPx = (overlayHeight - panelTopPx).coerceAtLeast(dp(260))
-                panel.layoutParams = (panel.layoutParams as FrameLayout.LayoutParams).apply {
-                    width = FrameLayout.LayoutParams.MATCH_PARENT
-                    height = panelHeightPx
-                    gravity = Gravity.TOP or Gravity.START
-                }
-                panel.translationY = (panelTopPx + panelHeightPx).toFloat()
-                panel.visibility = View.VISIBLE
-                panelPositioned = true
-                if (!openAnimationStarted) {
-                    openAnimationStarted = true
-                    panel.animate().translationY(panelTopPx.toFloat()).setDuration(220)
-                        .setInterpolator(DecelerateInterpolator()).start()
-                }
-            }
-            // Start the next pages before the user reaches the end. The loading
-            // state is represented by skeleton rows inside the list, never by a
-            // fixed "正在加载更多" footer.
-            scroll.setOnScrollChangeListener { _, _, scrollY, _, _ ->
-                val child = scroll.getChildAt(0) ?: return@setOnScrollChangeListener
-                if (scrollY >= child.height - scroll.height - dp(260)) {
-                    maybePreloadReplies()
-                }
-            }
-            loadReplies(maxPages = 2)
+        val session = BiliSessionStore.cookie()
+        if (streamSession != session) {
+            currentStream = null
+            playingStream = null
+            failedCodecTracks.clear()
         }
-
-        private fun loadReplies(maxPages: Int = 1) {
-            if (!hasMore) return
-            pagesToLoad = maxOf(pagesToLoad, maxPages.coerceIn(1, 2))
-            retryView?.let {
-                listBox.removeView(it)
-                retryView = null
-            }
-            showSkeleton()
-            if (!loading) requestNextReplyPage()
-        }
-
-        /** Requests pages serially so replies stay ordered and Bilibili is not hit concurrently. */
-        private fun requestNextReplyPage() {
-            if (loading || !hasMore || pagesToLoad <= 0) {
-                if (!loading) hideSkeleton()
-                return
-            }
-            loading = true
-            val requestGeneration = generation
-            val requestPage = page
-            val aid = currentDetail?.aid ?: 0L
-            BiliApi.fetchSubReplies(aid, root.id, requestPage) { list, next, error ->
-                if (isFinishing || isDestroyed || requestGeneration != generation) return@fetchSubReplies
-                loading = false
-                if (error != null) {
-                    pagesToLoad = 0
-                    hideSkeleton()
-                    showReplyRetry()
-                    return@fetchSubReplies
-                }
-                if (!loadedRoot) {
-                    loadedRoot = true
-                    listBox.addView(buildSheetRootItem(root), 0)
-                    listBox.addView(View(this@VideoDetailActivity).apply { setBackgroundColor(COLOR_BORDER) },
-                        1, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)).apply {
-                            topMargin = dp(10)
-                            bottomMargin = dp(4)
-                        })
-                }
-                list.forEach { sub ->
-                    if (sub.id <= 0L || !seenReplyIds.add(sub.id)) return@forEach
-                    val insertAt = skeletonBox?.let { listBox.indexOfChild(it) }
-                        ?.takeIf { it >= 0 } ?: listBox.childCount
-                    if (hasReplyRows) {
-                        listBox.addView(View(this@VideoDetailActivity).apply { setBackgroundColor(COLOR_BORDER) },
-                            insertAt, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)))
-                    }
-                    val rowInsertAt = skeletonBox?.let { listBox.indexOfChild(it) }
-                        ?.takeIf { it >= 0 } ?: listBox.childCount
-                    listBox.addView(buildSheetReplyItem(sub), rowInsertAt)
-                    hasReplyRows = true
-                }
-                hasMore = next > 0
-                page = if (next > 0) next else page + 1
-                pagesToLoad = (pagesToLoad - 1).coerceAtLeast(0)
-                if (hasMore && pagesToLoad > 0) {
-                    // Keep the skeleton visible between pages, then continue on
-                    // the main thread so rows are appended in API order.
-                    listBox.post { requestNextReplyPage() }
-                } else {
-                    hideSkeleton()
-                }
-            }
-        }
-
-        private fun maybePreloadReplies() {
-            if (hasMore) loadReplies(maxPages = 2)
-        }
-
-        /** Three compact placeholder rows act like a list skeleton, not a footer label. */
-        private fun showSkeleton() {
-            if (skeletonBox != null) return
-            val box = LinearLayout(this@VideoDetailActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(0, dp(6), 0, 0)
-            }
-            repeat(3) { index ->
-                box.addView(buildReplySkeletonItem(), LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, dp(64)).apply {
-                    if (index > 0) topMargin = dp(8)
-                })
-            }
-            skeletonBox = box
-            listBox.addView(box)
-            skeletonAnimator?.cancel()
-            skeletonAnimator = ValueAnimator.ofFloat(0.42f, 0.9f).apply {
-                duration = 760L
-                repeatMode = ValueAnimator.REVERSE
-                repeatCount = ValueAnimator.INFINITE
-                addUpdateListener { box.alpha = it.animatedValue as Float }
-                start()
-            }
-        }
-
-        private fun hideSkeleton() {
-            skeletonAnimator?.cancel()
-            skeletonAnimator = null
-            skeletonBox?.let { listBox.removeView(it) }
-            skeletonBox = null
-        }
-
-        private fun showReplyRetry() {
-            if (retryView != null) return
-            retryView = TextView(this@VideoDetailActivity).apply {
-                text = "加载失败，点击重试"
-                textSize = 12f
-                setTextColor(COLOR_MUTED)
-                gravity = Gravity.CENTER
-                setPadding(0, dp(12), 0, dp(16))
-                setOnClickListener {
-                    listBox.removeView(this)
-                    retryView = null
-                    loadReplies(maxPages = 1)
-                }
-            }
-            listBox.addView(retryView)
-        }
-
-        /** A single row with avatar/name/content bars for the in-list loading effect. */
-        private fun buildReplySkeletonItem(): View {
-            val row = LinearLayout(this@VideoDetailActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.TOP
-                background = rounded(COLOR_SOFT_FILL, dp(10))
-                setPadding(dp(10), dp(10), dp(10), dp(10))
-            }
-            val avatar = View(this@VideoDetailActivity).apply {
-                background = rounded(COLOR_SOFT_FILL_STRONG, dp(18))
-            }
-            row.addView(avatar, LinearLayout.LayoutParams(dp(30), dp(30)))
-            val bars = LinearLayout(this@VideoDetailActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(10), 0, dp(22), 0)
-                addView(View(this@VideoDetailActivity).apply {
-                    background = rounded(COLOR_SOFT_FILL_STRONG, dp(5))
-                }, LinearLayout.LayoutParams(dp(92), dp(10)))
-                addView(View(this@VideoDetailActivity).apply {
-                    background = rounded(COLOR_SOFT_FILL, dp(5))
-                }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(10)).apply {
-                    topMargin = dp(9)
-                })
-                addView(View(this@VideoDetailActivity).apply {
-                    background = rounded(COLOR_SOFT_FILL, dp(5))
-                }, LinearLayout.LayoutParams(dp(150), dp(10)).apply {
-                    topMargin = dp(7)
-                })
-            }
-            row.addView(bars, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
-            return row
-        }
-
-        /** Root comment row: avatar, name + 楼主 tag, time, body, like. */
-        private fun buildSheetRootItem(comment: VideoComment): View {
-            return buildSheetItem(comment, 36, showRootTag = true, reply = false)
-        }
-
-        /** One reply row inside the sheet: indented, tinted, smaller avatar. */
-        private fun buildSheetReplyItem(comment: VideoComment): View {
-            return buildSheetItem(comment, 30, showRootTag = false, reply = true)
-        }
-
-        private fun buildSheetItem(comment: VideoComment, avatarSize: Int, showRootTag: Boolean, reply: Boolean): View {
-            val row = LinearLayout(this@VideoDetailActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.TOP
-                if (reply) {
-                    // Replies sit on a soft tinted block, slightly indented, so the
-                    // root comment (楼主) visually stands apart from the in-floor ones.
-                    background = rounded(
-                        (COLOR_MUTED and 0x00FFFFFF.toInt()) or 0x14000000.toInt(), dp(10))
-                    setPadding(dp(10), dp(8), dp(10), dp(8))
-                } else {
-                    setPadding(0, dp(8), 0, dp(8))
-                }
-            }
-            val avatar = RoundImageView(this@VideoDetailActivity).apply { setBackgroundColor(COLOR_COVER) }
-            if (comment.avatar.isNotBlank()) {
-                CoverLoader.load(avatar, comment.avatar + "@52w_52h_1c.webp")
-            }
-            row.addView(avatar, LinearLayout.LayoutParams(dp(avatarSize), dp(avatarSize)))
-            val body = LinearLayout(this@VideoDetailActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(10), 0, 0, 0)
-            }
-            val nameLine = LinearLayout(this@VideoDetailActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            nameLine.addView(TextView(this@VideoDetailActivity).apply {
-                text = comment.user
-                textSize = 13f; typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-                setTextColor(if (reply) COLOR_MUTED else COLOR_INK)
-            }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-            if (showRootTag) {
-                nameLine.addView(TextView(this@VideoDetailActivity).apply {
-                    text = "楼主"
-                    textSize = 10f; setTextColor(COLOR_ON_ROSE)
-                    background = rounded(COLOR_ROSE, dp(8))
-                    gravity = Gravity.CENTER
-                    setPadding(dp(6), dp(1), dp(6), dp(1))
-                }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                    leftMargin = dp(6)
-                })
-            }
-            body.addView(nameLine, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-            body.addView(TextView(this@VideoDetailActivity).apply {
-                text = formatCommentTime(comment.publishedAt)
-                textSize = 11f; setTextColor(COLOR_MUTED)
-                setPadding(0, dp(3), 0, 0)
-            }, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-            body.addView(
-                buildExpandableCommentText(comment.content, comment.emotes, textSizeSp = 14f),
-                LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-            )
-            if (comment.pictures.isNotEmpty()) {
-                body.addView(buildPicturesRow(comment.pictures), LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-            }
-            body.addView(LikeButton(this@VideoDetailActivity, comment), LinearLayout.LayoutParams(dp(64), dp(26)).apply {
-                topMargin = dp(7)
-            })
-            row.addView(body, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            return row
-        }
-
-        private fun dismissWithAnim() {
-            if (!isShowing || closing) return
-            closing = true
-            generation++
-            pagesToLoad = 0
-            hideSkeleton()
-            panel.animate().translationY((panelTopPx + panelHeightPx).toFloat()).setDuration(180)
-                .setInterpolator(AccelerateInterpolator())
-                .withEndAction { dismiss() }.start()
-        }
-
-        override fun onStop() {
-            generation++
-            pagesToLoad = 0
-            if (::listBox.isInitialized) hideSkeleton()
-            super.onStop()
-        }
-
-        override fun onBackPressed() {
-            dismissWithAnim()
-        }
-    }
-
-    /** Fullscreen image viewer with a translucent download button (static + animated). */
-    private fun showImagesDialog(urls: List<String>, startIndex: Int) {
-        val images = urls.filter { it.isNotBlank() }.distinct()
-        if (images.isEmpty()) return
-        var current = startIndex.coerceIn(0, images.size - 1)
-        var animating = false
-        val dialog = Dialog(this)
-        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
-        val root = FrameLayout(this).apply {
-            setBackgroundColor(0xE6000000.toInt())
-        }
-        val slots = ArrayList<ZoomableImageView>(3).apply {
-            repeat(3) { add(ZoomableImageView(this@VideoDetailActivity)) }
-        }
-        fun rotateSlotWindow(direction: Int) {
-            if (direction > 0) {
-                // Left swipe: the old next slot is the new current slot.
-                slots.add(slots.removeAt(0))
-            } else if (direction < 0) {
-                // Right swipe: the old previous slot is the new current slot.
-                slots.add(0, slots.removeAt(slots.lastIndex))
-            }
-        }
-        var appliedDelta = 0f
-        // Picture counter, e.g. "2/4", bottom centre.
-        val counter = TextView(this).apply {
-            textSize = 13f; setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setPadding(dp(14), dp(6), dp(14), dp(6))
-            background = rounded(0x66000000.toInt(), dp(14))
-        }
-        lateinit var renderPage: () -> Unit
-        slots.forEach { slot ->
-            root.addView(slot, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-            slot.visibility = View.GONE
-            // Drag follows the finger; release decides flip vs bounce-back.
-            slot.onPagerDrag = { delta ->
-                val w = root.width.toFloat().coerceAtLeast(1f)
-                // Edge pages: dragging towards the empty side gets a springy
-                // resistance instead of revealing a blank page.
-                val limited = when {
-                    current == 0 && delta > 0f -> delta * 0.28f
-                    current == images.size - 1 && delta < 0f -> delta * 0.28f
-                    else -> delta
-                }
-                appliedDelta = limited
-                slots.forEachIndexed { i, s ->
-                    s.translationX = (i - 1) * w + limited
-                }
-            }
-            slot.onPagerRelease = { delta, velocityX ->
-                if (!animating) {
-                    val w = root.width.toFloat().coerceAtLeast(1f)
-                    // Light swipe: 10% of the screen width, or a quick flick
-                    // (velocity-based) flips the page like the feed pager.
-                    // Clamped to the picture range: 0/2 and 3/2 must never exist.
-                    val next = when {
-                        delta < -w * 0.10f || (velocityX < -500f && delta < 0f) -> (current + 1).coerceAtMost(images.size - 1)
-                        delta > w * 0.10f || (velocityX > 500f && delta > 0f) -> (current - 1).coerceAtLeast(0)
-                        else -> current
-                    }
-                    val target = when {
-                        next > current -> -w
-                        next < current -> w
-                        else -> 0f
-                    }
-                    animating = true
-                    val startDelta = when {
-                        current == 0 && delta > 0f -> delta * 0.28f
-                        current == images.size - 1 && delta < 0f -> delta * 0.28f
-                        else -> delta
-                    }
-                    val anim = ValueAnimator.ofFloat(startDelta, target)
-                    anim.duration = 200
-                    anim.interpolator = DecelerateInterpolator()
-                    anim.addUpdateListener {
-                        val v = it.animatedValue as Float
-                        slots.forEachIndexed { i, s -> s.translationX = (i - 1) * w + v }
-                    }
-                    var settled = false
-                    fun settle() {
-                        if (settled) return
-                        settled = true
-                        if (next != current) {
-                            val direction = if (next > current) 1 else -1
-                            current = next
-                            rotateSlotWindow(direction)
-                        }
-                        renderPage()
-                        animating = false
-                    }
-                    anim.addListener(object : Animator.AnimatorListener {
-                        override fun onAnimationStart(animation: Animator) {}
-                        override fun onAnimationRepeat(animation: Animator) {}
-                        override fun onAnimationCancel(animation: Animator) = settle()
-                        override fun onAnimationEnd(animation: Animator) = settle()
-                    })
-                    anim.start()
-                }
-            }
-        }
-        renderPage = {
-            val w = root.width.toFloat().coerceAtLeast(1f)
-            listOf(current - 1, current, current + 1).forEachIndexed { slotIdx, imageIndex ->
-                val slot = slots[slotIdx]
-                // Slot anchors: previous page sits one width left, next page
-                // one width right, so drag/flip animations look like a pager.
-                slot.translationX = (slotIdx - 1) * w
-                if (imageIndex in images.indices) {
-                    // Centre page plays; neighbours stay VISIBLE for swipe but
-                    // animate=false freezes their GIF loop so only one Movie
-                    // burns CPU at a time.
-                    slot.visibility = View.VISIBLE
-                    CoverLoader.load(
-                        slot,
-                        images[imageIndex].substringBefore('@'),
-                        original = true,
-                        clearBeforeLoad = false,
-                        animate = slotIdx == 1
-                    )
-                    if (slotIdx == 1) {
-                        slot.invalidate()
-                        slot.drawable?.invalidateSelf()
-                    }
-                } else {
-                    slot.visibility = View.GONE
-                }
-            }
-            counter.text = "${current + 1}/${images.size}"
-        }
-        root.addView(counter, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-            bottomMargin = dp(28)
-        })
-        // Save to system gallery, top-right corner.
-        val save = TextView(this).apply {
-            text = "存相册"
-            textSize = 13f; setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setPadding(dp(14), dp(8), dp(14), dp(8))
-            background = rounded(0x66000000.toInt(), dp(18))
-            isClickable = true
-            setOnClickListener { downloadImage(images[current].substringBefore('@')) }
-        }
-        root.addView(save, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP or Gravity.END).apply {
-            topMargin = dp(16); rightMargin = dp(16)
-        })
-        val close = TextView(this).apply {
-            text = "×"
-            textSize = 16f; setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setPadding(dp(10), dp(6), dp(10), dp(6))
-            background = rounded(0x66000000.toInt(), dp(16))
-            isClickable = true
-            setOnClickListener { dialog.dismiss() }
-        }
-        root.addView(close, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP or Gravity.START).apply {
-            topMargin = dp(16); leftMargin = dp(16)
-        })
-        dialog.setContentView(root)
-        dialog.window?.setLayout(
-            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
-        dialog.window?.setBackgroundDrawable(ColorDrawable(0x00000000))
-        dialog.show()
-        root.alpha = 0f
-        root.animate().alpha(1f).setDuration(200).start()
-        // Must wait for the dialog to lay out: right after show() the root
-        // width is still 0, and a 0-width pager stacks all three slots at the
-        // origin with the LAST slot (current+1) on top - which is exactly why
-        // tapping picture 1 opened picture 2.
-        root.post { renderPage() }
-    }
-
-    /**
-     * Fullscreen image viewer with pinch-zoom, pan and double-tap.
-     *
-     * Rewritten with the battle-tested PhotoView algorithm:
-     * - the image is loaded as a static BitmapDrawable, so dimensions always
-     *   come from the bitmap itself (never the unreliable intrinsic of
-     *   AnimatedImageDrawable which caused "zoomed into the centre").
-     * - min/max scale are derived from the fit scale, not hardcoded.
-     * - fit is (re)applied when the drawable arrives and when the view is
-     *   laid out, whichever comes last.
-     */
-    private inner class ZoomableImageView(context: Context) : ImageView(context) {
-        private val baseMatrix = Matrix()
-        private val matrix = Matrix()
-        private var minScale = 1f
-        private var maxScale = 5f
-
-        private val scaleDetector = ScaleGestureDetector(context,
-            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
-                override fun onScale(detector: ScaleGestureDetector): Boolean {
-                    var factor = detector.scaleFactor
-                    val next = currentScale * factor
-                    if (next > maxScale) factor = maxScale / currentScale
-                    if (next < minScale) factor = minScale / currentScale
-                    matrix.postScale(factor, factor, detector.focusX, detector.focusY)
-                    clampMatrix()
-                    imageMatrix = matrix
-                    return true
-                }
-            })
-
-        private val tapDetector = GestureDetector(context,
-            object : GestureDetector.SimpleOnGestureListener() {
-                override fun onDoubleTap(e: MotionEvent): Boolean {
-                    if (currentScale > minScale * 1.2f) resetToFit() else zoomTo(minScale * 2.5f, e.x, e.y)
-                    return true
-                }
-                override fun onScroll(e1: MotionEvent?, e2: MotionEvent,
-                                      distanceX: Float, distanceY: Float): Boolean {
-                    if (scaleDetector.isInProgress) return false
-                    // Zoomed in: pan the image. (Fit-state paging is handled
-                    // directly in onTouchEvent so the drag stays under the finger.)
-                    if (currentScale > minScale * 1.05f) {
-                        matrix.postTranslate(-distanceX, -distanceY)
-                        clampMatrix()
-                        imageMatrix = matrix
-                        return true
-                    }
-                    return false
-                }
-            })
-
-        /** Pager hooks used by the multi-image viewer (fit state horizontal drags). */
-        var onPagerDrag: ((Float) -> Unit)? = null
-        var onPagerRelease: ((delta: Float, velocityX: Float) -> Unit)? = null
-        private var pagerMode = 0 // 0 undecided, 1 horizontal drag, 2 other
-        private var downX = 0f
-        private var downY = 0f
-        private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
-        private val velocityTracker = VelocityTracker.obtain()
-
-        private val currentScale: Float
-            get() {
-                val v = FloatArray(9)
-                matrix.getValues(v)
-                return v[Matrix.MSCALE_X]
-            }
-
-        init {
-            scaleType = ImageView.ScaleType.MATRIX
-            isClickable = true
-        }
-
-        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-            super.onSizeChanged(w, h, oldw, oldh)
-            if (drawable != null) resetToFit()
-        }
-
-        override fun setImageDrawable(drawable: Drawable?) {
-            super.setImageDrawable(drawable)
-            if (drawable != null) resetToFit()
-        }
-
-        private fun imageWidth(): Float =
-            (drawable as? BitmapDrawable)?.bitmap?.width?.toFloat()
-                ?: drawable?.intrinsicWidth?.toFloat() ?: 0f
-
-        private fun imageHeight(): Float =
-            (drawable as? BitmapDrawable)?.bitmap?.height?.toFloat()
-                ?: drawable?.intrinsicHeight?.toFloat() ?: 0f
-
-        private fun resetToFit() {
-            if (width == 0 || height == 0) {
-                // View not laid out yet; retry after layout.
-                post { resetToFit() }
-                return
-            }
-            val vw = width.toFloat()
-            val vh = height.toFloat()
-            val dw = imageWidth()
-            val dh = imageHeight()
-            if (dw <= 0f || dh <= 0f) return // retried from onSizeChanged
-            val fit = minOf(vw / dw, vh / dh)
-            minScale = fit
-            maxScale = maxOf(fit * 5f, 2f)
-            baseMatrix.reset()
-            baseMatrix.postScale(fit, fit)
-            baseMatrix.postTranslate((vw - dw * fit) / 2f, (vh - dh * fit) / 2f)
-            matrix.set(baseMatrix)
-            imageMatrix = matrix
-        }
-
-        private fun zoomTo(target: Float, fx: Float, fy: Float) {
-            val factor = target / currentScale
-            matrix.postScale(factor, factor, fx, fy)
-            clampMatrix()
-            imageMatrix = matrix
-        }
-
-        override fun onDetachedFromWindow() {
-            super.onDetachedFromWindow()
-            velocityTracker.recycle()
-        }
-
-        private fun clampMatrix() {
-            val vw = width.toFloat().coerceAtLeast(1f)
-            val vh = height.toFloat().coerceAtLeast(1f)
-            val v = FloatArray(9)
-            matrix.getValues(v)
-            val dw = imageWidth() * v[Matrix.MSCALE_X]
-            val dh = imageHeight() * v[Matrix.MSCALE_Y]
-            v[Matrix.MTRANS_X] = if (dw <= vw) (vw - dw) / 2f
-            else v[Matrix.MTRANS_X].coerceIn(vw - dw, 0f)
-            v[Matrix.MTRANS_Y] = if (dh <= vh) (vh - dh) / 2f
-            else v[Matrix.MTRANS_Y].coerceIn(vh - dh, 0f)
-            matrix.setValues(v)
-        }
-
-        override fun onTouchEvent(event: MotionEvent): Boolean {
-            velocityTracker.addMovement(event)
-            // Fit state: track single-finger drags directly so the picture
-            // follows the finger; release flips the page or bounces back.
-            if (!scaleDetector.isInProgress && currentScale <= minScale * 1.05f) {
-                when (event.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> {
-                        pagerMode = 0
-                        downX = event.x
-                        downY = event.y
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        if (pagerMode == 0) {
-                            val dx = event.x - downX
-                            val dy = event.y - downY
-                            if (Math.abs(dx) > touchSlop && Math.abs(dx) > Math.abs(dy) * 1.5f) {
-                                pagerMode = 1
-                            } else if (Math.abs(dy) > touchSlop) {
-                                pagerMode = 2
-                            }
-                        }
-                        if (pagerMode == 1) {
-                            onPagerDrag?.invoke(event.x - downX)
-                            return true
-                        }
-                    }
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                        if (pagerMode == 1) {
-                            velocityTracker.computeCurrentVelocity(1000)
-                            onPagerRelease?.invoke(event.x - downX, velocityTracker.xVelocity)
-                            pagerMode = 0
-                            return true
-                        }
-                        pagerMode = 0
-                    }
-                }
-            }
-            scaleDetector.onTouchEvent(event)
-            tapDetector.onTouchEvent(event)
-            return super.onTouchEvent(event)
-        }
-    }
-
-    private inner class EmoteImageSpan(
-        private val url: String,
-        private val sizePx: Int
-    ) : ReplacementSpan() {
-        private var drawable: Drawable? = null
-        private var loading = false
-
-        fun attach(tv: TextView) {
-            if (drawable != null || loading) return
-            loading = true
-            EMOTE_POOL.execute {
-                try {
-                    // Bilibili emote URLs sometimes already carry a CDN size
-                    // suffix ("@..."); appending another one would 404.
-                    val loadUrl = if (url.contains("@")) url else "$url@48w_48h"
-                    val bytes = fetchBytes(loadUrl) ?: return@execute
-                    val bmp = decodeEmote(bytes)
-                    if (bmp == null) {
-                        Log.w("YuiBili", "emote decode failed: $loadUrl")
-                        return@execute
-                    }
-                    val d = BitmapDrawable(resources, bmp)
-                    d.setBounds(0, 0, sizePx, sizePx)
-                    runOnUiThread {
-                        drawable = d
-                        // requestLayout forces a full measure/layout/draw pass;
-                        // a bare invalidate() can be swallowed while the
-                        // TextView is mid-layout, which is why emotes only
-                        // appeared after returning from the task switcher.
-                        tv.requestLayout()
-                        tv.invalidate()
-                    }
-                } catch (error: Exception) {
-                    Log.w("YuiBili", "emote load failed: $url -> ${error.message}")
-                }
-            }
-        }
-
-        private fun fetchBytes(loadUrl: String): ByteArray? {
-            val connection = URL(loadUrl).openConnection() as HttpURLConnection
-            try {
-                connection.connectTimeout = 8000
-                connection.readTimeout = 8000
-                connection.instanceFollowRedirects = true
-                connection.setRequestProperty("User-Agent", NETWORK_USER_AGENT)
-                connection.setRequestProperty("Referer", "https://www.bilibili.com/")
-                connection.connect()
-                if (connection.responseCode !in 200..299) return null
-                return connection.inputStream.use { it.readBytes() }
-            } finally {
-                connection.disconnect()
-            }
-        }
-
-        /** Decodes static frames; animated webp/gif fall back to the first
-         *  frame via ImageDecoder (BitmapFactory returns null for them). */
-        private fun decodeEmote(bytes: ByteArray): Bitmap? {
-            if (Build.VERSION.SDK_INT >= 28) {
-                try {
-                    val source = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
-                    return ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
-                        decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-                    }
-                } catch (_: Exception) {
-                    // fall through to BitmapFactory
-                }
-            }
-            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        }
-
-        override fun getSize(paint: Paint, text: CharSequence?, start: Int, end: Int, fm: FontMetricsInt?): Int {
-            if (fm != null) {
-                val lineH = fm.descent - fm.ascent
-                if (sizePx > lineH) {
-                    val extra = sizePx - lineH
-                    fm.ascent -= extra / 2
-                    fm.descent += extra - extra / 2
-                }
-            }
-            return sizePx
-        }
-
-        override fun draw(
-            canvas: Canvas, text: CharSequence?, start: Int, end: Int,
-            x: Float, top: Int, y: Int, bottom: Int, paint: Paint
-        ) {
-            val d = drawable ?: return
-            val cy = (top + bottom) / 2f
-            canvas.save()
-            canvas.translate(x, cy - sizePx / 2f)
-            d.draw(canvas)
-            canvas.restore()
-        }
-    }
-
-    /** Replaces emote codes in [content] with inline image spans (text flow preserved). */
-    private fun commentSpannable(content: String, emotes: Map<String, String>): SpannableString {
-        val spannable = SpannableString(content)
-        if (emotes.isEmpty()) return spannable
-        val sizePx = dp(18)
-        emotes.forEach { (code, url) ->
-            if (code.isBlank() || url.isBlank()) return@forEach
-            var index = content.indexOf(code)
-            while (index >= 0) {
-                spannable.setSpan(
-                    EmoteImageSpan(url, sizePx), index, index + code.length,
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                )
-                index = content.indexOf(code, index + code.length)
-            }
-        }
-        return spannable
-    }
-
-    /** Starts async loading for every inline emote span of a TextView. */
-    private fun attachEmoteSpans(tv: TextView) {
-        val spanned = tv.text as? Spanned ?: return
-        spanned.getSpans(0, spanned.length, EmoteImageSpan::class.java).forEach { it.attach(tv) }
-    }
-
-    /** Save the image to the gallery (MediaStore on API 29+, legacy path below). */
-    private fun downloadImage(url: String) {
-        if (url.isBlank()) return
-        Thread {
-            try {
-                val connection = (URL(url).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 12_000
-                    readTimeout = 15_000
-                    setRequestProperty("User-Agent", NETWORK_USER_AGENT)
-                    setRequestProperty("Referer", "https://www.bilibili.com/")
-                }
-                val bytes = connection.inputStream.use { it.readBytes() }
-                val extension = url.substringAfterLast('.', "png").substringBefore('?').take(4)
-                val fileName = "yuibili_${System.currentTimeMillis()}.$extension"
-                val saved = if (android.os.Build.VERSION.SDK_INT >= 29) {
-                    val resolver = contentResolver
-                    val values = android.content.ContentValues().apply {
-                        put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                        put(MediaStore.Images.Media.MIME_TYPE,
-                            if (extension == "gif") "image/gif" else "image/webp")
-                        put(MediaStore.Images.Media.RELATIVE_PATH,
-                            android.os.Environment.DIRECTORY_PICTURES + "/YuiBili")
-                    }
-                    val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                    if (uri != null) {
-                        resolver.openOutputStream(uri)?.use { it.write(bytes) }
-                        true
-                    } else false
-                } else {
-                    val dir = android.os.Environment.getExternalStoragePublicDirectory(
-                        android.os.Environment.DIRECTORY_PICTURES)
-                    val file = java.io.File(dir, fileName)
-                    file.parentFile?.mkdirs()
-                    file.writeBytes(bytes)
-                    true
-                }
-                runOnUiThread {
-                    showSnackbar(if (saved) "已保存到相册（Pictures/YuiBili）" else "保存失败")
-                }
-            } catch (error: Exception) {
-                runOnUiThread { showSnackbar("下载失败：${error.message ?: "网络错误"}") }
-            }
-        }.start()
-    }
-
-    private fun formatCommentTime(epochSeconds: Long): String {
-        if (epochSeconds <= 0L) return "时间未知"
-        val date = Date(epochSeconds * 1000L)
-        val now = System.currentTimeMillis()
-        val diff = now - date.time
-        return when {
-            diff < 60_000L -> "刚刚"
-            diff < 3_600_000L -> "${diff / 60_000L}分钟前"
-            diff < 86_400_000L -> "${diff / 3_600_000L}小时前"
-            diff < 7L * 86_400_000L -> "${diff / 86_400_000L}天前"
-            else -> SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(date)
-        }
-    }
-
-    private fun loadPlayer() {
-        val generation = ++playbackGeneration
-        retryScheduled = false
-        exoPlayer?.let { old ->
-            pendingResumePositionMs = maxOf(pendingResumePositionMs, playerGlobalPosition(old))
-            playerView.player = null
-            exoPlayer = null
-            old.release()
-        }
-        playerSpinner.visibility = View.VISIBLE
-        playerError.visibility = View.GONE
-        if (currentCid <= 0L) { showError("无法获取视频信息，点这里重试"); return }
-        BiliPlayUrl.fetchPlayUrl(currentBvid, currentCid, effectiveQuality()) { stream, error ->
-            if (isFinishing || isDestroyed || generation != playbackGeneration) return@fetchPlayUrl
+        val generation = beginPlaybackChange()
+        bindDanmakuForCurrentMedia()
+        lastRequestedQuality = quality
+        playbackRequest = BiliPlayUrl.fetchPlayUrlDetailed(
+            currentBvid,
+            currentCid,
+            quality,
+            allowProgressiveFallback = true,
+            bypassCache = bypassCache
+        ) { stream, error, permissionDenied ->
             handler.post {
-                if (generation != playbackGeneration) return@post
-                val chargeOnly = currentDetail?.charge == true
-                if (stream != null) {
-                    startExoPlayer(stream, generation)
-                    // 充电/付费视频：未解锁时 playurl 只给试看时长。rights 字段可能因
-                    // 接口版本差异取不到，因此同时用“流时长明显小于视频总时长”兜底判断。
-                    val totalMs = (currentDetail?.duration ?: 0).toLong() * 1000L
-                    val looksPreview = stream.durationMs > 0L && totalMs > 0L &&
-                        stream.durationMs < totalMs * 6 / 10
-                    if (chargeOnly || looksPreview) {
-                        showSnackbar("该视频为充电/付费视频，当前仅可试看部分内容，解锁后可在 B 站客户端完整观看")
-                    }
-                } else {
-                    val err = error ?: "未知错误"
-                    val lockedHint = chargeOnly || err.contains("充电") || err.contains("付费") ||
-                        err.contains("大会员") || err.contains("权限")
-                    if (lockedHint) {
-                        showError("该视频为充电/付费视频，未解锁无法播放：$err\n\n点这里重试")
-                    } else {
-                        showError("播放失败：$err\n\n点这里重试")
-                    }
+                if (!canUsePlayback(generation)) return@post
+                playbackRequest = null
+                if (session != BiliSessionStore.cookie()) {
+                    loadPlayer(quality = effectiveQuality(), bypassCache = true)
+                    return@post
                 }
+                if (stream == null) {
+                    val message = error ?: "未知错误"
+                    val paywalled = currentDetail?.charge == true || permissionDenied
+                    showError(if (paywalled) "该视频需要登录或大会员权限：$message\n\n点这里重试"
+                        else "播放失败：$message\n\n点这里重试")
+                    return@post
+                }
+                currentStream = stream
+                streamSession = session
+                streamLoadedAt = SystemClock.elapsedRealtime()
+                val selected = selectStableStream(stream, quality)
+                val targetId = selected.videoTracks.firstOrNull()?.id ?: selected.actualQuality
+                if (stream.isDash && quality > BiliPlayUrl.QUALITY_720 && targetId < quality &&
+                    quality in stream.acceptedQualities
+                ) {
+                    val hint = if (quality >= BiliPlayUrl.QUALITY_1080_PLUS && !BiliSessionStore.isBigVip()) {
+                        "${qualityName(quality)}需要大会员权限，已切换为${qualityName(targetId)}"
+                    } else {
+                        "未获取到${qualityName(quality)}视频流，当前播放${qualityName(targetId)}"
+                    }
+                    showSnackbar(hint)
+                }
+                startExoPlayer(selected, generation)
+                showPreviewNotice(stream)
             }
         }
     }
 
-    private fun startExoPlayer(stream: BiliPlayUrl.DashStream, generation: Int = playbackGeneration) {
-        if (generation != playbackGeneration || isFinishing || isDestroyed) return
-        currentStream = stream
-        playerView.player = null
-        exoPlayer?.release(); exoPlayer = null
-        val okClient = mediaOkClient
+    private fun beginPlaybackChange(): Int {
+        val generation = ++playbackGeneration
+        playbackRequest?.cancel()
+        playbackRequest = null
+        // 切集时不能把上一集的位置带到新分集，否则新视频会直接 seek 到结尾
+        if (!switchingLocalTask) rememberPlaybackPosition()
+        stopPlayerSource()
+        retryScheduled = false
         playerSpinner.visibility = View.VISIBLE
         playerError.visibility = View.GONE
+        return generation
+    }
 
-        // Do not probe every CDN/quality before playback. That approach adds several
-        // round trips, can pick a random lower quality, and makes first frame slow.
-        // Keep one requested compatible track and let Media3 use its CDN backups.
-        val selected = selectStableStream(stream)
-        handler.post {
-            if (generation == playbackGeneration && !isFinishing && !isDestroyed) {
-                doStartExoPlayer(selected, okClient, generation)
-            }
+    private fun rememberPlaybackPosition() {
+        val player = exoPlayer ?: return
+        if (playerListener == null || player.mediaItemCount == 0) return
+        val current = playerGlobalPosition(player)
+        if (player.playbackState == Player.STATE_READY || pendingResumePositionMs == 0L || current > 0L) {
+            pendingResumePositionMs = current
+        }
+        resumeSegmentIndex = if (segmentTimeline.durationMs == 0L) player.currentMediaItemIndex else 0
+        restoreEndedState = restoreEndedState || endedState
+    }
+
+    private fun stopPlayerSource() {
+        handler.removeCallbacks(progressUpdater)
+        handler.removeCallbacks(historyTick)
+        cancelLongPressBoost()
+        exoPlayer?.let { player ->
+            playerListener?.let(player::removeListener)
+            player.pause()
+            player.stop()
+            player.clearMediaItems()
+        }
+        playerListener = null
+    }
+
+    private fun canUsePlayback(generation: Int): Boolean =
+        generation == playbackGeneration && !playbackStopped && !isFinishing && !isDestroyed
+
+    private fun startExoPlayer(stream: BiliPlayUrl.DashStream, generation: Int) {
+        if (!canUsePlayback(generation)) return
+        val sources = try {
+            OnlinePlaybackSource.create(stream)
+        } catch (e: Exception) {
+            showError("播放地址无效：${e.message ?: "未知错误"}\n\n点这里重试")
+            return
+        }
+        playingStream = stream
+        segmentTimeline = PlaybackTimeline(stream.durlSegments.map { it.lengthMs }, stream.durationMs)
+        bindPlayerSource(sources, generation)
+    }
+
+    private fun showPreviewNotice(stream: BiliPlayUrl.DashStream) {
+        val item = currentDetail ?: return
+        if (playPreviewNoticeShown) return
+        val looksPreview = stream.durationMs > 0L && item.duration > 0 && stream.durationMs < item.duration * 600L
+        if (item.charge || looksPreview) {
+            playPreviewNoticeShown = true
+            showSnackbar("该视频为充电/付费视频，当前仅可试看部分内容，解锁后可在 B 站客户端完整观看")
         }
     }
 
-    private fun selectStableStream(stream: BiliPlayUrl.DashStream): BiliPlayUrl.DashStream {
-        if (!stream.isDash) return stream
-        val effective = effectiveQuality()
-        val requestedOrLower = stream.videoTracks
-            .filter { it.id <= effective }
-            .ifEmpty { stream.videoTracks }
-        val selectedQuality = requestedOrLower.maxOfOrNull { it.id }
-            ?: stream.videoTracks.maxOfOrNull { it.id }
-        val qualityTracks = requestedOrLower.filter { it.id == selectedQuality }
-        // AVC/H.264 is the widest hardware-compatible format on Android 6+; only
-        // use HEVC/AV1 when Bilibili did not return AVC for the selected quality.
-        val video = qualityTracks.minWithOrNull(
-            compareBy<BiliPlayUrl.DashVideoTrack> { codecStabilityRank(it.codecs) }
-                .thenByDescending { it.bandwidth }
-        ) ?: stream.videoTracks.first()
-        val audio = stream.audioTracks
-            .filter { it.codecs.startsWith("mp4a", true) }
-            .maxByOrNull { it.bandwidth }
-            ?: stream.audioTracks.maxByOrNull { it.bandwidth }
-        Log.i("YuiBiliPlayer", "stable-select video=${video.id}/${video.codecs}, audio=${audio?.id}")
-        return stream.copy(
-            videoTracks = listOf(video),
-            audioTracks = listOfNotNull(audio),
-            actualQuality = video.id
-        )
-    }
-
-    private fun codecStabilityRank(codec: String): Int = when {
-        codec.startsWith("avc", true) -> 0
-        codec.startsWith("hev", true) || codec.startsWith("hvc", true) -> 1
-        codec.startsWith("av01", true) -> 2
-        else -> 3
+    private fun selectStableStream(stream: BiliPlayUrl.DashStream, effective: Int): BiliPlayUrl.DashStream {
+        val selected = BiliPlayUrl.selectDashStreamTrack(stream, effective, failedCodecTracks)
+        val video = selected.videoTracks.firstOrNull()
+        val audio = selected.audioTracks.firstOrNull()
+        if (video != null) {
+            Log.i(
+                "YuiBiliPlayer",
+                "stable-select req=$effective video=${video.id}/${video.width}x${video.height}/${video.codecs}/bw=${video.bandwidth}, audio=${audio?.id}"
+            )
+        }
+        return selected
     }
 
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
-    private fun doStartExoPlayer(
-        stream: BiliPlayUrl.DashStream,
-        okClient: OkHttpClient,
-        generation: Int
-    ) {
-        if (generation != playbackGeneration || isFinishing || isDestroyed) return
-        playingStream = stream
-        // Fresh playback: clear ended/replay and boost state from any previous player.
-        endedState = false
-        playPauseBtn.setEnded(false)
-        showReplay(false)
-        cancelLongPressBoost()
-        val mediaSource = buildMediaSource(stream, okClient)
-        // Keep enough data for weak mobile networks without caching the whole video.
-        // Start quickly, but require a healthier buffer after a rebuffer to stop the
-        // repeated play/pause loop users experience as "playing slowly".
-        val renderersFactory = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
-        val player = ExoPlayer.Builder(this, renderersFactory)
-            .setLoadControl(
-                DefaultLoadControl.Builder()
-                    // Deep buffering for long videos: short clips used to fit
-                    // entirely inside the old 12s/45s window while long ones
-                    // starved between refills. Start playback after 5s, keep
-                    // downloading until 90s (or 64MB) buffered, then refill
-                    // when it drops below 30s. Rebuffer waits for 10s.
-                    .setBufferDurationsMs(30_000, 90_000, 5_000, 10_000)
-                    .setTargetBufferBytes(64 * 1024 * 1024)
-                    .setBackBuffer(8_000, false)
-                    .setPrioritizeTimeOverSizeThresholds(true)
-                    .build()
-            )
-            .build()
+    private fun bindPlayerSource(sources: List<MediaSource>, generation: Int) {
+        if (!canUsePlayback(generation)) return
+        val player = exoPlayer ?: createPlayer().also { exoPlayer = it }
+        playerListener?.let(player::removeListener)
+        endedState = restoreEndedState
+        playPauseBtn.setEnded(endedState)
+        showReplay(endedState)
         playerView.player = player
-        player.setMediaSource(mediaSource)
-        player.repeatMode = Player.REPEAT_MODE_OFF
-        if (pendingResumePositionMs > 0L) seekPlayerGlobal(player, pendingResumePositionMs)
-        player.playWhenReady = userWantsPlayback && activityResumed
-        player.addListener(object : Player.Listener {
+        playerView.setKeepContentOnPlayerReset(true)
+        val resume = if (segmentTimeline.durationMs > 0L) {
+            segmentTimeline.locate(pendingResumePositionMs)
+        } else {
+            PlaybackTimeline.Position(resumeSegmentIndex.coerceIn(0, sources.lastIndex), pendingResumePositionMs)
+        }
+        player.setMediaSources(sources, resume.index, resume.offsetMs)
+        player.playbackParameters = PlaybackParameters(speeds[speedIndex])
+        val listener = object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
-                if (generation != playbackGeneration || player !== exoPlayer) return
+                if (!canUsePlayback(generation) || player !== exoPlayer) return
                 when (state) {
                     Player.STATE_READY -> {
+                        handler.removeCallbacks(stallWatchdog)
+                        stallRetries = 0
                         playerSpinner.visibility = View.GONE
                         playerError.visibility = View.GONE
                         pendingResumePositionMs = 0L
+                        restoreEndedState = false
                         retryScheduled = false
-                        playPauseBtn.setEnded(false)
+                        playPauseBtn.setEnded(endedState)
                         playPauseBtn.setPlaying(player.isPlaying)
-                        if (!isSeeking && player.isPlaying) { showReplay(false); scheduleAutoHide() }
-                        updateQualityState(playingStream ?: stream)
+                        playingStream?.let(::updateQualityState)
                     }
-                    Player.STATE_BUFFERING -> if (!isSeeking) playerSpinner.visibility = View.VISIBLE
+                    Player.STATE_BUFFERING -> if (!isSeeking) {
+                        playerSpinner.visibility = View.VISIBLE
+                        handler.removeCallbacks(stallWatchdog)
+                        handler.postDelayed(stallWatchdog, STALL_TIMEOUT_MS)
+                    }
                     Player.STATE_ENDED -> {
                         playerSpinner.visibility = View.GONE
                         cancelLongPressBoost()
+                        // 收藏夹播放态：按收藏夹队列与模式连播
+                        favoritePlayback?.let { fav ->
+                            val next = resolveNextSeasonTarget()
+                            if (next is NextSeasonTarget.Online) {
+                                if (next.episode.bvid == currentBvid && next.episode.cid == currentCid) {
+                                    // 单集循环：从头重播
+                                    exoPlayer?.seekTo(0L)
+                                    exoPlayer?.playWhenReady = true
+                                } else {
+                                    selectEpisode(next.episode)
+                                }
+                                return
+                            }
+                            // 顺序播放到底 / 收藏夹仅一条：停在结束态
+                            endedState = true
+                            playPauseBtn.setEnded(true)
+                            playPauseBtn.setPlaying(false)
+                            showReplay(true)
+                            showControls()
+                            return
+                        }
+                        if (isLocalMode) {
+                            val nextId = DownloadManager.resolveNextPlayableTaskId(
+                                localPlaylist, localTaskId, localPlayMode
+                            )
+                            if (nextId != null) {
+                                if (nextId == localTaskId) {
+                                    // 单集循环（或仅一集的列表循环）：直接从头重播
+                                    exoPlayer?.seekTo(0L)
+                                    exoPlayer?.playWhenReady = true
+                                    return
+                                } else {
+                                    switchLocalTask(nextId)
+                                    return
+                                }
+                            }
+                        }
                         endedState = true
                         playPauseBtn.setEnded(true)
                         playPauseBtn.setPlaying(false)
@@ -3569,88 +4132,90 @@ class VideoDetailActivity : Activity() {
                         showControls()
                     }
                 }
+                updatePlaybackProgress()
             }
+
             override fun onIsPlayingChanged(isPlaying: Boolean) {
-                if (generation != playbackGeneration || player !== exoPlayer) return
+                if (!canUsePlayback(generation) || player !== exoPlayer) return
+                handler.removeCallbacks(historyTick)
                 if (isPlaying) {
-                    // Report playback to the Bilibili watch history: on start and
-                    // every 30 seconds while playing.
-                    reportPlayHistory(status = 3)
-                    handler.removeCallbacks(historyTick)
-                    handler.postDelayed(historyTick, 30_000L)
+                    if (!isLocalMode) {
+                        reportPlayHistory(status = 3)
+                        handler.postDelayed(historyTick, 30_000L)
+                    }
                     endedState = false
                     playPauseBtn.setEnded(false)
                     playPauseBtn.setPlaying(true)
                     showReplay(false)
                     scheduleAutoHide()
                 } else {
-                    playPauseBtn.setEnded(false)
+                    playPauseBtn.setEnded(endedState)
                     playPauseBtn.setPlaying(false)
-                    showControls()
+                    if (activityResumed) showControls()
                 }
+                updatePlaybackProgress()
             }
-            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                if (generation != playbackGeneration || player !== exoPlayer) return
-                recoverPlayback(stream, player, error, generation)
-            }
-        })
-        player.prepare()
-        exoPlayer = player
-        handler.removeCallbacks(progressUpdater)
-        handler.post(progressUpdater)
-    }
 
-    /**
-     * Build the Media3 source for a stream. DASH streams are served through a
-     * locally generated MPD (file name includes the target quality so a
-     * quality switch never races with the manifest currently being read).
-     */
-    private fun buildMediaSource(stream: BiliPlayUrl.DashStream, okClient: OkHttpClient): MediaSource {
-        val httpFactory = OkHttpDataSource.Factory(okClient)
-            .setUserAgent(CDN_USER_AGENT)
-            .setDefaultRequestProperties(
-                buildMap {
-                    put("Referer", "https://www.bilibili.com/")
-                    put("Origin", "https://www.bilibili.com")
-                    // CDN segment requests must only carry the anonymous buvid
-                    // fingerprint. CURRENT_FNVAL / SESSDATA sent to CDN hosts make
-                    // nodes reject the request (403/503) whenever the fingerprint
-                    // or session is not perfectly valid.
-                    val cdnCookie = BiliPlayUrl.cdnCookieHeader()
-                    if (cdnCookie.isNotBlank()) put("Cookie", cdnCookie)
+            override fun onRenderedFirstFrame() {
+                if (canUsePlayback(generation) && player === exoPlayer) {
+                    val format = player.videoFormat
+                    val size = player.videoSize
+                    if (format != null || size.width > 0) {
+                        Log.i(
+                            "YuiBiliPlayer",
+                            "rendered-format id=${format?.id} codecs=${format?.codecs} " +
+                                "format=${format?.width}x${format?.height} size=${size.width}x${size.height} " +
+                                "playingQuality=${playingStream?.actualQuality}"
+                        )
+                    }
+                    if (startupAtMs > 0L) {
+                        Log.d("YuiBiliPlayer", "First frame in ${SystemClock.elapsedRealtime() - startupAtMs} ms")
+                        startupAtMs = 0L
+                    }
                 }
-            )
-        val dataSourceFactory: DataSource.Factory = DefaultDataSource.Factory(this, httpFactory)
-        val loadPolicy = DefaultLoadErrorHandlingPolicy(4)
-        return if (stream.isDash) {
-            val manifest = BiliDashManifest.build(stream)
-            val manifestFile = File(cacheDir, "bili_dash_${currentBvid}_${currentCid}_${requestedQuality}.mpd")
-            manifestFile.writeText(manifest)
-            val mediaItem = MediaItem.Builder().setUri(Uri.fromFile(manifestFile)).setMimeType(MimeTypes.APPLICATION_MPD).build()
-            DashMediaSource.Factory(dataSourceFactory)
-                .setLoadErrorHandlingPolicy(loadPolicy)
-                .createMediaSource(mediaItem)
-        } else {
-            val segments = stream.durlSegments.ifEmpty {
-                listOf(BiliPlayUrl.DurlSegment(
-                    urls = stream.fallbackUrls.ifEmpty { listOf(stream.videoUrl) },
-                    lengthMs = stream.durationMs,
-                    sizeBytes = 0L
-                ))
             }
-            val sources = segments.mapNotNull { segment ->
-                val url = segment.urls.firstOrNull { it.isNotBlank() } ?: return@mapNotNull null
-                val mediaItem = MediaItem.Builder().setUri(url).setMimeType(MimeTypes.APPLICATION_MP4).build()
-                ProgressiveMediaSource.Factory(dataSourceFactory)
-                    .setLoadErrorHandlingPolicy(loadPolicy)
-                    .createMediaSource(mediaItem)
+
+            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                if (canUsePlayback(generation) && player === exoPlayer && videoSize.width > 0) {
+                    Log.i(
+                        "YuiBiliPlayer",
+                        "video-size ${videoSize.width}x${videoSize.height} playingQuality=${playingStream?.actualQuality}"
+                    )
+                }
             }
-            when (sources.size) {
-                0 -> throw IllegalStateException("没有可用的单文件播放地址")
-                1 -> sources.first()
-                else -> ConcatenatingMediaSource(true, *sources.toTypedArray())
+
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                if (!canUsePlayback(generation) || player !== exoPlayer) return
+                val stream = playingStream
+                if (isLocalMode || stream == null) {
+                    showError("本地文件播放失败：${error.message ?: error.errorCodeName}\n\n点这里重试")
+                } else {
+                    recoverPlayback(stream, error, generation)
+                }
             }
         }
+        playerListener = listener
+        player.addListener(listener)
+        player.playWhenReady = userWantsPlayback && activityResumed && !endedState
+        player.prepare()
+        updatePlaybackProgress()
+    }
+
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private fun createPlayer(): ExoPlayer {
+        val loadControl = DefaultLoadControl.Builder().apply {
+            if (isLocalMode) {
+                setBufferDurationsMs(5_000, 20_000, 250, 500)
+                setTargetBufferBytes(16 * 1024 * 1024)
+            } else {
+                setBufferDurationsMs(18_000, 50_000, 1_200, 3_200)
+                setTargetBufferBytes(36 * 1024 * 1024)
+                setBackBuffer(4_000, false)
+            }
+        }.build()
+        return ExoPlayer.Builder(this, DefaultRenderersFactory(this).setEnableDecoderFallback(true))
+            .setLoadControl(loadControl)
+            .build()
     }
 
     /**
@@ -3662,41 +4227,25 @@ class VideoDetailActivity : Activity() {
         return minOf(requestedQuality, BiliPlayUrl.QUALITY_480)
     }
 
-    /**
-     * Switch quality. When the target tier is already present in the current
-     * DASH response we rebuild only the local MPD and hot-swap the media
-     * source on the existing player (no network round-trip, near-instant).
-     * Higher tiers require a fresh playurl request.
-     */
     private fun switchQuality(quality: Int) {
-        if (quality == requestedQuality) return
+        if (quality == playingStream?.actualQuality && playerListener != null &&
+            playerError.visibility != View.VISIBLE && streamSession == BiliSessionStore.cookie() &&
+            playbackRequest == null && !retryScheduled
+        ) return
         requestedQuality = quality
         saveQualityPreference(quality)
         playRetryCount = 0
         lastPlaybackError = null
-        val stream = currentStream ?: return
-        pendingResumePositionMs = exoPlayer?.let { playerGlobalPosition(it) } ?: 0L
-        if (stream.isDash && stream.videoTracks.any { it.id == quality }) {
-            val selected = selectStableStream(stream)
-            Log.i("YuiBiliPlayer", "quality switch local: ${qualityName(quality)}")
-            applyMediaSource(selected)
+        val effective = effectiveQuality()
+        val stream = currentStream
+        if (stream != null && streamSession == BiliSessionStore.cookie() && stream.isDash &&
+            stream.videoTracks.any { it.id == effective }
+        ) {
+            lastRequestedQuality = effective
+            startExoPlayer(selectStableStream(stream, effective), beginPlaybackChange())
         } else {
-            Log.i("YuiBiliPlayer", "quality switch refetch: ${qualityName(quality)}")
-            loadPlayer()
+            loadPlayer(effective)
         }
-    }
-
-    /** Swap the media source on the live player and resume at the saved position. */
-    private fun applyMediaSource(stream: BiliPlayUrl.DashStream) {
-        val player = exoPlayer ?: return
-        playingStream = stream
-        val positionMs = pendingResumePositionMs
-        pendingResumePositionMs = 0L
-        playerSpinner.visibility = View.VISIBLE
-        playerError.visibility = View.GONE
-        player.setMediaSource(buildMediaSource(stream, mediaOkClient), positionMs)
-        player.prepare()
-        player.playWhenReady = userWantsPlayback && activityResumed
     }
 
     private fun loadQualityPreference(): Int {
@@ -3712,15 +4261,10 @@ class VideoDetailActivity : Activity() {
 
     private fun recoverPlayback(
         stream: BiliPlayUrl.DashStream,
-        player: ExoPlayer,
         error: androidx.media3.common.PlaybackException,
         generation: Int
     ) {
-        if (isLocalMode) {
-            showError("本地文件播放失败：${error.message ?: error.errorCodeName}\n\n点这里重试")
-            return
-        }
-        if (generation != playbackGeneration || retryScheduled || currentCid <= 0L) return
+        if (!canUsePlayback(generation) || retryScheduled || currentCid <= 0L) return
         lastPlaybackError = "${error.errorCodeName} ${error.message ?: ""}"
         val transientIo = error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ||
             error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
@@ -3730,50 +4274,63 @@ class VideoDetailActivity : Activity() {
             error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_IO_UNSPECIFIED
         val decodeError = error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_DECODING_FAILED ||
             error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_DECODER_INIT_FAILED
-        if (!transientIo && !decodeError) {
+        val manifestError = stream.isDash && (error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED ||
+            error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED)
+        if (!transientIo && !decodeError && !manifestError) {
             showError("播放出错：${error.errorCodeName}\n\n${error.message ?: ""}\n\n点这里重试")
             return
         }
 
         retryScheduled = true
-        stablePlaybackStartedAtMs = 0L
-        pendingResumePositionMs = maxOf(pendingResumePositionMs, playerGlobalPosition(player))
+        rememberPlaybackPosition()
         playRetryCount++
         playerSpinner.visibility = View.VISIBLE
         playerError.visibility = View.GONE
 
-        when {
-            playRetryCount == 1 -> {
-                // Rotate every chosen track/segment to its next CDN candidate before
-                // spending another playurl request. This is fast and preserves quality.
-                val rotated = rotateCdnCandidates(stream)
-                handler.postDelayed({
-                    if (generation == playbackGeneration) {
-                        retryScheduled = false
-                        startExoPlayer(rotated, generation)
-                    }
-                }, 350L)
+        val fullStream = currentStream
+        val currentTrack = stream.videoTracks.firstOrNull()
+        // 解码或清单异常时，优先在同一画质下尝试其他编码轨（如 AVC <-> HEVC <-> AV1），避免直接跌回 DURL 720p
+        val alternateCodec = if ((decodeError || manifestError) && stream.isDash && fullStream != null && currentTrack != null) {
+            failedCodecTracks.add(currentTrack.id to currentTrack.codecs)
+            fullStream.videoTracks.firstOrNull { track ->
+                track.id == currentTrack.id && (track.id to track.codecs) !in failedCodecTracks
+            }?.let { nextTrack ->
+                Log.w("YuiBiliPlayer", "codec-fallback quality=${nextTrack.id} from=${currentTrack.codecs} to=${nextTrack.codecs}")
+                selectStableStream(fullStream, currentTrack.id)
             }
-            playRetryCount == 2 && stream.isDash -> {
-                // DASH/codec/manifest still failed: use Bilibili's classic progressive
-                // stream, capped at 1080P, and keep the exact playback position.
-                val durlQuality = requestedQuality.coerceAtMost(BiliPlayUrl.QUALITY_1080)
-                BiliPlayUrl.fetchDurlPlayUrl(currentBvid, currentCid, durlQuality) { fallback, _ ->
-                    if (isFinishing || isDestroyed || generation != playbackGeneration) return@fetchDurlPlayUrl
+        } else null
+
+        val alternateCdn = if (playRetryCount == 1 && transientIo) rotateCdnCandidates(stream).takeIf { it != stream } else null
+        when {
+            alternateCodec != null -> startExoPlayer(alternateCodec, beginPlaybackChange())
+            playRetryCount == 1 && (transientIo || BiliPlayUrl.isStreamNearExpiry(stream)) &&
+                SystemClock.elapsedRealtime() - streamLoadedAt > 20_000L -> {
+                // 地址可能过期或 403，优先强制刷新最新 PlayUrl
+                loadPlayer(minOf(lastRequestedQuality, effectiveQuality()), bypassCache = true)
+            }
+            alternateCdn != null -> startExoPlayer(alternateCdn, beginPlaybackChange())
+            playRetryCount <= 2 && stream.isDash -> {
+                playRetryCount = 2
+                val nextGeneration = beginPlaybackChange()
+                retryScheduled = true
+                val session = BiliSessionStore.cookie()
+                val durlQuality = minOf(lastRequestedQuality, effectiveQuality(), BiliPlayUrl.QUALITY_1080)
+                playbackRequest = BiliPlayUrl.fetchDurlPlayUrl(currentBvid, currentCid, durlQuality, bypassCache = true) { fallback, _ ->
                     handler.post {
-                        if (generation != playbackGeneration) return@post
+                        if (!canUsePlayback(nextGeneration)) return@post
+                        playbackRequest = null
                         retryScheduled = false
-                        if (fallback != null) {
-                            startExoPlayer(fallback, generation)
-                        } else {
-                            lowerQualityAndReload()
+                        when {
+                            session != BiliSessionStore.cookie() -> loadPlayer(bypassCache = true)
+                            fallback != null -> startExoPlayer(fallback, nextGeneration)
+                            else -> lowerQualityAndReload()
                         }
                     }
                 }
             }
             playRetryCount <= 3 -> lowerQualityAndReload()
             else -> showError(
-                "播放失败：网络或解码器持续异常\n\n${lastPlaybackError ?: ""}\n\n已尝试备用线路、兼容流和低画质。点这里重试"
+                "播放失败：网络或解码器持续异常\n\n${lastPlaybackError ?: ""}\n\n已尝试刷新地址、备用线路和低画质。点这里重试"
             )
         }
     }
@@ -3805,59 +4362,90 @@ class VideoDetailActivity : Activity() {
     }
 
     private fun lowerQualityAndReload() {
-        retryScheduled = false
-        requestedQuality = when {
-            requestedQuality > BiliPlayUrl.QUALITY_720 -> BiliPlayUrl.QUALITY_720
-            requestedQuality > BiliPlayUrl.QUALITY_480 -> BiliPlayUrl.QUALITY_480
+        val next = when {
+            lastRequestedQuality > BiliPlayUrl.QUALITY_720 -> BiliPlayUrl.QUALITY_720
+            lastRequestedQuality > BiliPlayUrl.QUALITY_480 -> BiliPlayUrl.QUALITY_480
             else -> BiliPlayUrl.QUALITY_360
         }
-        loadPlayer()
+        loadPlayer(minOf(next, effectiveQuality()))
     }
 
-    private fun playerGlobalPosition(player: ExoPlayer): Long {
-        val stream = currentStream
-        val segments = stream?.durlSegments.orEmpty()
-        if (segments.isEmpty() || player.currentMediaItemIndex <= 0) {
-            return player.currentPosition.coerceAtLeast(0L)
-        }
-        val before = segments.take(player.currentMediaItemIndex).sumOf { it.lengthMs }
-        return (before + player.currentPosition).coerceAtLeast(0L)
+    private fun playerGlobalPosition(player: ExoPlayer): Long =
+        segmentTimeline.global(player.currentMediaItemIndex, player.currentPosition)
+
+    // ─────────────────────────────────────────────────
+    //  后台播放：移交到在线音频页
+    // ─────────────────────────────────────────────────
+
+    /** 仅在线视频与本地视频可切；本地纯音频本身已是音频，隐藏入口。 */
+    /** 后台播放仅对在线视频有意义：本地下载（视频或纯音频）均不显示。 */
+    private fun updateBackgroundPlayVisibility() {
+        if (!::backgroundPlayBtn.isInitialized) return
+        backgroundPlayBtn.visibility = if (isLocalMode) View.GONE else View.VISIBLE
+        backgroundPlayBtn.isEnabled = !backgroundSwitchLocked
+        backgroundPlayBtn.alpha = if (backgroundSwitchLocked) 0.45f else 1f
     }
 
-    private fun playerGlobalBufferedPosition(player: ExoPlayer): Long {
-        val segments = currentStream?.durlSegments.orEmpty()
-        if (segments.isEmpty() || player.currentMediaItemIndex <= 0) {
-            return player.bufferedPosition.coerceAtLeast(0L)
-        }
-        val before = segments.take(player.currentMediaItemIndex).sumOf { it.lengthMs }
-        return (before + player.bufferedPosition).coerceAtLeast(0L)
-    }
-
-    private fun playerGlobalDuration(player: ExoPlayer): Long {
-        val stream = currentStream
-        val segmentDuration = stream?.durlSegments.orEmpty().sumOf { it.lengthMs }
-        return when {
-            segmentDuration > 0L -> segmentDuration
-            stream != null && stream.durationMs > 0L -> stream.durationMs
-            player.duration > 0L -> player.duration
-            else -> 0L
-        }
-    }
-
-    private fun seekPlayerGlobal(player: ExoPlayer, positionMs: Long) {
-        val segments = currentStream?.durlSegments.orEmpty()
-        if (segments.isEmpty()) {
-            player.seekTo(positionMs.coerceAtLeast(0L))
+    /** 把当前视频的播放位置与合集队列交给音频页，从同一进度继续。 */
+    private fun enterBackgroundAudioPlayback() {
+        if (backgroundSwitchLocked) return
+        if (isLocalMode) {
+            showSnackbar("本地视频请直接在下载管理中打开对应音频")
             return
         }
-        var remaining = positionMs.coerceAtLeast(0L)
-        for ((index, segment) in segments.withIndex()) {
-            val length = segment.lengthMs
-            if (length <= 0L || remaining <= length || index == segments.lastIndex) {
-                player.seekTo(index, remaining.coerceIn(0L, length.coerceAtLeast(0L)))
-                return
-            }
-            remaining -= length
+        val bvid = currentBvid
+        val cid = currentCid
+        if (bvid.isBlank() || cid <= 0L) {
+            showSnackbar("视频尚未加载完成")
+            return
+        }
+        val player = exoPlayer ?: return
+        val positionMs = playerGlobalPosition(player).coerceAtLeast(0L)
+        val fallbackDurationMs = playerGlobalDuration(player).takeIf { it > 0L }
+            ?: currentDetail?.duration?.toLong()?.times(1000L) ?: 0L
+
+        backgroundSwitchLocked = true
+        updateBackgroundPlayVisibility()
+        userWantsPlayback = false
+        player.pause()
+
+        val launch = OnlineAudioLaunch(
+            entry = buildOnlineEntry(bvid, cid, fallbackDurationMs),
+            startPositionMs = positionMs,
+            season = if (favoritePlayback != null) null else (currentDetail?.season ?: cachedSeason),
+            favorite = favoritePlayback
+        )
+        startActivity(OnlineAudioLauncher.intent(this, launch))
+        overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out)
+    }
+
+    private fun buildOnlineEntry(bvid: String, cid: Long, durationMs: Long): UgcEpisode {
+        val detail = currentDetail
+        return UgcEpisode(
+            bvid = bvid,
+            aid = currentAid,
+            cid = cid,
+            title = detail?.title.orEmpty().ifBlank { "未命名音频" },
+            duration = (durationMs / 1000L).coerceAtLeast(0L).toInt(),
+            cover = detail?.cover.orEmpty(),
+            publishedAt = detail?.publishedAt ?: 0L
+        )
+    }
+
+    private fun playerGlobalBufferedPosition(player: ExoPlayer): Long =
+        segmentTimeline.global(player.currentMediaItemIndex, player.bufferedPosition)
+
+    private fun playerGlobalDuration(player: ExoPlayer): Long =
+        segmentTimeline.durationMs.takeIf { it > 0L }
+            ?: player.duration.takeIf { it > 0L }
+            ?: playingStream?.durationMs ?: 0L
+
+    private fun seekPlayerGlobal(player: ExoPlayer, positionMs: Long) {
+        if (segmentTimeline.durationMs == 0L) {
+            player.seekTo(positionMs.coerceAtLeast(0L))
+        } else {
+            val position = segmentTimeline.locate(positionMs)
+            player.seekTo(position.index, position.offsetMs)
         }
     }
 
@@ -3872,19 +4460,21 @@ class VideoDetailActivity : Activity() {
             ?: if (!stream.isDash) stream.actualQuality
             else available.firstOrNull() ?: stream.actualQuality
         val suffix = if (available.isEmpty()) "" else " · 可用：${available.joinToString("/") { qualityName(it) }}"
-        infoState.text = "当前播放：${qualityLabelOf(playingId)}$suffix"
-        infoState.setTextColor(COLOR_MUTED)
-        qualityBtn.text = qualityLabelOf(playingId).replace("P", "p")
+        if (infoState.parent == null) {
+            infoState.text = "当前播放：${qualityLabelOf(playingId)}$suffix"
+            infoState.setTextColor(COLOR_MUTED)
+        }
+        qualityBtn.text = formatQualityButtonText(playingId)
     }
 
     private fun qualityLabelOf(id: Int): String = BiliPlayUrl.qualityLabel(id)
 
     private fun qualityResLabel(id: Int): String =
-        BiliPlayUrl.qualityLabel(id).replace("P", "p")
+        formatQualityButtonText(id)
 
     private fun qualityName(id: Int): String = when (id) {
-        127 -> "8K"; 126 -> "杜比"; 125 -> "HDR"; 120 -> "4K"; 116 -> "1080P60"
-        112 -> "1080P+"; 80 -> "1080P"; 64 -> "720P"; 32 -> "480P"; 16 -> "360P"
+        127 -> "8K"; 126 -> "杜比视界"; 125 -> "HDR"; 120 -> "4K"; 116 -> "1080P 60帧"
+        112 -> "1080P 高码"; 80 -> "1080P"; 64 -> "720P"; 32 -> "480P"; 16 -> "360P"
         else -> "${id}档"
     }
 
@@ -3892,22 +4482,40 @@ class VideoDetailActivity : Activity() {
     //  Progress & Time
     // ─────────────────────────────────────────────────
 
-    private val progressUpdater = object : Runnable {
-        override fun run() {
-            val p = exoPlayer ?: return
-            val dur = playerGlobalDuration(p)
-            if (dur > 0 && !isSeeking) {
-                val pos = playerGlobalPosition(p)
-                progressContainer.updateFromPlayer()
-                timeText.text = formatTime(pos)
-                durationText.text = formatTime(dur)
+    private val progressUpdater = Runnable { updatePlaybackProgress() }
+
+    private fun updatePlaybackProgress() {
+        handler.removeCallbacks(progressUpdater)
+        val player = exoPlayer ?: return
+        if (!activityResumed || playerListener == null) return
+        val duration = playerGlobalDuration(player)
+        val position = playerGlobalPosition(player)
+        val speed = player.playbackParameters.speed.takeIf { it > 0f } ?: 1f
+        danmakuController?.onPlaybackTick(
+            positionMs = position,
+            durationMs = duration,
+            playing = player.isPlaying && !isSeeking,
+            speed = speed
+        )
+        if (duration > 0L && !isSeeking) {
+            progressContainer.updateFromPlayer()
+            if (position / 1000L != lastPositionSecond) {
+                lastPositionSecond = position / 1000L
+                timeText.text = formatTime(position)
             }
-            handler.postDelayed(this, 250)
+            if (duration / 1000L != lastDurationSecond) {
+                lastDurationSecond = duration / 1000L
+                durationText.text = formatTime(duration)
+            }
+        }
+        if (player.isPlaying || player.playWhenReady && player.playbackState == Player.STATE_BUFFERING) {
+            handler.postDelayed(progressUpdater, 250L)
         }
     }
 
     /** Shared by the seek bar and the swipe gesture: updates time text + bar, clears ended state when scrubbing back. */
     private fun onManualSeek(pos: Long, dur: Long) {
+        lastPositionSecond = pos / 1000L
         timeText.text = formatTime(pos)
         progressContainer.seekToFraction(pos.toFloat() / dur.toFloat())
         if (endedState && pos < dur - 1500) clearEndedState()
@@ -3950,7 +4558,8 @@ class VideoDetailActivity : Activity() {
         playPauseBtn.setPlaying(false)
         showReplay(false)
         userWantsPlayback = true
-        p.seekTo(0)
+        p.seekTo(0, 0L)
+        danmakuController?.onSeeked(0L)
         p.play()
         showControls()
     }
@@ -3978,6 +4587,7 @@ class VideoDetailActivity : Activity() {
         longPressBoost = true
         normalSpeed = p.playbackParameters.speed.let { if (it > 0f) it else 1f }
         p.playbackParameters = PlaybackParameters(2.0f)
+        updatePlaybackProgress()
         showBoostIndicator()
     }
 
@@ -3988,6 +4598,7 @@ class VideoDetailActivity : Activity() {
         if (longPressBoost) {
             longPressBoost = false
             exoPlayer?.playbackParameters = PlaybackParameters(normalSpeed)
+            updatePlaybackProgress()
             hideBoostIndicator()
         }
     }
@@ -4020,21 +4631,51 @@ class VideoDetailActivity : Activity() {
         boostIndicator.scaleY = 1f
     }
 
+    private fun showSeekHint(posMs: Long, durMs: Long) {
+        if (!::playerSeekHint.isInitialized) return
+        playerSeekHint.text = "${formatTime(posMs)}  /  ${formatTime(durMs)}"
+        playerSeekHint.animate().cancel()
+        if (playerSeekHint.visibility != View.VISIBLE) {
+            playerSeekHint.visibility = View.VISIBLE
+            playerSeekHint.alpha = 0f
+            playerSeekHint.animate().alpha(1f).setDuration(110).start()
+        } else {
+            playerSeekHint.alpha = 1f
+        }
+    }
+
+    private fun hideSeekHint() {
+        if (!::playerSeekHint.isInitialized) return
+        playerSeekHint.animate().cancel()
+        if (playerSeekHint.visibility == View.VISIBLE) {
+            playerSeekHint.animate().alpha(0f).setDuration(140)
+                .withEndAction { playerSeekHint.visibility = View.GONE }.start()
+        }
+    }
+
     private fun showSpeedToast(text: String) {
         val toast = TextView(this).apply {
-            this.text = text; textSize = 16f
-            setTextColor(Color.WHITE); typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            this.text = text
+            textSize = 14.5f
+            setTextColor(Color.WHITE)
+            typeface = Ds.display(bold = true)
             gravity = Gravity.CENTER
-            setBackgroundColor(0xBB000000.toInt())
-            setPadding(dp(18), dp(8), dp(18), dp(8))
+            background = Ds.pill(this@VideoDetailActivity, 0xCC14161B.toInt(), 0x33FFFFFF)
+            setPadding(dp(18), dp(7), dp(18), dp(7))
         }
         val overlay = FrameLayout(this).apply {
-            addView(toast, FrameLayout.LayoutParams(dp(64), dp(36), Gravity.CENTER))
-            setOnClickListener { (parent as? ViewGroup)?.removeView(this) }
+            isClickable = false
+            addView(toast, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
         }
-        controlOverlay.addView(overlay, FrameLayout.LayoutParams(
+        playerHost.addView(overlay, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        overlay.postDelayed({ controlOverlay.removeView(overlay) }, 800)
+        toast.alpha = 0f
+        toast.animate().alpha(1f).setDuration(120).start()
+        overlay.postDelayed({
+            toast.animate().alpha(0f).setDuration(160)
+                .withEndAction { playerHost.removeView(overlay) }.start()
+        }, 650)
     }
 
     private fun cycleSpeed() {
@@ -4042,6 +4683,7 @@ class VideoDetailActivity : Activity() {
         val speed = speeds[speedIndex]
         exoPlayer?.playbackParameters = PlaybackParameters(speed)
         speedBtn.text = "${speed}x"
+        updatePlaybackProgress()
         showSpeedToast("${speed}x")
     }
 
@@ -4056,41 +4698,78 @@ class VideoDetailActivity : Activity() {
 
         val menu = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(2), dp(2), dp(2), dp(2))
-            // 70% transparent backdrop so the video stays visible behind the list.
-            background = rounded(0x4D29262A.toInt(), dp(12))
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+            background = Ds.plate(0xE6181A20.toInt(), 0x26FFFFFF, Ds.hairline(this@VideoDetailActivity), dp(14).toFloat())
         }
         lateinit var popup: PopupWindow
-        qualities.forEach { quality ->
+        qualities.forEachIndexed { idx, quality ->
             val available = quality in availableIds
+            val isSelected = quality == playingId
             val suffix = when {
+                !available -> " · 暂无流"
                 quality <= BiliPlayUrl.QUALITY_480 -> ""
-                quality < BiliPlayUrl.QUALITY_1080 -> if (loggedIn) "" else "（需登录）"
-                else -> if (BiliSessionStore.isBigVip()) "（大会员）" else "（需大会员）"
+                quality < BiliPlayUrl.QUALITY_1080 -> if (loggedIn) "" else " · 需登录"
+                else -> if (BiliSessionStore.isBigVip()) " · 大会员" else " · 需大会员"
             }
-            val label = "${if (quality == playingId) "✓ " else ""}${qualityName(quality)}$suffix"
-            val item = TextView(this).apply {
-                text = label; textSize = 13f
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setTextColor(if (available) Color.WHITE else 0xFFAAA4A7.toInt())
-                setPadding(dp(14), 0, dp(14), 0)
+                setPadding(dp(12), 0, dp(12), 0)
+                if (isSelected) background = rounded(0x28F27D9E, dp(9))
                 isClickable = true
+                Ds.bindPressFeedback(this, 0.96f)
                 setOnClickListener {
                     popup.dismiss()
-                    if (quality != requestedQuality) switchQuality(quality)
+                    if (!available) {
+                        val reason = when {
+                            quality >= BiliPlayUrl.QUALITY_1080_PLUS && !BiliSessionStore.isBigVip() ->
+                                "${qualityName(quality)}需要大会员权限"
+                            quality > BiliPlayUrl.QUALITY_480 && !loggedIn ->
+                                "${qualityName(quality)}需要登录账号"
+                            else -> "正在尝试获取${qualityName(quality)}视频流"
+                        }
+                        showSnackbar(reason)
+                        if (!loggedIn && quality > BiliPlayUrl.QUALITY_480) return@setOnClickListener
+                        if (quality >= BiliPlayUrl.QUALITY_1080_PLUS && !BiliSessionStore.isBigVip()) return@setOnClickListener
+                    }
+                    switchQuality(quality)
                 }
             }
-            if (quality == playingId) {
-                item.setBackgroundColor(0x33FFFFFF.toInt())
+            row.addView(TextView(this).apply {
+                text = qualityName(quality)
+                textSize = 13f
+                typeface = Ds.body(bold = isSelected)
+                setTextColor(when {
+                    isSelected -> Ds.colors.accent
+                    available -> Color.WHITE
+                    else -> 0xFF9EA3AE.toInt()
+                })
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            if (suffix.isNotEmpty()) {
+                row.addView(TextView(this).apply {
+                    text = suffix.removePrefix(" · ")
+                    textSize = 10.5f
+                    setTextColor(if (isSelected) Ds.colors.accent else 0xFF9EA3AE.toInt())
+                })
             }
-            menu.addView(item, LinearLayout.LayoutParams(dp(176), dp(42)))
+            menu.addView(row, LinearLayout.LayoutParams(dp(172), dp(36)).apply {
+                if (idx > 0) topMargin = dp(2)
+            })
         }
-        popup = PopupWindow(menu, dp(180), LinearLayout.LayoutParams.WRAP_CONTENT, true).apply {
+        menu.measure(
+            View.MeasureSpec.makeMeasureSpec(dp(220), View.MeasureSpec.AT_MOST),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        val menuW = menu.measuredWidth.coerceAtLeast(dp(188))
+        val menuH = menu.measuredHeight
+        popup = PopupWindow(menu, menuW, LinearLayout.LayoutParams.WRAP_CONTENT, true).apply {
             setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            elevation = dp(8).toFloat()
+            elevation = dp(10).toFloat()
             isOutsideTouchable = true
         }
-        popup.showAsDropDown(anchor, -dp(144), -dp(menu.childCount * 42 + dp(16)))
+        val xOff = anchor.width - menuW
+        val yOff = -(menuH + anchor.height + dp(8))
+        popup.showAsDropDown(anchor, xOff, yOff)
     }
 
     // ─────────────────────────────────────────────────
@@ -4105,6 +4784,7 @@ class VideoDetailActivity : Activity() {
     private fun showControls() {
         controlsAnimating = true
         controlsVisible = true
+        controlOverlay.animate().cancel()
         controlOverlay.visibility = View.VISIBLE
         if (reducedMotion) {
             controlOverlay.alpha = 1f
@@ -4115,9 +4795,6 @@ class VideoDetailActivity : Activity() {
                 .setInterpolator(MotionTokens.easeOut)
                 .withEndAction { controlsAnimating = false }.start()
         }
-        playerBack.animate().cancel()
-        playerBack.alpha = 1f
-        playerBack.visibility = View.VISIBLE
         controlsHideRunnable?.let { handler.removeCallbacks(it) }
         if (exoPlayer?.isPlaying == true) scheduleAutoHide()
     }
@@ -4125,6 +4802,7 @@ class VideoDetailActivity : Activity() {
     private fun hideControls() {
         controlsAnimating = true
         controlsVisible = false
+        controlOverlay.animate().cancel()
         if (reducedMotion) {
             controlOverlay.visibility = View.GONE
             controlsAnimating = false
@@ -4136,8 +4814,6 @@ class VideoDetailActivity : Activity() {
                     controlsAnimating = false
                 }.start()
         }
-        playerBack.animate().alpha(0f).setDuration(200)
-            .withEndAction { if (playerBack.alpha <= 0.01f) playerBack.visibility = View.GONE }.start()
     }
 
     private fun scheduleAutoHide() {
@@ -4152,7 +4828,7 @@ class VideoDetailActivity : Activity() {
     // ─────────────────────────────────────────────────
 
     private fun isPortraitVideo(): Boolean {
-        val track = currentStream?.videoTracks?.firstOrNull() ?: return false
+        val track = playingStream?.videoTracks?.firstOrNull() ?: return false
         return track.width > 0 && track.height > 0 && track.height > track.width
     }
 
@@ -4161,16 +4837,52 @@ class VideoDetailActivity : Activity() {
         if (fsTransitioning) return
         isFullscreen = !isFullscreen
         fsBtn.setFullscreen(isFullscreen)
+        if (::danmakuView.isInitialized) danmakuView.setFullscreenMode(isFullscreen)
+        if (!isFullscreen) {
+            closeSeasonDrawer(immediate = true)
+            danmakuSettingsDrawer?.close(immediate = true)
+        }
         controlsHideRunnable?.let { handler.removeCallbacks(it) }
         if (isFullscreen) enterFullscreen() else exitFullscreen()
     }
 
+    private fun isTabletSplitActive(): Boolean =
+        LayoutMode.isTablet && !isFullscreen && resources.displayMetrics.widthPixels > resources.displayMetrics.heightPixels &&
+            (resources.displayMetrics.widthPixels / resources.displayMetrics.density) >= 600f
+
+    /** 根据当前模式与屏幕方向排列播放器与详情区：手机端恒定上下；平板横屏左播放(62%)右详情(38%)，平板竖屏上限46%高。 */
+    private fun applyPageSplitLayout() {
+        if (!::page.isInitialized || !::playerHost.isInitialized || !::infoArea.isInitialized) return
+        if (isFullscreen) return
+        val dm = resources.displayMetrics
+        if (isTabletSplitActive()) {
+            page.orientation = LinearLayout.HORIZONTAL
+            val rightW = (dm.widthPixels * 0.36f).toInt().coerceIn(dp(340), dp(460))
+            playerHost.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+            tabletSplitDivider?.apply {
+                visibility = View.VISIBLE
+                layoutParams = LinearLayout.LayoutParams(Ds.hairline(this@VideoDetailActivity), LinearLayout.LayoutParams.MATCH_PARENT)
+            }
+            infoArea.layoutParams = LinearLayout.LayoutParams(rightW, LinearLayout.LayoutParams.MATCH_PARENT)
+            if (::danmakuView.isInitialized) danmakuView.setFullscreenMode(true)
+        } else {
+            page.orientation = LinearLayout.VERTICAL
+            val raw16x9 = dm.widthPixels * 9 / 16
+            val playerHeight = if (LayoutMode.isTablet) {
+                minOf(raw16x9, (dm.heightPixels * 0.45f).toInt())
+            } else {
+                raw16x9
+            }
+            playerHost.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, playerHeight)
+            tabletSplitDivider?.visibility = View.GONE
+            infoArea.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+            if (::danmakuView.isInitialized) danmakuView.setFullscreenMode(false)
+        }
+        page.requestLayout()
+    }
+
     private fun enterFullscreen() {
         fsTransitioning = true
-        // Instant re-parent, no alpha/scale animation: the player is a SurfaceView and
-        // view animations don't render its video frames — they only add jank on top of
-        // the system rotation animation. For landscape videos the system rotation
-        // provides the visual transition; for portrait videos there is nothing to animate.
         (playerHost.parent as? ViewGroup)?.removeView(playerHost)
         fullscreenContainer.removeAllViews()
         fullscreenContainer.addView(playerHost, FrameLayout.LayoutParams(
@@ -4178,10 +4890,8 @@ class VideoDetailActivity : Activity() {
         fullscreenContainer.visibility = View.VISIBLE
         page.visibility = View.GONE
         hideSystemBars()
-        // Brightness/volume indicator grows to full size in fullscreen.
         adjustIndicator.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
-        // Rotate to landscape unless this is a portrait video; system animates.
-        if (!isPortraitVideo() &&
+        if (!LayoutMode.isTablet && !isPortraitVideo() &&
             resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE) {
             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         }
@@ -4191,30 +4901,23 @@ class VideoDetailActivity : Activity() {
     }
 
     private fun exitFullscreen() {
-        if (resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT) {
+        if (LayoutMode.isTablet || resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT) {
             movePlayerBackToPage()
         } else {
             exitingFullscreen = true
             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-            // movePlayerBackToPage() runs from onConfigurationChanged once the rotation lands
         }
     }
 
     private fun movePlayerBackToPage() {
         exitingFullscreen = false
         fsTransitioning = true
-        // Restore system bars first so the inset change and the re-parent happen in the
-        // same layout pass — avoids a visible "jump" mid-transition.
         showSystemBars()
-        // Same instant re-parent as entering fullscreen: the system rotation already
-        // animated the viewport, so any extra fade only adds dropped frames.
         fullscreenContainer.removeView(playerHost)
         fullscreenContainer.visibility = View.GONE
-        val playerHeight = resources.displayMetrics.widthPixels * 9 / 16
-        page.addView(playerHost, 0, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, playerHeight))
+        page.addView(playerHost, 0)
+        applyPageSplitLayout()
         page.visibility = View.VISIBLE
-        // Brightness/volume indicator shrinks back to compact size in portrait.
         adjustIndicator.animate().scaleX(COMPACT_ADJUST_SCALE).scaleY(COMPACT_ADJUST_SCALE)
             .setDuration(200).start()
         applyControlSizing()
@@ -4222,34 +4925,73 @@ class VideoDetailActivity : Activity() {
         fsTransitioning = false
     }
 
-    private fun hideSystemBars() {
-        window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+    private fun applyPlayerSystemBars() {
+        // 播放页顶部状态栏保持纯黑+白色图标；平板端底部导航栏同样保持纯黑+白色图标（避免浅色背景退全屏时导航栏白闪）。
+        val navDark = LayoutMode.isTablet || Theme.isDark
+        window.statusBarColor = Color.BLACK
+        window.navigationBarColor = if (navDark) Color.BLACK else COLOR_BACKGROUND
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            window.isNavigationBarContrastEnforced = false
+            window.isStatusBarContrastEnforced = false
+        }
+        // 访问 insetsController 前必须先触发 decorView 初始化，否则 setContentView 之前调用会 NPE
+        val decor = window.decorView
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.insetsController?.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+            val mask = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+                android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+            val appearance = if (navDark) 0 else android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+            decor.windowInsetsController?.setSystemBarsAppearance(appearance, mask)
         } else {
             @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN
+            var flags = decor.systemUiVisibility and
+                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR.inv() and
+                0x00000010.inv()
+            if (!navDark) flags = flags or 0x00000010
+            @Suppress("DEPRECATION")
+            decor.systemUiVisibility = flags
+        }
+    }
+
+    private fun hideSystemBars() {
+        window.statusBarColor = Color.BLACK
+        window.navigationBarColor = Color.BLACK
+        val decor = window.decorView
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            decor.windowInsetsController?.apply {
+                systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+            }
+        } else {
+            window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+            @Suppress("DEPRECATION")
+            decor.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN
                 or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY)
         }
     }
 
     private fun showSystemBars() {
-        window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+        applyPlayerSystemBars()
+        val decor = window.decorView
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.insetsController?.show(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+            window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+            decor.windowInsetsController?.show(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
         }
-        // Re-apply theme chrome after fullscreen; SYSTEM_UI_FLAG_VISIBLE alone drops light/dark icons.
-        Theme.applySystemBars(this)
+        applyPlayerSystemBars()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        // Exiting fullscreen: as soon as the portrait rotation lands, move the player back
-        // into the detail page on the next frame so the transition stays continuous —
-        // waiting any longer makes the player linger fullscreen-sized in the middle.
         if (exitingFullscreen && newConfig.orientation == Configuration.ORIENTATION_PORTRAIT) {
             handler.post { if (exitingFullscreen) movePlayerBackToPage() }
+        } else if (LayoutMode.isTablet && !isFullscreen) {
+            handler.post {
+                applyPageSplitLayout()
+                applyControlSizing()
+            }
         }
+        updateFullscreenStatusVisibility()
     }
 
     private fun retryPlayer() {
@@ -4258,7 +5000,13 @@ class VideoDetailActivity : Activity() {
         retryScheduled = false
         userWantsPlayback = true
         if (isLocalMode) { loadLocalPlayer(); return }
-        if (currentCid > 0L) loadPlayer() else loadVideoAndPlayer()
+        if (currentBvid.isNotBlank() && currentCid > 0L) {
+            loadPlayer(bypassCache = true)
+        } else {
+            playerError.visibility = View.GONE
+            playerSpinner.visibility = View.VISIBLE
+            loadVideoAndPlayer()
+        }
     }
     private fun showError(msg: String) {
         playerSpinner.visibility = View.GONE; playerError.text = msg; playerError.visibility = View.VISIBLE
@@ -4271,135 +5019,6 @@ class VideoDetailActivity : Activity() {
             setColor(fill)
             cornerRadii = floatArrayOf(radius.toFloat(), radius.toFloat(), radius.toFloat(), radius.toFloat(), 0f, 0f, 0f, 0f)
         }
-
-    /** Horizontal pager used for 简介/评论: drag-follows the finger, flings, and snaps.
-     *  Vertical scroll is left to the child ScrollViews. */
-    /** Drawn sort icon (up/down chevrons, no emoji) shown next to the sort label. */
-    private inner class SortIconView(context: Context) : View(context) {
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = COLOR_MUTED
-            strokeWidth = dpf(1.8f)
-            strokeCap = Paint.Cap.ROUND
-            style = Paint.Style.STROKE
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            val cx = width / 2f
-            val cy = height / 2f
-            val s = dpf(3.4f)
-            // Up chevron
-            canvas.drawLine(cx - s, cy - s * 0.4f, cx, cy - s * 1.3f, paint)
-            canvas.drawLine(cx + s, cy - s * 0.4f, cx, cy - s * 1.3f, paint)
-            // Down chevron
-            canvas.drawLine(cx - s, cy + s * 0.4f, cx, cy + s * 1.3f, paint)
-            canvas.drawLine(cx + s, cy + s * 0.4f, cx, cy + s * 1.3f, paint)
-        }
-    }
-
-        /**
-     * Comment like button.
-     * - Initial state from reply/main `action`/`like` (Bilibili, login cookie required).
-     * - Click: POST reply/action; success keeps optimistic UI (action API returns no state).
-     * - Re-enter page: fetchComments refreshes action from server — no local store.
-     */
-    private inner class LikeButton(context: Context, private val comment: VideoComment) : View(context) {
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            textSize = dpf(11f)
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-        }
-        // Seed from reply/main, then overlay a just-confirmed action if the
-        // server action field has not caught up yet (few-second lag).
-        private var liked: Boolean
-        private var likes: Long
-        private var inFlight = false
-
-        init {
-            val bridged = LikeStateBridge.resolveComment(comment.id, comment.liked, comment.likes)
-            liked = bridged.first
-            likes = bridged.second
-            isClickable = true
-            setOnClickListener { toggleLike() }
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            val color = if (liked) COLOR_ROSE else COLOR_MUTED
-            paint.color = color
-            paint.strokeWidth = dpf(1.7f)
-            paint.strokeCap = Paint.Cap.ROUND
-            paint.strokeJoin = Paint.Join.ROUND
-            val cx = dpf(10f)
-            val cy = height / 2f
-            // 与动作栏点赞同款：拇指上扬线条手势；激活时实心
-            paint.style = if (liked) Paint.Style.FILL_AND_STROKE else Paint.Style.STROKE
-            val thumb = Path().apply {
-                // 拇指
-                moveTo(cx - dpf(1.2f), cy - dpf(5.8f))
-                quadTo(cx + dpf(1.6f), cy - dpf(7.2f), cx + dpf(3.2f), cy - dpf(4.4f))
-                lineTo(cx + dpf(2.2f), cy - dpf(1.2f))
-                // 手掌上沿
-                lineTo(cx + dpf(5.6f), cy - dpf(0.6f))
-                quadTo(cx + dpf(7.2f), cy + dpf(0.2f), cx + dpf(6.6f), cy + dpf(2.6f))
-                // 掌底
-                lineTo(cx + dpf(5.8f), cy + dpf(5.6f))
-                quadTo(cx + dpf(5.2f), cy + dpf(6.8f), cx + dpf(3.6f), cy + dpf(6.6f))
-                lineTo(cx - dpf(3.8f), cy + dpf(6.4f))
-                quadTo(cx - dpf(5.4f), cy + dpf(6.2f), cx - dpf(5.6f), cy + dpf(4.6f))
-                lineTo(cx - dpf(5.4f), cy + dpf(0.6f))
-                quadTo(cx - dpf(5.2f), cy - dpf(1.0f), cx - dpf(3.4f), cy - dpf(1.4f))
-                // 回到拇指根
-                lineTo(cx - dpf(1.8f), cy - dpf(1.6f))
-                close()
-            }
-            canvas.drawPath(thumb, paint)
-            val text = if (likes > 0L) formatViews(likes) else ""
-            if (text.isNotEmpty()) {
-                textPaint.color = color
-                canvas.drawText(text, dpf(20f), cy + textPaint.textSize / 2f - dpf(1f), textPaint)
-            }
-        }
-
-        private fun toggleLike() {
-            if (inFlight) return
-            if (!BiliSessionStore.isLoggedIn()) {
-                showSnackbar("请先登录后再点赞评论")
-                return
-            }
-            val aid = currentDetail?.aid ?: 0L
-            if (aid <= 0L || comment.id <= 0L) {
-                showSnackbar("评论信息未就绪，请稍后再试")
-                return
-            }
-            val previousLiked = liked
-            val previousLikes = likes
-            val newLiked = !previousLiked
-            // Optimistic UI only after we will confirm POST code==0.
-            // Count is approximate until next list refresh (B站 like 字段有延迟).
-            liked = newLiked
-            likes = (previousLikes + if (newLiked) 1 else -1).coerceAtLeast(0L)
-            inFlight = true
-            isEnabled = false
-            animate().scaleX(1.3f).scaleY(1.3f).setDuration(110)
-                .withEndAction { animate().scaleX(1f).scaleY(1f).setDuration(150).start() }.start()
-            invalidate()
-            BiliApi.postCommentLike(aid, comment.id, newLiked) { ok, error ->
-                if (isFinishing || isDestroyed) return@postCommentLike
-                inFlight = false
-                isEnabled = true
-                if (ok) {
-                    // Keep optimistic state and bridge the short reply.action lag
-                    // so an immediate re-enter still shows the confirmed action.
-                    LikeStateBridge.rememberComment(comment.id, liked, likes)
-                    invalidate()
-                } else {
-                    liked = previousLiked
-                    likes = previousLikes
-                    invalidate()
-                    showSnackbar(error ?: "评论点赞失败，请稍后再试")
-                }
-            }
-        }
-    }
 
 /** Action bar icon: modern outline style (thin strokes, no emoji) + label. */
     private inner class ActionIconView(context: Context, private val kind: Int) : View(context) {
@@ -4635,16 +5254,25 @@ class VideoDetailActivity : Activity() {
     /** Floating pill showing brightness/volume level while adjusting via vertical drag. */
     private inner class AdjustIndicator(context: Context) : View(context) {
         private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xCC1A1A1A.toInt(); style = Paint.Style.FILL
+            color = 0xCC14161B.toInt(); style = Paint.Style.FILL
+        }
+        private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0x33FFFFFF; style = Paint.Style.STROKE; strokeWidth = dpf(1f)
         }
         private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0x40FFFFFF.toInt(); style = Paint.Style.FILL
+            color = 0x3DFFFFFF; style = Paint.Style.FILL
         }
         private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xFFFFB7D2.toInt(); style = Paint.Style.FILL
+            color = Ds.colors.accent; style = Paint.Style.FILL
         }
         private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE; textAlign = Paint.Align.CENTER
+            typeface = Ds.body(bold = true)
+            fontFeatureSettings = "tnum"
+        }
+        private val glyphPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE; style = Paint.Style.STROKE
+            strokeWidth = dpf(1.7f); strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
         }
         var mode = 1 // 1 brightness, 2 volume
             set(value) { field = value; invalidate() }
@@ -4654,10 +5282,53 @@ class VideoDetailActivity : Activity() {
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             val w = width.toFloat(); val h = height.toFloat()
-            canvas.drawRoundRect(RectF(0f, 0f, w, h), dpf(12f), dpf(12f), bgPaint)
-            iconPaint.textSize = dpf(17f)
-            canvas.drawText(if (mode == 1) "☀" else "♪", w / 2f, dpf(30f), iconPaint)
-            val barLeft = w / 2f - dpf(2.5f)
+            val rect = RectF(0.5f, 0.5f, w - 0.5f, h - 0.5f)
+            canvas.drawRoundRect(rect, dpf(16f), dpf(16f), bgPaint)
+            canvas.drawRoundRect(rect, dpf(16f), dpf(16f), borderPaint)
+
+            val cx = w / 2f
+            val iconCy = dpf(24f)
+            if (mode == 1) {
+                // 极简太阳图标（圆心 + 8 条短射线）
+                val r = dpf(4.2f)
+                canvas.drawCircle(cx, iconCy, r, glyphPaint)
+                val innerR = dpf(6.5f)
+                val outerR = dpf(8.5f)
+                for (i in 0 until 8) {
+                    val a = i * Math.PI / 4.0
+                    canvas.drawLine(
+                        cx + (innerR * cos(a)).toFloat(), iconCy + (innerR * sin(a)).toFloat(),
+                        cx + (outerR * cos(a)).toFloat(), iconCy + (outerR * sin(a)).toFloat(),
+                        glyphPaint
+                    )
+                }
+            } else {
+                // 极简喇叭 + 声波
+                val spk = Path().apply {
+                    moveTo(cx - dpf(5.5f), iconCy - dpf(2.2f))
+                    lineTo(cx - dpf(2.8f), iconCy - dpf(2.2f))
+                    lineTo(cx + dpf(1.2f), iconCy - dpf(5.5f))
+                    lineTo(cx + dpf(1.2f), iconCy + dpf(5.5f))
+                    lineTo(cx - dpf(2.8f), iconCy + dpf(2.2f))
+                    lineTo(cx - dpf(5.5f), iconCy + dpf(2.2f))
+                    close()
+                }
+                canvas.drawPath(spk, glyphPaint)
+                if (fraction > 0.02f) {
+                    canvas.drawArc(
+                        RectF(cx - dpf(1f), iconCy - dpf(4f), cx + dpf(5.5f), iconCy + dpf(4f)),
+                        -45f, 90f, false, glyphPaint
+                    )
+                }
+                if (fraction > 0.45f) {
+                    canvas.drawArc(
+                        RectF(cx - dpf(1f), iconCy - dpf(6.8f), cx + dpf(8.2f), iconCy + dpf(6.8f)),
+                        -45f, 90f, false, glyphPaint
+                    )
+                }
+            }
+
+            val barLeft = cx - dpf(2.5f)
             val barTop = dpf(42f)
             val barBot = h - dpf(30f)
             canvas.drawRoundRect(RectF(barLeft, barTop, barLeft + dpf(5f), barBot), dpf(2.5f), dpf(2.5f), trackPaint)
@@ -4666,8 +5337,8 @@ class VideoDetailActivity : Activity() {
                 canvas.drawRoundRect(RectF(barLeft, barBot - fillH, barLeft + dpf(5f), barBot),
                     dpf(2.5f), dpf(2.5f), fillPaint)
             }
-            iconPaint.textSize = dpf(12f)
-            canvas.drawText("${(fraction * 100).roundToInt()}", w / 2f, h - dpf(12f), iconPaint)
+            iconPaint.textSize = dpf(11.5f)
+            canvas.drawText("${(fraction * 100).roundToInt()}%", cx, h - dpf(12f), iconPaint)
         }
     }
 
@@ -4676,17 +5347,17 @@ class VideoDetailActivity : Activity() {
         init { setWillNotDraw(false) }
 
         private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0x44FFFFFF.toInt(); style = Paint.Style.FILL
+            color = 0x40FFFFFF.toInt(); style = Paint.Style.FILL
         }
         // Buffered (prefetched) segment: white, drawn between played and unplayed.
         private val bufferedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = 0xB3FFFFFF.toInt(); style = Paint.Style.FILL
         }
         private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xFFFFB7D2.toInt(); style = Paint.Style.FILL
+            color = Ds.colors.accent; style = Paint.Style.FILL
         }
         private val thumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xFFFFB7D2.toInt(); style = Paint.Style.FILL
+            color = Ds.colors.accent; style = Paint.Style.FILL
         }
         private val thumbBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = dpf(2f)
@@ -4696,6 +5367,7 @@ class VideoDetailActivity : Activity() {
         var bufferedWidth = 0f
             private set
         var isDragging = false
+        private val barRect = RectF()
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
@@ -4704,19 +5376,18 @@ class VideoDetailActivity : Activity() {
             val trackY = (h - trackH) / 2f
             val r = trackH / 2f
 
-            // Track background
-            canvas.drawRoundRect(RectF(0f, trackY, width.toFloat(), trackY + trackH), r, r, trackPaint)
-            // Buffered (prefetched) portion — white, sits right of the played part
+            barRect.set(0f, trackY, width.toFloat(), trackY + trackH)
+            canvas.drawRoundRect(barRect, r, r, trackPaint)
             val fw = fillWidth.coerceAtLeast(0f)
             val bw = bufferedWidth.coerceAtLeast(fw)
             if (bw > 0) {
-                canvas.drawRoundRect(RectF(fw, trackY, bw, trackY + trackH), r, r, bufferedPaint)
+                barRect.set(fw, trackY, bw, trackY + trackH)
+                canvas.drawRoundRect(barRect, r, r, bufferedPaint)
             }
-            // Filled portion
             if (fw > 0) {
-                canvas.drawRoundRect(RectF(0f, trackY, fw, trackY + trackH), r, r, fillPaint)
+                barRect.set(0f, trackY, fw, trackY + trackH)
+                canvas.drawRoundRect(barRect, r, r, fillPaint)
             }
-            // Thumb
             val thumbR = dpf(5f)
             val thumbX = fw.coerceIn(thumbR, width.toFloat() - thumbR)
             canvas.drawCircle(thumbX, h / 2f, thumbR, thumbPaint)
@@ -4732,9 +5403,13 @@ class VideoDetailActivity : Activity() {
             val p = exoPlayer ?: return
             val duration = playerGlobalDuration(p)
             if (duration > 0L && width > 0 && !isDragging) {
-                fillWidth = (playerGlobalPosition(p).toFloat() / duration.toFloat()) * width
-                bufferedWidth = (playerGlobalBufferedPosition(p).toFloat() / duration.toFloat()) * width
-                invalidate()
+                val fill = (playerGlobalPosition(p).toFloat() / duration.toFloat()).coerceIn(0f, 1f) * width
+                val buffered = (playerGlobalBufferedPosition(p).toFloat() / duration.toFloat()).coerceIn(0f, 1f) * width
+                if (abs(fill - fillWidth) >= 0.5f || abs(buffered - bufferedWidth) >= 0.5f) {
+                    fillWidth = fill
+                    bufferedWidth = buffered
+                    invalidate()
+                }
             }
         }
     }
@@ -4751,6 +5426,9 @@ class VideoDetailActivity : Activity() {
             color = COLOR_COVER
         }
         private val shaderMatrix = Matrix()
+        private var cachedShaderBmp: Bitmap? = null
+        private var cachedShaderW = 0
+        private var cachedShaderH = 0
 
         init {
             // Background must stay transparent; placeholder is drawn as a circle.
@@ -4773,14 +5451,12 @@ class VideoDetailActivity : Activity() {
             val radius = minOf(width, height) / 2f
             val cx = width / 2f
             val cy = height / 2f
-            // Circular placeholder so empty/loading states never show a square halo.
             canvas.drawCircle(cx, cy, radius, placeholderPaint)
 
             val d = drawable ?: return
             val bmp = when (d) {
                 is BitmapDrawable -> d.bitmap
                 else -> {
-                    // Fallback: clip any non-bitmap drawable to a circle.
                     val saved = canvas.save()
                     canvas.clipPath(Path().apply {
                         addCircle(cx, cy, radius, Path.Direction.CW)
@@ -4792,15 +5468,20 @@ class VideoDetailActivity : Activity() {
                 }
             } ?: return
             if (bmp.isRecycled) return
-            val scale = (width.toFloat() / bmp.width.coerceAtLeast(1))
-                .coerceAtLeast(height.toFloat() / bmp.height.coerceAtLeast(1))
-            val dx = (width - bmp.width * scale) * 0.5f
-            val dy = (height - bmp.height * scale) * 0.5f
-            shaderMatrix.setScale(scale, scale)
-            shaderMatrix.postTranslate(dx, dy)
-            val shader = BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
-            shader.setLocalMatrix(shaderMatrix)
-            shaderPaint.shader = shader
+            if (cachedShaderBmp !== bmp || cachedShaderW != width || cachedShaderH != height) {
+                cachedShaderBmp = bmp
+                cachedShaderW = width
+                cachedShaderH = height
+                val scale = (width.toFloat() / bmp.width.coerceAtLeast(1))
+                    .coerceAtLeast(height.toFloat() / bmp.height.coerceAtLeast(1))
+                val dx = (width - bmp.width * scale) * 0.5f
+                val dy = (height - bmp.height * scale) * 0.5f
+                shaderMatrix.setScale(scale, scale)
+                shaderMatrix.postTranslate(dx, dy)
+                val shader = BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+                shader.setLocalMatrix(shaderMatrix)
+                shaderPaint.shader = shader
+            }
             canvas.drawCircle(cx, cy, radius, shaderPaint)
         }
     }
@@ -4838,20 +5519,30 @@ class VideoDetailActivity : Activity() {
                     }
                     if (gestureSeeking) {
                         val p = exoPlayer ?: return true
-                        val duration = playerGlobalDuration(p)
+                        val duration = gestureSeekDuration
                         if (duration <= 0L) return true
-                        val seekDelta = ((dx / width.toFloat().coerceAtLeast(1f)) * duration).toLong()
+                        val seekDelta = ((dx / width.toFloat().coerceAtLeast(1f)) * duration * 0.65f).toLong()
                         val newPos = (gestureSeekStartPos + seekDelta).coerceIn(0L, duration)
-                        seekPlayerGlobal(p, newPos)
+                        gestureSeekTargetPos = newPos
                         onManualSeek(newPos, duration)
+                        showSeekHint(newPos, duration)
                     } else if (adjustMode != 0) {
                         applyAdjust(dy)
                     } else {
                         // Decide gesture type: horizontal drag → seek; vertical drag on the
                         // left/right third → brightness/volume; otherwise pass to detector.
                         if (!gestureSeeking && abs(dx) > dpf(20f) && abs(dx) > abs(dy) * 1.5f) {
-                            gestureSeeking = true
-                            gestureSeekStartPos = exoPlayer?.let { playerGlobalPosition(it) } ?: 0L
+                            val p = exoPlayer
+                            val dur = if (p != null) playerGlobalDuration(p) else 0L
+                            if (p != null && dur > 0L) {
+                                gestureSeeking = true
+                                isSeeking = true
+                                gestureSeekDuration = dur
+                                gestureSeekStartPos = playerGlobalPosition(p)
+                                gestureSeekTargetPos = gestureSeekStartPos
+                                gestureSeekWasPlaying = p.playWhenReady && userWantsPlayback
+                                controlsHideRunnable?.let(handler::removeCallbacks)
+                            }
                         } else if (abs(dy) > dpf(20f) && abs(dy) > abs(dx) * 1.2f && width > 0) {
                             val zone = when {
                                 gestureStartX < width / 3f -> 1 // brightness
@@ -4881,14 +5572,26 @@ class VideoDetailActivity : Activity() {
                         adjustMode = 0
                         hideAdjust()
                     }
-                    if (boosted) {
+                    if (gestureSeeking) {
+                        val p = exoPlayer
+                        if (ev.actionMasked == MotionEvent.ACTION_UP && p != null && gestureSeekDuration > 0L) {
+                            seekPlayerGlobal(p, gestureSeekTargetPos)
+                            danmakuController?.onSeeked(gestureSeekTargetPos)
+                        }
+                        if (gestureSeekWasPlaying && activityResumed && userWantsPlayback) {
+                            p?.play()
+                        }
+                        isSeeking = false
+                        hideSeekHint()
+                        if (p?.isPlaying == true || gestureSeekWasPlaying) scheduleAutoHide()
+                    } else if (boosted) {
                         // A boost release must not also toggle the controls: feed a synthetic
                         // CANCEL to the detector so it skips single-tap confirmation.
                         val synthetic = MotionEvent.obtain(ev)
                         synthetic.action = MotionEvent.ACTION_CANCEL
                         gestureDetector.onTouchEvent(synthetic)
                         synthetic.recycle()
-                    } else if (!gestureSeeking) {
+                    } else {
                         gestureDetector.onTouchEvent(ev)
                     }
                     gestureSeeking = false
@@ -5081,69 +5784,416 @@ class VideoDetailActivity : Activity() {
         }
     }
 
-    override fun onBackPressed() { if (isFullscreen) toggleFullscreen() else super.onBackPressed() }
+    /** 电池图标：外壳 + 正极 + 内部电量填充，低电变红、充电变绿并叠加闪电。 */
+    private inner class BatteryStatusIcon(context: Context) : View(context) {
+        private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dpf(1.2f)
+        }
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val shellRect = RectF()
+        private val capRect = RectF()
+        private val fillRect = RectF()
+        private val boltPath = Path()
+        private var percent = -1
+        private var charging = false
+
+        private fun dpf(v: Float): Float = v * resources.displayMetrics.density
+
+        fun update(level: Int, isCharging: Boolean) {
+            if (percent == level && charging == isCharging) return
+            percent = level
+            charging = isCharging
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val cy = height / 2f
+            val bodyW = dpf(15.5f)
+            val bodyH = dpf(9.5f)
+            val ox = (width - dpf(18f)) / 2f
+            val top = cy - bodyH / 2f
+            val bot = cy + bodyH / 2f
+            val radius = dpf(2f)
+
+            val lowBattery = !charging && percent in 0..20
+            val shellColor = when {
+                charging -> 0xE6FFFFFF.toInt()
+                lowBattery -> 0xFFEB6F79.toInt()
+                percent < 0 -> 0x99FFFFFF.toInt()
+                else -> 0xD9FFFFFF.toInt()
+            }
+            strokePaint.color = shellColor
+            shellRect.set(
+                ox + dpf(0.6f), top + dpf(0.6f),
+                ox + bodyW - dpf(0.6f), bot - dpf(0.6f)
+            )
+            canvas.drawRoundRect(shellRect, radius, radius, strokePaint)
+
+            fillPaint.color = shellColor
+            capRect.set(
+                ox + bodyW + dpf(0.5f), cy - dpf(2.2f),
+                ox + bodyW + dpf(2.1f), cy + dpf(2.2f)
+            )
+            canvas.drawRoundRect(capRect, dpf(0.8f), dpf(0.8f), fillPaint)
+
+            if (percent >= 0) {
+                fillPaint.color = when {
+                    charging -> 0xFF70C493.toInt()
+                    lowBattery -> 0xFFEB6F79.toInt()
+                    else -> 0xE6FFFFFF.toInt()
+                }
+                val inL = ox + dpf(2f)
+                val inT = top + dpf(2f)
+                val inB = bot - dpf(2f)
+                val maxW = bodyW - dpf(4f)
+                val inR = inL + (maxW * (percent / 100f)).coerceIn(0f, 1f)
+                if (inR - inL >= dpf(1.2f)) {
+                    fillRect.set(inL, inT, inR, inB)
+                    canvas.drawRoundRect(fillRect, dpf(0.9f), dpf(0.9f), fillPaint)
+                }
+            }
+
+            if (charging) {
+                val bx = ox + bodyW / 2f
+                fillPaint.color = 0xFFFFFFFF.toInt()
+                boltPath.rewind()
+                boltPath.moveTo(bx + dpf(0.6f), cy - dpf(3.8f))
+                boltPath.lineTo(bx - dpf(2.2f), cy + dpf(0.3f))
+                boltPath.lineTo(bx - dpf(0.1f), cy + dpf(0.3f))
+                boltPath.lineTo(bx - dpf(0.6f), cy + dpf(3.8f))
+                boltPath.lineTo(bx + dpf(2.2f), cy - dpf(0.3f))
+                boltPath.lineTo(bx + dpf(0.1f), cy - dpf(0.3f))
+                boltPath.close()
+                canvas.drawPath(boltPath, fillPaint)
+            }
+        }
+    }
+
+    /** 「下一集」图标：右指实心三角 + 右侧竖线，与 PlayPauseIcon 的实心风格一致。 */
+    /** 「后台播放」图标：耳机轮廓 + 居中播放三角，语义为转为音频继续播放。 */
+    private inner class BackgroundPlayIcon(context: Context) : View(context) {
+        private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+        }
+        private val arcRect = RectF()
+        private val earRect = RectF()
+        private val triPath = Path()
+        private var compact = true
+
+        private fun dpf(v: Float): Float = v * resources.displayMetrics.density
+
+        fun setCompact(value: Boolean) {
+            if (compact == value) return
+            compact = value
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val cx = width / 2f
+            val cy = height / 2f
+            val s = dpf(if (compact) 18f else 20f)
+            val u = s / 20f
+            strokePaint.strokeWidth = dpf(1.85f)
+
+            // 头梁
+            arcRect.set(cx - 6.8f * u, cy - 7.2f * u, cx + 6.8f * u, cy + 6.4f * u)
+            canvas.drawArc(arcRect, 180f, 180f, false, strokePaint)
+            canvas.drawLine(cx - 6.8f * u, cy - 0.4f * u, cx - 6.8f * u, cy + 2.0f * u, strokePaint)
+            canvas.drawLine(cx + 6.8f * u, cy - 0.4f * u, cx + 6.8f * u, cy + 2.0f * u, strokePaint)
+
+            // 左右耳罩
+            earRect.set(cx - 7.2f * u, cy + 0.8f * u, cx - 4.4f * u, cy + 6.4f * u)
+            canvas.drawRoundRect(earRect, 1.5f * u, 1.5f * u, strokePaint)
+            earRect.set(cx + 4.4f * u, cy + 0.8f * u, cx + 7.2f * u, cy + 6.4f * u)
+            canvas.drawRoundRect(earRect, 1.5f * u, 1.5f * u, strokePaint)
+
+            // 居中播放三角
+            triPath.rewind()
+            triPath.moveTo(cx - 1.6f * u, cy - 0.8f * u)
+            triPath.lineTo(cx + 2.5f * u, cy + 1.8f * u)
+            triPath.lineTo(cx - 1.6f * u, cy + 4.4f * u)
+            triPath.close()
+            canvas.drawPath(triPath, fillPaint)
+        }
+    }
+
+    private inner class NextEpisodeIcon(context: Context) : View(context) {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE; style = Paint.Style.FILL
+        }
+        private val path = Path()
+        private val barRect = RectF()
+
+        private fun dpf(v: Float): Float = v * resources.displayMetrics.density
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val cx = width / 2f
+            val cy = height / 2f
+            path.reset()
+            path.moveTo(cx - dpf(6.5f), cy - dpf(6f))
+            path.lineTo(cx + dpf(2.2f), cy)
+            path.lineTo(cx - dpf(6.5f), cy + dpf(6f))
+            path.close()
+            canvas.drawPath(path, paint)
+            barRect.set(
+                cx + dpf(4f), cy - dpf(5.8f),
+                cx + dpf(6.5f), cy + dpf(5.8f)
+            )
+            canvas.drawRoundRect(barRect, dpf(0.9f), dpf(0.9f), paint)
+        }
+    }
+
+    private fun openDanmakuSettingsDrawer() {
+        if (!isFullscreen || isLocalMode) return
+        danmakuSettingsDrawer?.open()
+    }
+
+    private fun bindDanmakuForCurrentMedia() {
+        if (isLocalMode) return
+        val cid = currentCid
+        if (cid <= 0L) return
+        val referer = if (currentBvid.isNotBlank()) {
+            "https://www.bilibili.com/video/$currentBvid/"
+        } else {
+            "https://www.bilibili.com/"
+        }
+        val durationMs = exoPlayer?.let { playerGlobalDuration(it) }?.takeIf { it > 0L }
+            ?: playingStream?.durationMs?.takeIf { it > 0L }
+            ?: currentDetail?.duration?.toLong()?.times(1000L)
+            ?: 0L
+        danmakuController?.bindMedia(
+            cid = cid,
+            aid = currentAid,
+            referer = referer,
+            durationMs = durationMs,
+            isLocalMode = false
+        )
+    }
+
+    override fun onBackPressed() {
+        if (danmakuSettingsDrawer?.opened == true) {
+            danmakuSettingsDrawer?.close()
+            return
+        }
+        if (seasonDrawerOpen) {
+            closeSeasonDrawer()
+            return
+        }
+        if (isFullscreen) toggleFullscreen() else super.onBackPressed()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (!playbackStopped || isFinishing || !::playerView.isInitialized) return
+        playbackStopped = false
+        val restoreSource = resumePlayerOnStart
+        val restoreDetails = resumeDetailOnStart
+        resumePlayerOnStart = false
+        resumeDetailOnStart = false
+        val sessionChanged = !isLocalMode && streamSession.isNotBlank() && streamSession != BiliSessionStore.cookie()
+        // 如果切后台期间保留了原 ExoPlayer 实例且账号未变更、无播放错误、流未临期，直接重绑视图即可；
+        // 否则重新拉取播放地址并准备播放器。
+        val retained = exoPlayer
+        val retainedUsable = retained != null &&
+            playerListener != null &&
+            retained.playerError == null &&
+            !sessionChanged &&
+            (isLocalMode || playingStream?.let { !BiliPlayUrl.isStreamNearExpiry(it) } != false)
+        if (retainedUsable) {
+            playerView.player = retained
+            playerSpinner.visibility = View.GONE
+            if (retained.playbackState == Player.STATE_ENDED) {
+                endedState = true
+                playPauseBtn.setEnded(true)
+                showReplay(true)
+            }
+            bindDanmakuForCurrentMedia()
+            updatePlaybackProgress()
+        } else {
+            if (retained != null) {
+                releasePlayer()
+            }
+            if (restoreSource) {
+                if (isLocalMode) {
+                    loadLocalPlayer()
+                } else if (currentCid > 0L && currentBvid.isNotBlank()) {
+                    val cached = playingStream?.takeIf {
+                        !sessionChanged &&
+                            SystemClock.elapsedRealtime() - streamLoadedAt < STREAM_RESUME_TTL_MS &&
+                            !BiliPlayUrl.isStreamNearExpiry(it)
+                    }
+                    if (cached != null) {
+                        startExoPlayer(cached, beginPlaybackChange())
+                    } else {
+                        playRetryCount = 0
+                        loadPlayer(bypassCache = sessionChanged)
+                    }
+                }
+            }
+        }
+        if (!isLocalMode && restoreDetails) loadVideoAndPlayer()
+    }
+
     override fun onResume() {
         super.onResume()
         activityResumed = true
-        if (userWantsPlayback) exoPlayer?.play()
-        // User may have just finished logging in from the comment login hint: refresh.
+        backgroundSwitchLocked = false
+        updateBackgroundPlayVisibility()
+        registerStatusReceiver()
+        updateStatusClock()
+        refreshBatteryState()
+        if (userWantsPlayback && !endedState && playerListener != null) exoPlayer?.play()
+        updatePlaybackProgress()
         if (commentsLoaded && commentLoginHintShown && BiliSessionStore.isLoggedIn()) {
             commentLoginHintShown = false
             loadComments(reset = true)
         }
     }
+
     override fun onPause() {
         reportPlayHistory(status = 2)
-        handler.removeCallbacks(historyTick)
         activityResumed = false
+        handler.removeCallbacks(historyTick)
+        handler.removeCallbacks(progressUpdater)
+        controlsHideRunnable?.let(handler::removeCallbacks)
+        cancelLongPressBoost()
+        unregisterStatusReceiver()
+        closeSeasonDrawer(immediate = true)
+        danmakuSettingsDrawer?.close(immediate = true)
         exoPlayer?.pause()
+        danmakuView.setPlaying(false)
         super.onPause()
     }
+
+    override fun onStop() {
+        danmakuController?.onStop()
+        if (::playerView.isInitialized) {
+            val retained = exoPlayer
+            val hasPreparedReadyPlayer = retained != null &&
+                playerListener != null &&
+                retained.playerError == null &&
+                retained.playbackState != Player.STATE_IDLE &&
+                playerError.visibility != View.VISIBLE
+            resumePlayerOnStart = playerError.visibility != View.VISIBLE &&
+                (playerListener != null || playbackRequest != null)
+            resumeDetailOnStart = detailRequest != null
+            rememberPlaybackPosition()
+            if (playbackRequest != null || retryScheduled) playingStream = null
+            playbackStopped = true
+            // 若播放器已真正就绪且无错误，保留 ExoPlayer 实例与已缓冲数据，仅解绑视频渲染表面；
+            // 仍在 IDLE/未就绪、已有错误、或正在切换配置销毁时释放。
+            val keepPreparedPlayer = !isChangingConfigurations && !isFinishing && hasPreparedReadyPlayer
+            if (keepPreparedPlayer) {
+                playbackRequest?.cancel()
+                playbackRequest = null
+                detailRequest?.cancel()
+                detailRequest = null
+                playerView.player = null
+            } else {
+                cancelPlaybackRequests()
+                releasePlayer()
+            }
+        }
+        super.onStop()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        rememberPlaybackPosition()
+        outState.putString(EXTRA_BVID, currentBvid)
+        outState.putLong(EXTRA_AID, currentAid)
+        outState.putLong(EXTRA_CID, currentCid)
+        outState.putLong(STATE_PLAY_POSITION, pendingResumePositionMs)
+        outState.putInt(STATE_SEGMENT_INDEX, resumeSegmentIndex)
+        outState.putInt(STATE_SPEED_INDEX, speedIndex)
+        outState.putBoolean(STATE_PLAY_WHEN_READY, userWantsPlayback)
+        outState.putBoolean(STATE_PLAY_ENDED, restoreEndedState)
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onDestroy() {
-        reportPlayHistory(status = 2)
-        handler.removeCallbacks(historyTick)
+        commentPrefetchHandle?.cancel()
+        commentPrefetchHandle = null
+        DanmakuSettingsStore.removeListener(danmakuUiSettingsListener)
+        danmakuController?.onDestroy()
+        danmakuController = null
+        unregisterStatusReceiver()
+        cancelPlaybackRequests()
         handler.removeCallbacksAndMessages(null)
         titleHeightAnimator?.cancel()
         descHeightAnimator?.cancel()
-        if (::playerView.isInitialized) playerView.player = null
-        exoPlayer?.release(); exoPlayer = null
+        if (::playerView.isInitialized) releasePlayer()
         super.onDestroy()
     }
 
-    /** Watch-history heartbeat: report the current playback progress. */
-    private val historyTick: Runnable = Runnable {
-        if (exoPlayer?.isPlaying == true) {
-            reportPlayHistory(status = 3)
-            handler.postDelayed(historyTick, 30_000L)
+    private fun cancelPlaybackRequests() {
+        playbackGeneration++
+        detailGeneration++
+        playbackRequest?.cancel()
+        detailRequest?.cancel()
+        playbackRequest = null
+        detailRequest = null
+    }
+
+    private fun releasePlayer() {
+        val player = exoPlayer ?: return
+        playerListener?.let(player::removeListener)
+        playerListener = null
+        exoPlayer = null
+        playerView.player = null
+        player.release()
+    }
+
+    private val historyTick = object : Runnable {
+        override fun run() {
+            if (activityResumed && exoPlayer?.isPlaying == true) {
+                reportPlayHistory(status = 3)
+                handler.postDelayed(this, 30_000L)
+            }
         }
     }
 
     private fun reportPlayHistory(status: Int) {
-        // 本地文件播放不向 B 站上报观看进度
-        if (isLocalMode) return
-        val item = currentDetail ?: return
+        if (isLocalMode || playerListener == null || currentAid <= 0L || currentCid <= 0L) return
         val player = exoPlayer ?: return
-        val aid = item.aid
-        val cid = item.cid
-        if (aid <= 0L || cid <= 0L) return
-        val progress = (player.currentPosition / 1000L).coerceAtLeast(0L)
-        val duration = (player.duration / 1000L).coerceAtLeast(0L)
-        BiliApi.reportHistory(aid, cid, progress, duration, status)
+        val progress = playerGlobalPosition(player) / 1000L
+        val duration = playerGlobalDuration(player) / 1000L
+        BiliApi.reportHistory(currentAid, currentCid, progress, duration, status)
     }
 
     companion object {
         const val EXTRA_BVID = "bvid"
         const val EXTRA_AID = "aid"
+        const val EXTRA_CID = "cid"
         const val EXTRA_LOCAL_TASK_ID = "local_task_id"
-        /** Comments longer than this start collapsed with an expand control. */
-        private const val COMMENT_COLLAPSE_CHARS = 50
-        /** Approximate visible lines while collapsed (about 50 CJK chars). */
-        private const val COMMENT_COLLAPSE_LINES = 3
-        /** Shared bounded pool for inline emote image loads. */
-        private val EMOTE_POOL: ExecutorService = Executors.newFixedThreadPool(2)
+        const val EXTRA_LOCAL_SORT_ORDER = "local_sort_order"
+        private const val STATE_PLAY_POSITION = "play_position"
+        private const val STATE_PLAY_WHEN_READY = "play_when_ready"
+        private const val STATE_PLAY_ENDED = "play_ended"
+        private const val STATE_SEGMENT_INDEX = "segment_index"
+        private const val STATE_SPEED_INDEX = "speed_index"
+        private const val STREAM_RESUME_TTL_MS = 5 * 60_000L
+        /** 卡在 BUFFERING 多久后强制重试。 */
+        private const val STALL_TIMEOUT_MS = 20_000L
+        /** 看门狗最多连续重试次数，避免无限重建。 */
+        private const val MAX_STALL_RETRIES = 2
+        /** Comments longer than this line count collapse cleanly. */
+        private const val COMMENT_COLLAPSE_LINES = 4
         /** Brightness/volume indicator scale when the player is NOT fullscreen. */
         private const val COMPACT_ADJUST_SCALE = 0.68f
         private const val KEY_LAST_QUALITY = "last_quality"
+        private const val KEY_LOCAL_SORT_ORDER = "local_sort_order"
+        private const val KEY_LOCAL_PLAY_MODE = "local_play_mode"
         private val SUPPORTED_QUALITIES = setOf(
             BiliPlayUrl.QUALITY_360, BiliPlayUrl.QUALITY_480, BiliPlayUrl.QUALITY_720,
             BiliPlayUrl.QUALITY_1080, BiliPlayUrl.QUALITY_1080_PLUS, BiliPlayUrl.QUALITY_4K,
@@ -5154,11 +6204,12 @@ class VideoDetailActivity : Activity() {
         const val KIND_FAVORITE = 1
         const val KIND_DOWNLOAD = 2
         const val KIND_SHARE = 3
-        fun open(context: Context, bvid: String, aid: Long = 0L) {
-            if (bvid.isNotBlank() || aid > 0L)
-                context.startActivity(Intent(context, VideoDetailActivity::class.java)
-                    .putExtra(EXTRA_BVID, bvid)
-                    .putExtra(EXTRA_AID, aid))
+        fun open(context: Context, bvid: String, aid: Long = 0L, cid: Long = 0L) {
+            if (bvid.isBlank() && aid <= 0L) return
+            context.startActivity(Intent(context, VideoDetailActivity::class.java)
+                .putExtra(EXTRA_BVID, bvid)
+                .putExtra(EXTRA_AID, aid)
+                .putExtra(EXTRA_CID, cid))
         }
 
         /** 播放本地下载任务（复用同一播放器，本地模式只显示标题/大小/时长）。 */
@@ -5166,31 +6217,43 @@ class VideoDetailActivity : Activity() {
             context.startActivity(Intent(context, VideoDetailActivity::class.java)
                 .putExtra(EXTRA_LOCAL_TASK_ID, taskId))
         }
-
-        /** Shared OkHttp client: keeps the connection pool & TLS sessions alive across players,
-         *  so replaying or switching quality skips TCP/TLS handshakes. */
-        private val mediaOkClient: OkHttpClient by lazy {
-            OkHttpClient.Builder()
-                .connectTimeout(8, TimeUnit.SECONDS)
-                .readTimeout(25, TimeUnit.SECONDS)
-                // Never cap the total lifetime of a long Range request: callTimeout
-                // previously killed valid playback after 25 seconds on slow links.
-                .callTimeout(0, TimeUnit.MILLISECONDS)
-                .followRedirects(true)
-                .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
-                .addInterceptor { chain ->
-                    val request = chain.request().newBuilder()
-                        .header("User-Agent", CDN_USER_AGENT)
-                        .header("Referer", "https://www.bilibili.com/")
-                        .header("Origin", "https://www.bilibili.com")
-                        .header("Accept", "*/*")
-                        // Never inject API cookies (CURRENT_FNVAL / SESSDATA) here:
-                        // this client only serves CDN media requests, and CDN nodes
-                        // reject such cookies when the buvid fingerprint is missing.
-                        // Playback requests set their own minimal cookie explicitly.
-                        .build()
-                    chain.proceed(request)
-                }.build()
-        }
     }
+}
+
+internal fun formatQualityButtonText(id: Int): String = when (id) {
+    127 -> "8K"
+    126 -> "杜比"
+    125 -> "HDR"
+    120 -> "4K"
+    116 -> "1080p60"
+    112 -> "1080p+"
+    80 -> "1080p"
+    64 -> "720p"
+    32 -> "480p"
+    16 -> "360p"
+    else -> BiliPlayUrl.qualityLabel(id).replace("P", "p")
+}
+
+internal fun buildEmoteCandidates(rawUrl: String): List<String> =
+    CommentSectionUi.buildEmoteCandidates(rawUrl)
+
+/** 合集排序三态循环与短标签（图标胶囊旁文字）。 */
+internal fun DownloadManager.SeasonSortOrder.nextOrder(): DownloadManager.SeasonSortOrder = when (this) {
+    DownloadManager.SeasonSortOrder.DEFAULT -> DownloadManager.SeasonSortOrder.OLDEST_FIRST
+    DownloadManager.SeasonSortOrder.OLDEST_FIRST -> DownloadManager.SeasonSortOrder.NEWEST_FIRST
+    DownloadManager.SeasonSortOrder.NEWEST_FIRST -> DownloadManager.SeasonSortOrder.DEFAULT
+}
+
+internal fun DownloadManager.SeasonSortOrder.seasonLabel(): String = when (this) {
+    DownloadManager.SeasonSortOrder.DEFAULT -> "默认排序"
+    DownloadManager.SeasonSortOrder.OLDEST_FIRST -> "从旧到新"
+    DownloadManager.SeasonSortOrder.NEWEST_FIRST -> "从新到旧"
+}
+
+/** 本地合集只提供三档播放模式，历史遗留的四档值统一回退到顺序播放。 */
+internal fun DownloadManager.LocalPlayMode.seasonLabel(): String = when (this) {
+    DownloadManager.LocalPlayMode.SEASON_SEQUENCE -> "顺序播放"
+    DownloadManager.LocalPlayMode.SINGLE_LOOP -> "单集循环"
+    DownloadManager.LocalPlayMode.SHUFFLE -> "随机播放"
+    else -> "顺序播放"
 }

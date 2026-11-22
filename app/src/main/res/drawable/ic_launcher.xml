@@ -1,28 +1,63 @@
 <?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="48dp"
-    android:height="48dp"
-    android:viewportWidth="48"
-    android:viewportHeight="48">
-    <!-- Original YuiBili rose badge: a soft pink disc and an airy Y-ribbon. -->
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 通知栏 / 应用内复用矢量图标：圆润玫瑰底 + 丝带 Y-Play 徽标 -->
+    <path android:pathData="M24,6H84C93.94,6 102,14.06 102,24V84C102,93.94 93.94,102 84,102H24C14.06,102 6,93.94 6,84V24C6,14.06 14.06,6 24,6Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="12"
+                android:startY="8"
+                android:endX="96"
+                android:endY="100">
+                <item android:offset="0.0" android:color="#FFFF7AA8" />
+                <item android:offset="0.52" android:color="#FFF04C85" />
+                <item android:offset="1.0" android:color="#FFD4326B" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 底层右斜丝带 -->
+    <path android:pathData="M64.2,26.6C65.4,24.7 67.8,23.8 69.9,24.5L80.2,27.8C83.2,28.8 84.4,32.4 82.6,35.0L52.6,79.0C50.3,82.4 45.3,82.3 43.2,78.8L39.8,73.3C38.7,71.5 38.9,69.3 40.1,67.6L64.2,26.6Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="79"
+                android:startY="25"
+                android:endX="42"
+                android:endY="80">
+                <item android:offset="0.0" android:color="#F4FFFFFF" />
+                <item android:offset="1.0" android:color="#BAFFACC9" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 右翼柔和播放三角 -->
     <path
-        android:fillColor="#FFFCEFF5"
-        android:pathData="M24,1.5C11.57,1.5 1.5,11.57 1.5,24S11.57,46.5 24,46.5 46.5,36.43 46.5,24 36.43,1.5 24,1.5z" />
+        android:fillColor="#D4FFC7DC"
+        android:pathData="M56.6,45.8L82.2,44.8C86.2,44.7 88.6,49.4 86.2,52.8L76.0,66.8C73.6,70.0 69.0,70.5 66.2,67.8L55.4,57.2C53.2,55.0 53.7,48.0 56.6,45.8Z" />
+
+    <!-- 顶层左斜丝带 -->
+    <path android:pathData="M26.6,26.4C25.2,23.8 27.1,20.7 30.0,20.7H40.4C42.6,20.7 44.7,22.0 45.6,24.0L58.2,50.0C59.0,51.7 58.9,53.6 57.8,55.2L46.2,72.8C44.3,75.6 40.0,75.3 38.6,72.2L35.6,65.9C34.9,64.4 35.1,62.5 36.1,61.0L43.2,50.8L26.6,26.4Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="28"
+                android:startY="21"
+                android:endX="56"
+                android:endY="73">
+                <item android:offset="0.0" android:color="#FFFFFFFF" />
+                <item android:offset="1.0" android:color="#FFFFDFE9" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 中心白色小播放键 -->
     <path
-        android:fillColor="#FFF15298"
-        android:pathData="M24,3.5C12.68,3.5 3.5,12.68 3.5,24S12.68,44.5 24,44.5 44.5,35.32 44.5,24 35.32,3.5 24,3.5z" />
-    <path
-        android:fillColor="#FFFF9EC5"
-        android:fillAlpha="0.42"
-        android:pathData="M14,7.8C9.18,11.28 6.05,16.95 6.05,23.35c0,2.05 0.33,4.02 0.94,5.86C10.73,21.1 17.28,13.8 25.75,10.63C21.41,9.01 17.43,8.11 14,7.8z" />
-    <path
-        android:fillColor="#00FFFFFF"
-        android:strokeColor="#FFFFFFFF"
-        android:strokeWidth="4.2"
-        android:strokeLineCap="round"
-        android:strokeLineJoin="round"
-        android:pathData="M14.7,14.8L24,25.2L33.3,14.8M24,25.2L24,34.4" />
-    <path
-        android:fillColor="#FFFFD9E8"
-        android:pathData="M29.4,27.7L35.2,31.05L29.4,34.4z" />
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M65.2,45.4L79.2,53.2C81.4,54.4 81.4,57.6 79.2,58.8L65.2,66.6C63.0,67.8 60.4,66.2 60.4,63.7V48.3C60.4,45.8 63.0,44.2 65.2,45.4Z" />
 </vector>

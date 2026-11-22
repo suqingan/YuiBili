@@ -2,103 +2,89 @@
   <img src="app/src/main/res/drawable-xxxhdpi/ic_logo.png" width="104" height="104" alt="YuiBili Logo"/>
 </p>
 
-<h1 align="center">🎀 YuiBili</h1>
+<h1 align="center">YuiBili</h1>
 
 <p align="center">
-  <b>一个干净、克制、以公开内容为主的第三方哔哩哔哩客户端</b><br/>
-  <sub>原生 Android View · Kotlin · 无 Compose / 无 AppCompat</sub>
+  <b>一款干净、轻快、适配手机与平板的第三方哔哩哔哩 Android 客户端</b>
 </p>
 
 <p align="center">
-  <img alt="版本" src="https://img.shields.io/badge/%E7%89%88%E6%9C%AC-v0.1.33-ff8fb1?style=flat-square"/>
-  <img alt="Kotlin" src="https://img.shields.io/badge/Kotlin-2.0.21-7F52FF?style=flat-square"/>
-  <img alt="minSdk" src="https://img.shields.io/badge/minSdk-23-6cc24a?style=flat-square"/>
-  <img alt="targetSdk" src="https://img.shields.io/badge/targetSdk-34-4c9aff?style=flat-square"/>
-  <img alt="构建" src="https://img.shields.io/badge/%E6%9E%84%E5%BB%BA-Gradle%208.7%20%2F%20JDK%2017-lightgrey?style=flat-square"/>
+  <img alt="版本" src="https://img.shields.io/badge/%E7%89%88%E6%9C%AC-v1.0.0-ff8fb1?style=flat-square"/>
+  <img alt="架构" src="https://img.shields.io/badge/ABI-arm64--v8a-4c9aff?style=flat-square"/>
+  <img alt="系统" src="https://img.shields.io/badge/Android-6.0%2B-6cc24a?style=flat-square"/>
 </p>
 
 ---
 
-> ⚠️ 本项目与哔哩哔哩（bilibili）**无任何关联、合作、授权或背书**，仅供学习与技术交流，请勿用于商业用途。
+## 账号迁移说明
 
-## ✨ 功能特性
+本项目原仓库为 [https://github.com/Yui-Little/YuiBili](https://github.com/Yui-Little/YuiBili)。
 
-**🏠 首页**
+**我是该项目的原作者。由于原账号绑定的邮箱已出售导致无法继续登录，现将项目完整迁移至本账号继续维护与发布，后续版本更新均以本仓库为准。**
 
-- 推荐 / 热门双流，卡片复用双列网格，接近底部自动分页
-- 顶部下拉刷新（网络完成才收起）、BVID 去重、滑动窗口控制内存（480 → 360 裁剪）
-- CDN 缩略图封面 + 内存 / 磁盘 LRU，缓存命中不闪烁
+---
 
-**🔍 搜索**
+## 软件简介
 
-- 输入防抖出建议、搜索历史、排序 / 时长 / 分区筛选
-- 卡片共享元素转场
+YuiBili 追求简单、安静、顺手的看视频体验：没有广告、没有多余的推荐干扰和繁杂弹窗，专注把刷视频、看番剧、看评论、逛 UP 主主页、听音频和离线缓存这些常用事做好。
 
-**▶️ 播放**
+同时支持**手机端**与**平板端**两套独立布局，可在「我的 → 外观 → 外观适配」里随时切换。
 
-- Web / WBI DASH 链路（`fnval=4048`），Media3 播放本地 MPD，保留备用 CDN 与初始化 / 索引区间
-- 播放前探测主备节点，减少 CDN 403 导致的失败；画质严格服从账号与大会员权限
-- 多 P 列表、简介与数据、评论（热度 / 时间排序）
+---
 
-**👤 账号**
+## 主要功能
 
-- 官方登录（二维码 / 网页），Cookie 仅存应用私有存储
-- 点赞、收藏、关注、评论点赞，登录后同步到服务器
+### 首页与搜索
+- 推荐与热门内容浏览，支持下拉刷新、自动续加载与一键回顶
+- 搜索视频、番剧、影视，带搜索建议、历史记录和排序/时长筛选
 
-**⬇️ 下载**
+### 视频、番剧与弹幕
+- 清晰流畅的视频与番剧/电影播放，支持画质切换、倍速、长按 2 倍速快进、手势调亮度/音量/进度
+- 支持屏幕弹幕显示，可自由调节字号、透明度、速度、显示区域和屏蔽选项
+- 支持多 P 分集、合集连续播放、收藏夹「播放全部」
 
-- DASH 音视频分离下载、断点续传、任务队列 + 前台服务
-- 合集 / 多 P 批量下载、本地播放、相册导出（MP4 合并）
+### 评论与个人主页
+- 评论支持按热度 / 按时间查看、点赞、楼中楼展开，支持表情与高清长图查看保存
+- 点击 UP 主可进入个人空间，浏览全部动态与投稿，并支持在空间内单独搜索动态或视频
 
-**📦 其他**
+### 下载与音频听歌模式
+- 支持单视频、合集、收藏夹与番剧分集批量下载，支持断点续传与导出到相册
+- 支持「仅下载音频」与在线/离线音频播放台，自带定时关闭、后台播放与播放列表管理
 
-- 历史记录 / 收藏夹搜索、深浅主题 + 圆形揭示转场、系统减弱动画支持
-- 内置更新检查（读取 GitHub `update.json`），有新版本才提示
+### 手机 & 平板双端界面
+- **手机端**：经典简洁的底部导航与单手顺手交互
+- **平板端**：横屏左侧导航栏、4 列首页卡片、播放页左右分栏、瀑布流动态、双栏下载页与右侧悬浮音频播放列表
+- 支持浅色 / 深色主题切换
 
-## 🎨 设计语言
+---
 
-- 简约、现代、白色；暖白 + 柔和粉的品牌配色，原创粉色 Y 形丝带 Logo
-- 无文字图标化底部 Dock、克制的短动画（可打断、支持系统减弱动画）
-- 不采用实时截图模糊，避免持续的 GPU / 内存开销
+## 下载与安装
 
-## 🛠️ 技术栈
+前往本仓库右侧的 **[Releases](../../releases)** 页面，下载最新版 `arm64-v8a` 安装包（适用于绝大多数近几年的 Android 手机与平板），直接安装即可。
 
-| 类别 | 选型 |
-| --- | --- |
-| 语言 | Kotlin 2.0.21 |
-| UI | 纯原生 Android View（无 Compose / 无 AppCompat / 无 Material） |
-| 播放 | AndroidX Media3 (ExoPlayer) 1.4.1 + DASH |
-| 网络 | OkHttp 4.12 · HttpURLConnection |
-| 二维码 | ZXing core 3.5.3 |
-| 构建 | Gradle 8.7 · AGP 8.6.0 · JDK 17 · Android SDK 34 |
+> 如需在手机或平板上开启平板布局：打开软件进入「我的 → 外观 → 外观适配 → 平板端」。
 
-## 📲 安装与更新
+---
 
-- 在 [Releases](https://github.com/Yui-Little/YuiBili/releases) 下载最新 APK 手动侧载安装
-- 应用内「检查更新」读取仓库根目录 `update.json`，仅在远端版本更新时提示
+## 自行编译
 
-## 🧱 从源码构建
+需要 JDK 17 与 Android SDK 34：
 
 ```bash
-# 需要 JDK 17 + Gradle 8.7 + Android SDK 34
-gradle :app:assembleDebug     # 调试包
-gradle :app:assembleRelease   # 发布包 → app/build/outputs/apk/release/app-release.apk
+./gradlew :app:assembleRelease
 ```
 
-> 说明：项目未内置 `gradlew` wrapper，请使用固定版本 **Gradle 8.7** 构建；签名使用仓库内 `debug.keystore`（调试签名，仅用于本机测试与覆盖安装）。
-
-## ⚖️ 免责声明与合规说明
-
-- 本项目为个人学习项目，与哔哩哔哩官方无任何关联、合作、授权或背书
-- 不绕过会员、版权、地区或账号权限；播放与下载内容严格受账号权限约束
-- 登录 Cookie 仅保存在设备本地，仅用于 B 站官方接口请求，不上传任何第三方
-- 使用本项目的任何后果由使用者自行承担
-
-## 🙏 参考与致谢
-
-- 下载功能设计参考 [BiliTools](https://github.com/happycola233/BiliTools)
-- 感谢开源社区在 B 站接口研究上的公开资料
+生成的正式安装包位于 `app/build/outputs/apk/release/`。
 
 ---
 
-<p align="center"><sub>Made with 💗 by Yui-Little</sub></p>
+## 免责声明
+
+- 本软件为个人兴趣与学习开发的第三方客户端，与哔哩哔哩官方无任何关联或授权。
+- 软件严格遵守账号自身权限，不提供任何绕过大会员、付费、版权或地区限制的功能。
+- 登录凭证仅保存在本机应用私有目录中，仅用于访问哔哩哔哩官方接口，不会上传到任何第三方服务器。
+- 下载内容仅限个人离线观看，请尊重创作者版权。
+
+---
+
+<p align="center"><sub>Maintained by xiaoyuili</sub></p>

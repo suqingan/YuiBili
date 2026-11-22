@@ -49,12 +49,71 @@ object SearchHistoryStore {
             .apply()
     }
 
-    private fun save(context: Context, values: List<String>) {
-        val array = JSONArray()
-        values.take(MAX_HISTORY_ITEMS).forEach { value -> array.put(value) }
-        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    private const val PREFS_SPACE = "space_search_history"
+    private const val MAX_SPACE_HISTORY_ITEMS = 10
+
+    fun loadForSpace(context: Context, mid: Long): List<String> =
+        loadFromPrefs(context, PREFS_SPACE, "items_$mid", MAX_SPACE_HISTORY_ITEMS)
+
+    fun recordForSpace(context: Context, mid: Long, rawKeyword: String) {
+        if (mid <= 0L) return
+        val keyword = rawKeyword.trim()
+        if (keyword.isBlank()) return
+        val key = "items_$mid"
+        val next = ArrayList<String>(MAX_SPACE_HISTORY_ITEMS)
+        next += keyword
+        loadFromPrefs(context, PREFS_SPACE, key, MAX_SPACE_HISTORY_ITEMS).forEach {
+            if (it != keyword && next.size < MAX_SPACE_HISTORY_ITEMS) next += it
+        }
+        saveToPrefs(context, PREFS_SPACE, key, next, MAX_SPACE_HISTORY_ITEMS)
+    }
+
+    fun removeForSpace(context: Context, mid: Long, rawKeyword: String) {
+        if (mid <= 0L) return
+        val keyword = rawKeyword.trim()
+        if (keyword.isBlank()) return
+        val key = "items_$mid"
+        val remaining = loadFromPrefs(context, PREFS_SPACE, key, MAX_SPACE_HISTORY_ITEMS)
+            .filterNot { it == keyword }
+        saveToPrefs(context, PREFS_SPACE, key, remaining, MAX_SPACE_HISTORY_ITEMS)
+    }
+
+    fun clearForSpace(context: Context, mid: Long) {
+        if (mid <= 0L) return
+        context.applicationContext.getSharedPreferences(PREFS_SPACE, Context.MODE_PRIVATE)
             .edit()
-            .putString(KEY_ITEMS, array.toString())
+            .remove("items_$mid")
             .apply()
+    }
+
+    private fun loadFromPrefs(context: Context, prefsName: String, key: String, limit: Int): List<String> {
+        val raw = context.applicationContext
+            .getSharedPreferences(prefsName, Context.MODE_PRIVATE)
+            .getString(key, null)
+            ?: return emptyList()
+        return try {
+            val array = JSONArray(raw)
+            val values = ArrayList<String>(limit)
+            for (index in 0 until minOf(array.length(), limit)) {
+                val value = array.optString(index).trim()
+                if (value.isNotBlank() && value !in values) values += value
+            }
+            values
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun saveToPrefs(context: Context, prefsName: String, key: String, values: List<String>, limit: Int) {
+        val array = JSONArray()
+        values.take(limit).forEach { value -> array.put(value) }
+        context.applicationContext.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
+            .edit()
+            .putString(key, array.toString())
+            .apply()
+    }
+
+    private fun save(context: Context, values: List<String>) {
+        saveToPrefs(context, PREFS, KEY_ITEMS, values, MAX_HISTORY_ITEMS)
     }
 }

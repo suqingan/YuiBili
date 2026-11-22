@@ -2,902 +2,564 @@ package com.yuilittle.bili
 
 import android.app.Activity
 import android.app.Dialog
-import android.content.Context
 import android.content.Intent
-import android.content.res.ColorStateList
-import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.Path
-import android.graphics.RectF
-import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
-import android.os.Build
 import android.os.Bundle
-import android.os.Environment
+import android.text.TextUtils
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.View
 import android.view.Window
 import android.view.WindowManager
-import android.widget.CheckBox
-import android.widget.EditText
 import android.widget.FrameLayout
-import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-import java.util.Locale
-import kotlin.math.cos
-import kotlin.math.min
-import kotlin.math.sin
 
 /**
- * 合集下载详情页：按任务类型（视频/音频/封面）过滤展示该合集的任务列表。
- * 顶栏右侧可进入多选模式，批量删除需二次确认；每行左滑露出「重命名/删除」。
+ * 离线合集详情列表页：
+ * - 展示合集信息（封面、合集名、分集数量与总真实磁盘占用）；
+ * - 支持排序（默认/从旧到新/从新到旧）；
+ * - 支持全选/取消全选批量删除（二次确认）以及长按条目的选项弹窗（重命名 / 删除，二次确认）；
+ * - 侧滑/系统返回在批量管理状态下先退出批量管理；
+ * - 单条样式与主页单视频/单音频一致：封面内嵌时长、标题、下载日期与大小；点击直接进入离线播放。
  */
 class DownloadSeasonActivity : Activity() {
 
     private var groupId: String = ""
-    private var requestedType: Int = DownloadManager.TYPE_VIDEO
+    private var mediaType: Int = DownloadManager.TYPE_VIDEO
+    private var sortOrder = DownloadManager.SeasonSortOrder.DEFAULT
 
-    private var listContainer: LinearLayout? = null
-    private var headerCard: LinearLayout? = null
-    private var emptyView: LinearLayout? = null
-    private var multiBtn: TextView? = null
-    private var bottomBar: LinearLayout? = null
-    private var selectAllBtn: TextView? = null
-    private var deleteBtn: TextView? = null
-
-    /** 多选模式。 */
     private var selectionMode = false
-    private val selected = HashSet<Long>()
+    private val selectedTaskIds = HashSet<Long>()
 
-    private val listener: (List<DownloadManager.Task>) -> Unit = { tasks ->
-        val groupTasks = groupTasksOf(tasks)
-        if (groupTasks.isEmpty()) {
-            rebuild()
-        } else {
-            updateRows(groupTasks)
-        }
+    private lateinit var titleText: TextView
+    private lateinit var selectAllBtn: TextView
+    private lateinit var manageBtn: TextView
+    private lateinit var headerCover: ImageView
+    private lateinit var headerTitle: TextView
+    private lateinit var headerMeta: TextView
+    private lateinit var sortChipText: TextView
+    private lateinit var sortChip: LinearLayout
+    private var sortIconView: SortOrderIconView? = null
+    private lateinit var listContainer: LinearLayout
+    private lateinit var batchBar: LinearLayout
+    private lateinit var batchCountText: TextView
+    private lateinit var batchDeleteBtn: TextView
+
+    private var currentTasks: List<DownloadManager.Task> = emptyList()
+
+    private val listener: (List<DownloadManager.Task>) -> Unit = { all ->
+        runOnUiThread { refresh(all) }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Theme.init(this)
-        Theme.applySystemBars(this)
+        Ds.applySystemBars(this)
+        LayoutMode.applyTabletOrientationIfEnabled(this)
+        window.setBackgroundDrawable(ColorDrawable(Ds.colors.bg))
+        DownloadManager.init(this)
+
         groupId = intent.getStringExtra(EXTRA_GROUP_ID).orEmpty()
-        requestedType = intent.getIntExtra(EXTRA_TYPE, DownloadManager.TYPE_VIDEO)
+        mediaType = intent.getIntExtra(EXTRA_MEDIA_TYPE, DownloadManager.TYPE_VIDEO)
         if (groupId.isBlank()) {
             Toast.makeText(this, "合集信息缺失", Toast.LENGTH_SHORT).show()
             finish()
             return
         }
-        DownloadManager.init(this)
-        DownloadManager.addListener(listener)
         setContentView(buildUi())
+        refresh(DownloadManager.snapshot())
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
+    override fun onStart() {
+        super.onStart()
+        DownloadManager.addListener(listener)
+        refresh(DownloadManager.snapshot())
+    }
+
+    override fun onStop() {
         DownloadManager.removeListener(listener)
-    }
-
-    private fun groupTasksOf(tasks: List<DownloadManager.Task>): List<DownloadManager.Task> =
-        tasks.filter { it.groupId == groupId && it.type == requestedType }
-            .sortedBy { it.episodeNo }
-
-    private fun typeTitle(): String = when (requestedType) {
-        DownloadManager.TYPE_AUDIO -> "音频列表"
-        DownloadManager.TYPE_COVER, DownloadManager.TYPE_COMMENT -> "封面列表"
-        else -> "视频列表"
+        super.onStop()
     }
 
     private fun buildUi(): View {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(COLOR_BACKGROUND)
-        }
+        val c = Ds.colors
+        val root = FrameLayout(this).apply { setBackgroundColor(c.bg) }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        // ── 顶栏：返回 + 类型标题 + 多选按钮 ──
-        val bar = LinearLayout(this).apply {
+        // ── 顶栏 ──
+        val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(4), dp(6), dp(12), dp(6))
+            setPadding(dp(Ds.Space.sm), dp(Ds.Space.sm), dp(Ds.Space.lg), dp(Ds.Space.sm))
         }
-        bar.addView(TextView(this).apply {
-            text = "‹"
-            textSize = 30f
-            setTextColor(COLOR_INK)
-            gravity = Gravity.CENTER
-            setOnClickListener { finish() }
-        }, LinearLayout.LayoutParams(dp(46), dp(46)))
-        bar.addView(TextView(this).apply {
-            text = typeTitle()
-            textSize = 20f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(COLOR_INK)
+        topBar.addView(Ds.backIcon(this, c.text) { handleBack() }, LinearLayout.LayoutParams(dp(40), dp(40)))
+        titleText = TextView(this).apply {
+            text = if (mediaType == DownloadManager.TYPE_AUDIO) "音频合集" else "视频合集"
+            textSize = 18f
+            typeface = Ds.display(bold = true)
+            setTextColor(c.text)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        topBar.addView(titleText, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+            leftMargin = dp(4)
         })
-        bar.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
-        multiBtn = TextView(this).apply {
-            text = "多选"
-            textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(COLOR_ROSE)
-            gravity = Gravity.CENTER
-            background = rounded(COLOR_ROSE_SOFT, dp(12))
-            setPadding(dp(16), dp(7), dp(16), dp(7))
-            setOnClickListener { setSelectionMode(!selectionMode) }
+
+        selectAllBtn = TextView(this).apply {
+            text = "全选"
+            textSize = 12.5f
+            typeface = Ds.body(bold = true)
+            setTextColor(c.accent)
+            background = Ds.pill(this@DownloadSeasonActivity, c.accentSoft)
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            visibility = View.GONE
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.94f)
+            setOnClickListener { toggleSelectAll() }
         }
-        bar.addView(multiBtn, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, dp(38)))
-        root.addView(bar, LinearLayout.LayoutParams(
+        topBar.addView(selectAllBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            rightMargin = dp(8)
+        })
+
+        manageBtn = TextView(this).apply {
+            text = "批量管理"
+            textSize = 12.5f
+            typeface = Ds.body(bold = true)
+            setTextColor(c.muted)
+            background = Ds.pill(this@DownloadSeasonActivity, c.surfaceRaised, c.lineSoft)
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.94f)
+            setOnClickListener { toggleSelectionMode(!selectionMode) }
+        }
+        topBar.addView(manageBtn)
+        col.addView(topBar, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        col.addView(View(this).apply { setBackgroundColor(c.lineSoft) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, Ds.hairline(this)))
 
-        // ── 可滚动内容 ──
-        val scroll = ScrollView(this).apply {
-            isVerticalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-            isFillViewport = true
-        }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(4), dp(16), dp(24))
-        }
-
-        // 头部卡片：封面 + 标题 + 统计
-        val first = groupTasksOf(DownloadManager.snapshot()).firstOrNull()
-        headerCard = LinearLayout(this).apply {
+        // ── 合集头卡 + 排序条 ──
+        val headerCard = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = rounded(COLOR_CARD, dp(16), COLOR_CARD_BORDER, 1)
+            background = Ds.card(this@DownloadSeasonActivity, c.surface, c.lineSoft, Ds.Radius.card)
             setPadding(dp(12), dp(12), dp(12), dp(12))
         }
-        val cover = FrameLayout(this).apply {
-            background = rounded(COLOR_COVER, dp(12))
-            clipToOutline = true
+        val coverHost = FrameLayout(this).apply {
+            setBackgroundColor(c.cover)
+            Ds.clipRounded(this, Ds.Radius.chip)
         }
-        val img = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
-        cover.addView(img, FrameLayout.LayoutParams(
+        headerCover = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+        coverHost.addView(headerCover, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        runCatching {
-            val url = first?.groupCoverUrl?.ifBlank { first.coverUrl }.orEmpty()
-            if (url.isNotBlank()) CoverLoader.load(img, url + "@480w_480h.webp")
-        }
-        headerCard!!.addView(cover, LinearLayout.LayoutParams(dp(112), dp(70)))
-        val mid = LinearLayout(this).apply {
+        headerCard.addView(coverHost, LinearLayout.LayoutParams(dp(92), dp(58)))
+
+        val headerInfo = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        mid.addView(TextView(this).apply {
-            text = first?.groupTitle?.ifBlank { first?.title } ?: "合集"
+        headerTitle = TextView(this).apply {
             textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(COLOR_INK)
+            typeface = Ds.display(bold = true)
+            setTextColor(c.text)
             maxLines = 2
-            ellipsize = android.text.TextUtils.TruncateAt.END
-        }, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        val stat = TextView(this).apply {
-            textSize = 12f
-            setTextColor(COLOR_MUTED)
-            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
         }
-        mid.addView(stat, LinearLayout.LayoutParams(
+        headerMeta = TextView(this).apply {
+            textSize = 12f
+            fontFeatureSettings = "tnum"
+            setTextColor(c.muted)
+        }
+        headerInfo.addView(headerTitle)
+        headerInfo.addView(headerMeta, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             topMargin = dp(5)
         })
-        headerCard!!.addView(mid, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+        headerCard.addView(headerInfo, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
             leftMargin = dp(12)
         })
-        content.addView(headerCard!!)
-
-        // 任务列表容器
-        listContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        content.addView(listContainer!!, LinearLayout.LayoutParams(
+        col.addView(headerCard, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = dp(16)
+            leftMargin = dp(14); rightMargin = dp(14); topMargin = dp(12)
         })
 
-        // 空状态
-        emptyView = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(0, dp(48), 0, dp(48))
-        }
-        emptyView!!.addView(TextView(this).apply {
-            text = "暂无任务"
-            textSize = 14f
-            setTextColor(COLOR_MUTED)
-            gravity = Gravity.CENTER
-        })
-        content.addView(emptyView!!)
-
-        scroll.addView(content)
-        root.addView(scroll, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
-
-        // ── 底部多选操作栏（默认隐藏）──
-        bottomBar = LinearLayout(this).apply {
+        // 排序工具条
+        val toolbar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = rounded(COLOR_CARD, dp(18), COLOR_CARD_BORDER, 1)
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            visibility = View.GONE
+            setPadding(dp(16), dp(10), dp(16), dp(6))
         }
-        selectAllBtn = TextView(this).apply {
-            text = "全选"
+        toolbar.addView(TextView(this).apply {
+            text = "已缓存分集"
             textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(COLOR_ROSE)
-            gravity = Gravity.CENTER
-            background = rounded(COLOR_ROSE_SOFT, dp(12))
-            setPadding(dp(16), dp(9), dp(16), dp(9))
-            setOnClickListener {
-                val tasks = groupTasksOf(DownloadManager.snapshot())
-                val allSelected = tasks.isNotEmpty() && tasks.all { selected.contains(it.id) }
-                if (allSelected) selected.clear() else tasks.forEach { selected.add(it.id) }
-                rebuild()
-                refreshSelectionUi()
-            }
-        }
-        bottomBar!!.addView(selectAllBtn, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, dp(40)))
-        bottomBar!!.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
-        deleteBtn = TextView(this).apply {
-            text = "删除"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            background = rounded(0xFFE0556B.toInt(), dp(12))
-            setPadding(dp(22), dp(9), dp(22), dp(9))
-            setOnClickListener { confirmDeleteMany(selected.toList()) }
-        }
-        bottomBar!!.addView(deleteBtn, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, dp(40)))
-        root.addView(bottomBar, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-            bottomMargin = dp(8)
-        })
+            typeface = Ds.body(bold = true)
+            setTextColor(c.muted)
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
-        rebuild()
+        val sortBtn = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = sortChipBackground(sortOrder)
+            setPadding(dp(10), dp(5), dp(10), dp(5))
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.94f)
+            setOnClickListener { showSortSheet() }
+        }
+        sortChip = sortBtn
+        val sortIcon = Ds.sortOrderIcon(this, sortOrder, sortTint(sortOrder)) as SortOrderIconView
+        sortIconView = sortIcon
+        sortBtn.addView(sortIcon,
+            LinearLayout.LayoutParams(dp(13), dp(13)).apply { rightMargin = dp(4) })
+        sortChipText = TextView(this).apply {
+            text = sortOrder.seasonLabel()
+            textSize = 12f
+            typeface = Ds.body(bold = true)
+            setTextColor(sortTint(sortOrder))
+        }
+        sortBtn.addView(sortChipText)
+        toolbar.addView(sortBtn)
+        col.addView(toolbar)
+
+        // 列表滚动区
+        listContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(6), dp(14), dp(88))
+        }
+        val scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(listContainer)
+        }
+        col.addView(scroll, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        val maxW = LayoutMode.centeredMaxWidthPx(this, 860)
+        val colLp = if (LayoutMode.isTablet) {
+            FrameLayout.LayoutParams(
+                maxW,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER_HORIZONTAL
+            )
+        } else {
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        }
+        root.addView(col, colLp)
+
+        // 底部批量删除栏
+        batchBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(c.surface)
+            setPadding(dp(16), dp(10), dp(16), dp(14))
+            visibility = View.GONE
+            elevation = dp(8).toFloat()
+        }
+        batchCountText = TextView(this).apply {
+            text = "已选 0 集"
+            textSize = 14f
+            typeface = Ds.body(bold = true)
+            setTextColor(c.text)
+        }
+        batchBar.addView(batchCountText, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        batchDeleteBtn = TextView(this).apply {
+            text = "删除所选"
+            textSize = 13.5f
+            typeface = Ds.body(bold = true)
+            setTextColor(Color.WHITE)
+            background = Ds.pill(this@DownloadSeasonActivity, c.danger)
+            setPadding(dp(20), dp(9), dp(20), dp(9))
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.95f)
+            setOnClickListener { confirmDeleteSelected() }
+        }
+        batchBar.addView(batchDeleteBtn)
+        root.addView(batchBar, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+
         return root
     }
 
-    /** 进入/退出多选模式。 */
-    private fun setSelectionMode(on: Boolean) {
-        selectionMode = on
-        selected.clear()
-        multiBtn?.text = if (on) "取消" else "多选"
-        multiBtn?.setTextColor(if (on) COLOR_MUTED else COLOR_ROSE)
-        multiBtn?.background = rounded(
-            if (on) COLOR_SOFT_FILL else COLOR_ROSE_SOFT, dp(12))
-        bottomBar?.visibility = if (on) View.VISIBLE else View.GONE
-        refreshSelectionUi()
-        rebuild()
-    }
+    private fun refresh(all: List<DownloadManager.Task> = DownloadManager.snapshot()) {
+        val raw = all.filter { it.groupId == groupId && it.type == mediaType }
+        currentTasks = DownloadManager.sortTasks(raw, sortOrder)
 
-    private fun refreshSelectionUi() {
-        deleteBtn?.text = if (selected.isEmpty()) "删除" else "删除 (${selected.size})"
-        deleteBtn?.alpha = if (selected.isEmpty()) 0.5f else 1f
-        val tasks = groupTasksOf(DownloadManager.snapshot())
-        val allSelected = tasks.isNotEmpty() && tasks.all { selected.contains(it.id) }
-        selectAllBtn?.text = if (allSelected) "取消全选" else "全选"
-    }
+        val validIds = currentTasks.mapTo(HashSet()) { it.id }
+        selectedTaskIds.retainAll(validIds)
 
-    /** 未授予「所有文件访问」权限时，删除后相册副本可能残留，弹窗里给出提示。 */
-    private fun storagePermissionSuffix(): String =
-        if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager())
-            "\n\n未授予「所有文件访问」权限，相册中的文件可能无法彻底删除"
-        else ""
-
-    /** 批量删除二次确认。 */
-    private fun confirmDeleteMany(ids: List<Long>) {
-        if (ids.isEmpty()) return
-        val msg = TextView(this).apply {
-            text = "确定删除选中的 ${ids.size} 个任务？\n已下载的文件也会一并删除。" + storagePermissionSuffix()
-            textSize = 14f
-            setTextColor(COLOR_MUTED)
-            setLineSpacing(dp(4).toFloat(), 1f)
-        }
-        val dialog = Dialog(this)
-        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
-        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-        dialog.setCanceledOnTouchOutside(true)
-        dialog.setContentView(buildDialogBody(
-            title = "删除 ${ids.size} 个任务",
-            body = msg,
-            confirmText = "删除",
-            confirmColor = 0xFFE0556B.toInt(),
-            onCancel = { dialog.dismiss() },
-            onConfirm = {
-                ids.forEach { DownloadManager.delete(it) }
-                setSelectionMode(false)
-                Toast.makeText(this, "已删除 ${ids.size} 个任务", Toast.LENGTH_SHORT).show()
-                dialog.dismiss()
-            }
-        ))
-        dialog.window?.setLayout((resources.displayMetrics.widthPixels * 0.82f).toInt(), WindowManager.LayoutParams.WRAP_CONTENT)
-        dialog.show()
-    }
-
-    private fun rebuild() {
-        val tasks = groupTasksOf(DownloadManager.snapshot())
-        val list = listContainer ?: return
-        list.removeAllViews()
-
-        // 头部统计
-        headerCard?.let { card ->
-            val stat = (card.getChildAt(1) as? LinearLayout)?.getChildAt(1) as? TextView
-            if (stat != null) {
-                if (tasks.isEmpty()) {
-                    stat.text = "0 个任务"
-                } else {
-                    val done = tasks.count { it.state == DownloadManager.STATE_COMPLETED }
-                    val totalBytes = tasks.sumOf { it.bytesTotal.coerceAtLeast(0L) }
-                    val doneBytes = tasks.sumOf { it.bytesDone.coerceAtLeast(0L) }
-                    stat.text = if (totalBytes > 0L)
-                        "${tasks.size} 个任务 · 已完成 $done 个 · ${formatBytes(doneBytes)}/${formatBytes(totalBytes)}"
-                    else "${tasks.size} 个任务 · 已完成 $done 个"
-                }
-            }
-        }
-
-        if (tasks.isEmpty()) {
-            emptyView?.visibility = View.VISIBLE
+        if (currentTasks.isEmpty()) {
+            finish()
             return
         }
-        emptyView?.visibility = View.GONE
 
-        tasks.forEach { t ->
-            val row = buildRow(t)
-            list.addView(row, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+        val first = currentTasks.first()
+        val gTitle = first.groupTitle.ifBlank { first.title }
+        headerTitle.text = gTitle
+        val doneCount = currentTasks.count { it.state == DownloadManager.STATE_COMPLETED }
+        val totalBytes = currentTasks.sumOf {
+            if (it.state == DownloadManager.STATE_COMPLETED) DownloadManager.taskDiskBytes(it)
+            else it.bytesDone.coerceAtLeast(0L)
+        }
+        headerMeta.text = "共 ${currentTasks.size} 集（已下载 $doneCount 集） · ${DownloadUiShared.formatBytes(totalBytes)}"
+        DownloadUiShared.loadCoverUrl(headerCover, first.groupCoverUrl.ifBlank { first.coverUrl }, first.coverPath)
+
+        renderRows()
+        updateSelectionChrome()
+    }
+
+    private fun renderRows() {
+        listContainer.removeAllViews()
+
+        val rowHeight = dp(86)
+
+        for (task in currentTasks) {
+            val isSelected = task.id in selectedTaskIds
+            val contentView = DownloadUiShared.buildSingleTaskCardContent(
+                context = this,
+                task = task,
+                selectionMode = selectionMode,
+                isSelected = isSelected,
+                onToggleSelect = { toggleTaskSelected(task.id) },
+                onActionClick = { handleTaskAction(task) },
+                onBodyClick = { openTask(task) },
+                onLongClick = { showTaskOptions(task) }
+            )
+            listContainer.addView(contentView, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, rowHeight).apply {
                 bottomMargin = dp(10)
             })
         }
     }
 
-    /** 纯进度/状态刷新：只更新已有行，不重建视图。 */
-    private fun updateRows(tasks: List<DownloadManager.Task>) {
-        val list = listContainer ?: return
-        for (i in 0 until list.childCount) {
-            val wrapper = list.getChildAt(i)
-            val holder = wrapper.tag as? RowHolder ?: continue
-            val task = tasks.firstOrNull { it.id == holder.taskId } ?: continue
-            holder.status.text = statusOf(task).first
-            holder.status.setTextColor(statusOf(task).second)
-            if (task.state == DownloadManager.STATE_COMPLETED) {
-                holder.progress.visibility = View.GONE
-            } else {
-                holder.progress.visibility = View.VISIBLE
-                holder.progress.setProgress(progressOf(task))
-            }
-        }
-    }
-
-    /**
-     * 任务行：多选模式下行首出现勾选框、点击切换选中；
-     * 左滑露出操作区（整体右圆角：重命名 + 删除），操作单元与内容卡等高对齐。
-     */
-    private fun buildRow(task: DownloadManager.Task): View {
-        val sw = resources.displayMetrics.widthPixels - dp(32)
-        val actionsW = dp(136)
-        val rowHeight = dp(66)
-
-        val scroll = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-            isFillViewport = true
-            clipToOutline = true
-        }
-        val inner = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-
-        // ── 内容区 ──
-        val selectedNow = selected.contains(task.id)
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            minimumHeight = rowHeight
-            background = if (selectionMode && selectedNow)
-                rounded(COLOR_ROSE_SOFT, dp(14), COLOR_ROSE, 1)
-            else
-                rounded(COLOR_CARD, dp(14), COLOR_CARD_BORDER, 1)
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            isClickable = true
-            setOnClickListener {
-                if (scroll.scrollX > 0) {
-                    scroll.smoothScrollTo(0, 0)
-                    return@setOnClickListener
-                }
-                if (selectionMode) {
-                    if (!selected.add(task.id)) selected.remove(task.id)
-                    val box = getChildAt(0) as? CheckBox
-                    box?.isChecked = selected.contains(task.id)
-                    background = if (selected.contains(task.id))
-                        rounded(COLOR_ROSE_SOFT, dp(14), COLOR_ROSE, 1)
-                    else
-                        rounded(COLOR_CARD, dp(14), COLOR_CARD_BORDER, 1)
-                    refreshSelectionUi()
-                } else {
-                    onRowTap(task, scroll)
-                }
-            }
-        }
-
-        // 多选勾选框（仅多选模式可见；点击由整行处理，避免事件冲突）
-        content.addView(CheckBox(this).apply {
-            buttonTintList = ColorStateList(
-                arrayOf(
-                    intArrayOf(-android.R.attr.state_checked),
-                    intArrayOf(android.R.attr.state_checked)
-                ),
-                intArrayOf(COLOR_MUTED, COLOR_ROSE)
-            )
-            isChecked = selectedNow
-            isClickable = false
-            isFocusable = false
-            visibility = if (selectionMode) View.VISIBLE else View.GONE
-        }, LinearLayout.LayoutParams(dp(36), dp(36)))
-
-        // 类型/集数徽章（视频=集数，音频/封面=类型）
-        val badgeText = when (task.type) {
-            DownloadManager.TYPE_AUDIO -> "音频"
-            DownloadManager.TYPE_COVER, DownloadManager.TYPE_COMMENT -> "封面"
-            else -> if (task.episodeNo > 0) "第${task.episodeNo}集" else "EP"
-        }
-        content.addView(TextView(this).apply {
-            text = badgeText
-            textSize = 10f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(if (task.state == DownloadManager.STATE_COMPLETED) COLOR_ROSE else COLOR_MUTED)
-            gravity = Gravity.CENTER
-            background = rounded(COLOR_ROSE_SOFT, dp(9))
-            setPadding(dp(8), dp(5), dp(8), dp(5))
-        }, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-
-        // 中间列：标题 + 进度 + 状态
-        val mid = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        mid.addView(TextView(this).apply {
-            text = task.title.ifBlank { "未命名任务" }
-            textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(COLOR_INK)
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
-        }, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        val progress = ProgressBarView(this)
-        progress.visibility = if (task.state == DownloadManager.STATE_COMPLETED) View.GONE else View.VISIBLE
-        progress.setProgress(progressOf(task))
-        mid.addView(progress, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, dp(3)).apply { topMargin = dp(6) })
-        val (stText, stColor) = statusOf(task)
-        val status = TextView(this).apply {
-            text = stText
-            textSize = 11f
-            setTextColor(stColor)
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
-        }
-        mid.addView(status, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = dp(3)
-        })
-        content.addView(mid, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-            leftMargin = dp(10)
-        })
-
-        // 右侧操作图标（未完成时）
-        if (task.state != DownloadManager.STATE_COMPLETED) {
-            val icon = when (task.state) {
-                DownloadManager.STATE_RUNNING, DownloadManager.STATE_QUEUED ->
-                    GlyphView(this, GLYPH_PAUSE, COLOR_ROSE).apply {
-                        setOnClickListener { DownloadManager.pause(task.id) }
-                    }
-                DownloadManager.STATE_PAUSED ->
-                    GlyphView(this, GLYPH_PLAY, COLOR_ROSE).apply {
-                        setOnClickListener { DownloadManager.resume(task.id) }
-                    }
-                else ->
-                    GlyphView(this, GLYPH_RETRY, COLOR_ROSE).apply {
-                        setOnClickListener { DownloadManager.retry(task.id) }
-                    }
-            }
-            content.addView(icon, LinearLayout.LayoutParams(dp(30), dp(30)).apply {
-                leftMargin = dp(6)
-            })
-        }
-
-        // ── 左滑操作区：整体右圆角，重命名（灰）+ 删除（红），图标+文字竖排，与内容卡等高 ──
-        val renameFg = if (Theme.isDark) 0xFFE98BAA.toInt() else COLOR_ROSE
-        val actions = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            background = rounded(COLOR_SURFACE, dp(14))
-            clipToOutline = true
-        }
-        fun actionUnit(label: String, glyph: Int, bg: Int, fg: Int, onClick: () -> Unit): View {
-            val unit = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                background = rounded(bg, 0)
-                isClickable = true
-                setOnClickListener { onClick() }
-            }
-            unit.addView(GlyphView(this, glyph, fg), LinearLayout.LayoutParams(dp(19), dp(19)))
-            unit.addView(TextView(this).apply {
-                text = label
-                textSize = 10f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(fg)
-                gravity = Gravity.CENTER
-            }, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                topMargin = dp(3)
-            })
-            return unit
-        }
-        actions.addView(
-            actionUnit("重命名", GLYPH_PENCIL, COLOR_SURFACE, renameFg) { showRenameDialog(task) },
-            LinearLayout.LayoutParams(dp(68), rowHeight))
-        actions.addView(
-            actionUnit("删除", GLYPH_TRASH, 0xFFE0556B.toInt(), Color.WHITE) { confirmDelete(task) },
-            LinearLayout.LayoutParams(dp(68), rowHeight))
-
-        inner.addView(content, LinearLayout.LayoutParams(sw, rowHeight))
-        inner.addView(actions, LinearLayout.LayoutParams(actionsW, rowHeight))
-        scroll.addView(inner)
-        scroll.scrollTo(0, 0)
-        scroll.setOnTouchListener { _, ev ->
-            when (ev.actionMasked) {
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    val x = scroll.scrollX
-                    if (x >= actionsW / 3) scroll.smoothScrollTo(actionsW, 0)
-                    else scroll.smoothScrollTo(0, 0)
-                }
-            }
-            false
-        }
-
-        val wrapper = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        wrapper.addView(scroll, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, rowHeight))
-        wrapper.tag = RowHolder(task.id, task.state, progress, status)
-        return wrapper
-    }
-
-    private fun onRowTap(task: DownloadManager.Task, scroll: HorizontalScrollView) {
-        if (scroll.scrollX > 0) {
-            scroll.smoothScrollTo(0, 0)
+    private fun handleBack() {
+        if (selectionMode) {
+            toggleSelectionMode(false)
             return
         }
-        when (task.state) {
-            DownloadManager.STATE_COMPLETED -> {
-                if (task.type == DownloadManager.TYPE_COVER || task.type == DownloadManager.TYPE_COMMENT) {
-                    Toast.makeText(this, "图片已保存到相册", Toast.LENGTH_SHORT).show()
-                } else if (task.playable()) {
-                    VideoDetailActivity.openLocal(this, task.id)
-                } else {
-                    Toast.makeText(this, "文件已缺失，请删除该任务", Toast.LENGTH_SHORT).show()
+        finish()
+    }
+
+    @Suppress("DEPRECATION")
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        handleBack()
+    }
+
+    private fun showTaskOptions(task: DownloadManager.Task) {
+        DownloadUiShared.showEntryLongPressMenu(
+            context = this,
+            title = task.title,
+            onRename = {
+                DownloadUiShared.showRenameDialog(
+                    context = this,
+                    dialogTitle = "重命名分集",
+                    currentName = task.title
+                ) { nextName ->
+                    DownloadManager.rename(task.id, nextName)
+                    Toast.makeText(this, "已重命名", Toast.LENGTH_SHORT).show()
+                }
+            },
+            onDelete = { confirmDeleteSingle(task) }
+        )
+    }
+
+    private fun toggleSelectionMode(enable: Boolean) {
+        selectionMode = enable
+        if (!enable) selectedTaskIds.clear()
+        renderRows()
+        updateSelectionChrome()
+    }
+
+    private fun toggleTaskSelected(id: Long) {
+        if (id in selectedTaskIds) selectedTaskIds.remove(id) else selectedTaskIds.add(id)
+        renderRows()
+        updateSelectionChrome()
+    }
+
+    private fun toggleSelectAll() {
+        val allSelected = currentTasks.isNotEmpty() && currentTasks.all { it.id in selectedTaskIds }
+        if (allSelected) selectedTaskIds.clear()
+        else currentTasks.forEach { selectedTaskIds.add(it.id) }
+        renderRows()
+        updateSelectionChrome()
+    }
+
+    private fun updateSelectionChrome() {
+        val c = Ds.colors
+        val count = selectedTaskIds.size
+        if (selectionMode) {
+            manageBtn.text = "完成"
+            manageBtn.setTextColor(c.onAccent)
+            manageBtn.background = Ds.pill(this, c.accent)
+            selectAllBtn.visibility = View.VISIBLE
+            val allSelected = currentTasks.isNotEmpty() && count == currentTasks.size
+            selectAllBtn.text = if (allSelected) "取消全选" else "全选"
+            batchBar.visibility = View.VISIBLE
+            batchCountText.text = "已选 $count 集"
+            batchDeleteBtn.alpha = if (count > 0) 1f else 0.45f
+            batchDeleteBtn.isEnabled = count > 0
+        } else {
+            manageBtn.text = "批量管理"
+            manageBtn.setTextColor(c.muted)
+            manageBtn.background = Ds.pill(this, c.surfaceRaised, c.lineSoft)
+            selectAllBtn.visibility = View.GONE
+            batchBar.visibility = View.GONE
+        }
+    }
+
+    private fun confirmDeleteSingle(task: DownloadManager.Task) {
+        DownloadUiShared.showConfirmDeleteDialog(
+            this,
+            "确认删除分集",
+            "确定要删除「${task.title}」的本地缓存文件吗？删除后无法恢复。"
+        ) {
+            DownloadManager.delete(task.id)
+            Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun confirmDeleteSelected() {
+        if (selectedTaskIds.isEmpty()) return
+        val ids = selectedTaskIds.toList()
+        DownloadUiShared.showConfirmDeleteDialog(
+            this,
+            "确认批量删除",
+            "确定要删除所选 ${ids.size} 集的本地缓存文件吗？删除后无法恢复。"
+        ) {
+            DownloadManager.deleteMany(ids)
+            selectedTaskIds.clear()
+            selectionMode = false
+            Toast.makeText(this, "已删除 ${ids.size} 集", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun showSortSheet() {
+        val options = listOf(
+            DownloadManager.SeasonSortOrder.DEFAULT to "默认排序",
+            DownloadManager.SeasonSortOrder.OLDEST_FIRST to "发布时间从旧到新",
+            DownloadManager.SeasonSortOrder.NEWEST_FIRST to "发布时间从新到旧"
+        )
+        val c = Ds.colors
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        dialog.setCanceledOnTouchOutside(true)
+        dialog.window?.attributes?.gravity = Gravity.BOTTOM
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Ds.card(this@DownloadSeasonActivity, c.surface, c.lineSoft, Ds.Radius.dialog)
+            setPadding(dp(18), dp(18), dp(18), dp(14))
+        }
+        root.addView(TextView(this).apply {
+            text = "分集排序"
+            textSize = 16f
+            typeface = Ds.display(bold = true)
+            setTextColor(c.text)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(10)
+        })
+        options.forEach { (order, label) ->
+            val selected = sortOrder == order
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = dp(50)
+                setPadding(dp(12), dp(6), dp(12), dp(6))
+                background = Ds.card(
+                    this@DownloadSeasonActivity,
+                    if (selected) c.accentSoft else Color.TRANSPARENT,
+                    null,
+                    Ds.Radius.control,
+                    0
+                )
+                isClickable = true
+                setOnClickListener {
+                    sortOrder = order
+                    sortChipText.text = sortLabel(order)
+                    sortChipText.setTextColor(sortTint(order))
+                    sortIconView?.update(order, sortTint(order))
+                    sortChip.background = sortChipBackground(order)
+                    refresh()
+                    dialog.dismiss()
                 }
             }
-            DownloadManager.STATE_RUNNING, DownloadManager.STATE_QUEUED ->
-                DownloadManager.pause(task.id)
+            row.addView(TextView(this).apply {
+                text = label
+                textSize = 14f
+                typeface = Ds.body(bold = selected)
+                setTextColor(if (selected) c.accent else c.text)
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            if (selected) {
+                row.addView(Ds.checkIcon(this, c.accent), LinearLayout.LayoutParams(dp(16), dp(16)))
+            }
+            root.addView(row)
+        }
+        dialog.setContentView(root)
+        dialog.show()
+        LayoutMode.applyDialogWidth(dialog, this, maxTabletDp = 460, phoneMarginDp = 24)
+    }
+
+    private fun sortLabel(order: DownloadManager.SeasonSortOrder): String = order.seasonLabel()
+
+    private fun sortTint(order: DownloadManager.SeasonSortOrder): Int =
+        if (order == DownloadManager.SeasonSortOrder.DEFAULT) Ds.colors.muted else Ds.colors.accent
+
+    private fun sortChipBackground(order: DownloadManager.SeasonSortOrder) =
+        if (order == DownloadManager.SeasonSortOrder.DEFAULT) {
+            Ds.pill(this, Ds.colors.surfaceRaised, Ds.colors.lineSoft)
+        } else {
+            Ds.pill(this, Ds.colors.accentSoft, Ds.colors.accent)
+        }
+
+    private fun handleTaskAction(task: DownloadManager.Task) {
+        when (task.state) {
+            DownloadManager.STATE_RUNNING, DownloadManager.STATE_QUEUED -> DownloadManager.pause(task.id)
             DownloadManager.STATE_PAUSED -> DownloadManager.resume(task.id)
             DownloadManager.STATE_FAILED -> DownloadManager.retry(task.id)
         }
     }
 
-    private fun progressOf(t: DownloadManager.Task): Float =
-        if (t.bytesTotal > 0L) (t.bytesDone.toFloat() / t.bytesTotal).coerceIn(0f, 1f) else 0f
-
-    private fun statusOf(t: DownloadManager.Task): Pair<String, Int> = when (t.state) {
-        DownloadManager.STATE_RUNNING -> {
-            val pct = if (t.bytesTotal > 0L) "${(progressOf(t) * 100).toInt()}% · " else ""
-            val size = if (t.bytesTotal > 0L)
-                "${formatBytes(t.bytesDone)}/${formatBytes(t.bytesTotal)} · " else ""
-            "下载中 $pct$size${formatBytes(t.speedBytes)}/s" to COLOR_ROSE
-        }
-        DownloadManager.STATE_QUEUED -> "等待中" to COLOR_MUTED
-        DownloadManager.STATE_PAUSED -> {
-            val size = if (t.bytesTotal > 0L)
-                " · ${formatBytes(t.bytesDone)}/${formatBytes(t.bytesTotal)}" else ""
-            "已暂停$size" to COLOR_MUTED
-        }
-        DownloadManager.STATE_FAILED -> {
-            val why = t.error.takeIf { it.isNotBlank() }?.let { " · ${it.take(16)}" } ?: ""
-            "下载失败$why" to 0xFFE0556B.toInt()
-        }
-        else -> "已完成 · ${formatBytes(t.bytesDone)}" to COLOR_MUTED
-    }
-
-    private fun formatBytes(bytes: Long): String {
-        if (bytes < 1024) return "${bytes}B"
-        val kb = bytes / 1024f
-        if (kb < 1024) return String.format(Locale.US, "%.1fKB", kb)
-        val mb = kb / 1024f
-        if (mb < 1024) return String.format(Locale.US, "%.1fMB", mb)
-        return String.format(Locale.US, "%.2fGB", mb / 1024f)
-    }
-
-    // ── 对话框 ──────────────────────────────────────────────
-
-    private fun showRenameDialog(task: DownloadManager.Task) {
-        val input = EditText(this).apply {
-            setText(task.title)
-            setSingleLine(true)
-            setSelectAllOnFocus(true)
-            hint = "输入新标题"
-            textSize = 15f
-            setTextColor(COLOR_INK)
-            setHintTextColor(COLOR_MUTED)
-            background = rounded(COLOR_SOFT_FILL, dp(10))
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-        }
-        val dialog = Dialog(this)
-        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
-        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-        dialog.setCanceledOnTouchOutside(true)
-        dialog.setContentView(buildDialogBody(
-            title = "重命名",
-            body = input,
-            confirmText = "确定",
-            confirmColor = COLOR_ROSE,
-            onCancel = { dialog.dismiss() },
-            onConfirm = {
-                val name = input.text.toString().trim()
-                if (name.isBlank()) {
-                    Toast.makeText(this, "标题不能为空", Toast.LENGTH_SHORT).show()
+    private fun openTask(task: DownloadManager.Task) {
+        when (task.state) {
+            DownloadManager.STATE_COMPLETED -> {
+                if (!task.playable()) {
+                    Toast.makeText(this, "本地文件已丢失，可重新下载", Toast.LENGTH_SHORT).show()
+                    return
+                }
+                if (task.type == DownloadManager.TYPE_AUDIO) {
+                    AudioPlayerActivity.open(this, task.id, sortOrder.name)
                 } else {
-                    DownloadManager.rename(task.id, name)
-                    Toast.makeText(this, "已重命名", Toast.LENGTH_SHORT).show()
-                    dialog.dismiss()
+                    startActivity(Intent(this, VideoDetailActivity::class.java).apply {
+                        putExtra(VideoDetailActivity.EXTRA_LOCAL_TASK_ID, task.id)
+                        putExtra(VideoDetailActivity.EXTRA_LOCAL_SORT_ORDER, sortOrder.name)
+                    })
                 }
             }
-        ))
-        dialog.window?.setLayout((resources.displayMetrics.widthPixels * 0.82f).toInt(), WindowManager.LayoutParams.WRAP_CONTENT)
-        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
-        dialog.show()
-    }
-
-    private fun confirmDelete(task: DownloadManager.Task) {
-        val msg = TextView(this).apply {
-            text = "将删除「${task.title}」及已下载的文件，确定删除？" + storagePermissionSuffix()
-            textSize = 14f
-            setTextColor(COLOR_MUTED)
-            setLineSpacing(dp(4).toFloat(), 1f)
-        }
-        val dialog = Dialog(this)
-        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
-        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-        dialog.setCanceledOnTouchOutside(true)
-        dialog.setContentView(buildDialogBody(
-            title = "删除任务",
-            body = msg,
-            confirmText = "删除",
-            confirmColor = 0xFFE0556B.toInt(),
-            onCancel = { dialog.dismiss() },
-            onConfirm = {
-                DownloadManager.delete(task.id)
-                Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
-                dialog.dismiss()
+            DownloadManager.STATE_RUNNING, DownloadManager.STATE_QUEUED -> {
+                Toast.makeText(this, "正在下载中，完成后即可离线播放", Toast.LENGTH_SHORT).show()
             }
-        ))
-        dialog.window?.setLayout((resources.displayMetrics.widthPixels * 0.82f).toInt(), WindowManager.LayoutParams.WRAP_CONTENT)
-        dialog.show()
-    }
-
-    /** 通用对话框主体：圆角卡片 + 标题 + 内容 + 底部按钮行。 */
-    private fun buildDialogBody(
-        title: String,
-        body: View,
-        confirmText: String,
-        confirmColor: Int,
-        onCancel: () -> Unit,
-        onConfirm: () -> Unit
-    ): View {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = rounded(COLOR_CARD, dp(18), COLOR_CARD_BORDER, 1)
-            setPadding(dp(18), dp(16), dp(18), dp(14))
-        }
-        root.addView(TextView(this).apply {
-            text = title
-            textSize = 16f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(COLOR_INK)
-        })
-        root.addView(body, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = dp(12)
-        })
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.END
-        }
-        row.addView(TextView(this).apply {
-            text = "取消"
-            textSize = 14f
-            gravity = Gravity.CENTER
-            setTextColor(COLOR_MUTED)
-            setPadding(dp(18), dp(10), dp(18), dp(10))
-            setOnClickListener { onCancel() }
-        }, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, dp(44)))
-        row.addView(TextView(this).apply {
-            text = confirmText
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            background = rounded(confirmColor, dp(12))
-            setPadding(dp(22), dp(10), dp(22), dp(10))
-            setOnClickListener { onConfirm() }
-        }, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, dp(44)).apply {
-            leftMargin = dp(8)
-        })
-        root.addView(row, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = dp(12)
-        })
-        return root
-    }
-
-    // ── 小部件 ──────────────────────────────────────────────
-
-    private class RowHolder(
-        val taskId: Long,
-        var state: Int,
-        val progress: ProgressBarView,
-        val status: TextView
-    )
-
-    /** 圆角进度条。 */
-    private class ProgressBarView(context: Context) : View(context) {
-        private val density = resources.displayMetrics.density
-        private val track = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = COLOR_SOFT_FILL
-            style = Paint.Style.FILL
-        }
-        private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = COLOR_ROSE
-            style = Paint.Style.FILL
-        }
-        private var pct = 0f
-
-        fun setProgress(value: Float) {
-            pct = value.coerceIn(0f, 1f)
-            invalidate()
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            val h = height.toFloat()
-            val r = h / 2f
-            canvas.drawRoundRect(RectF(0f, 0f, width.toFloat(), h), r, r, track)
-            val w = width.toFloat() * pct
-            if (w > 0.5f) canvas.drawRoundRect(RectF(0f, 0f, w, h), r, r, fill)
-        }
-    }
-
-    /** 线条图标：暂停 / 播放 / 重试 / 铅笔 / 垃圾桶。 */
-    private class GlyphView(
-        context: Context,
-        private val mode: Int,
-        private val color: Int
-    ) : View(context) {
-        private val density = resources.displayMetrics.density
-        private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color
-            style = Paint.Style.FILL
-        }
-        private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color
-            style = Paint.Style.STROKE
-            strokeWidth = 2f * density
-            strokeCap = Paint.Cap.ROUND
-            strokeJoin = Paint.Join.ROUND
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            val w = width.toFloat()
-            val h = height.toFloat()
-            when (mode) {
-                GLYPH_PAUSE -> {
-                    val bw = w * 0.26f
-                    val gap = w * 0.13f
-                    val top = h * 0.18f
-                    val bot = h * 0.82f
-                    canvas.drawRoundRect(RectF(w * 0.22f, top, w * 0.22f + bw, bot), bw / 2, bw / 2, fill)
-                    canvas.drawRoundRect(RectF(w * 0.22f + bw + gap, top, w * 0.22f + bw + gap + bw, bot), bw / 2, bw / 2, fill)
-                }
-                GLYPH_PLAY -> {
-                    val path = Path().apply {
-                        moveTo(w * 0.32f, h * 0.2f)
-                        lineTo(w * 0.8f, h * 0.5f)
-                        lineTo(w * 0.32f, h * 0.8f)
-                        close()
-                    }
-                    canvas.drawPath(path, fill)
-                }
-                GLYPH_RETRY -> {
-                    val r = min(w, h) * 0.3f
-                    val cx = w / 2f
-                    val cy = h / 2f
-                    canvas.drawArc(RectF(cx - r, cy - r, cx + r, cy + r), 30f, 280f, false, stroke)
-                    val rad = Math.toRadians(30.0)
-                    val cosA = cos(rad).toFloat()
-                    val sinA = sin(rad).toFloat()
-                    val p1x = cx + (r - 4f * density) * cosA - (r - 4f * density) * sinA * 0.35f
-                    val p1y = cy + (r - 4f * density) * sinA + (r - 4f * density) * cosA * 0.35f
-                    val p2x = cx + (r + 3f * density) * cosA
-                    val p2y = cy + (r + 3f * density) * sinA
-                    val p3x = cx + (r - 4f * density) * cosA + (r - 4f * density) * sinA * 0.35f
-                    val p3y = cy + (r - 4f * density) * sinA - (r - 4f * density) * cosA * 0.35f
-                    val path = Path().apply {
-                        moveTo(p1x, p1y); lineTo(p2x, p2y); lineTo(p3x, p3y); close()
-                    }
-                    canvas.drawPath(path, fill)
-                }
-                GLYPH_PENCIL -> {
-                    stroke.strokeWidth = 2.2f * density
-                    val path = Path().apply {
-                        moveTo(w * 0.30f, h * 0.66f)
-                        lineTo(w * 0.62f, h * 0.30f)
-                        lineTo(w * 0.72f, h * 0.38f)
-                        lineTo(w * 0.40f, h * 0.74f)
-                        lineTo(w * 0.28f, h * 0.72f)
-                        close()
-                    }
-                    canvas.drawPath(path, fill)
-                }
-                GLYPH_TRASH -> {
-                    stroke.strokeWidth = 2f * density
-                    val path = Path().apply {
-                        moveTo(w * 0.28f, h * 0.34f)
-                        lineTo(w * 0.72f, h * 0.34f)
-                        lineTo(w * 0.68f, h * 0.78f)
-                        lineTo(w * 0.32f, h * 0.78f)
-                        close()
-                    }
-                    canvas.drawPath(path, stroke)
-                    canvas.drawLine(w * 0.44f, h * 0.44f, w * 0.44f, h * 0.68f, stroke)
-                    canvas.drawLine(w * 0.56f, h * 0.44f, w * 0.56f, h * 0.68f, stroke)
-                    canvas.drawLine(w * 0.30f, h * 0.28f, w * 0.70f, h * 0.28f, stroke)
-                }
+            DownloadManager.STATE_PAUSED -> {
+                DownloadManager.resume(task.id)
+                Toast.makeText(this, "已继续下载", Toast.LENGTH_SHORT).show()
+            }
+            DownloadManager.STATE_FAILED -> {
+                DownloadManager.retry(task.id)
+                Toast.makeText(this, "已重试下载", Toast.LENGTH_SHORT).show()
             }
         }
     }
 
     companion object {
         const val EXTRA_GROUP_ID = "group_id"
-        const val EXTRA_TYPE = "type"
-
-        private const val GLYPH_PAUSE = 0
-        private const val GLYPH_PLAY = 1
-        private const val GLYPH_RETRY = 2
-        private const val GLYPH_PENCIL = 6
-        private const val GLYPH_TRASH = 7
-
-        /** 打开合集下载详情页（按类型展示对应任务列表）。 */
-        fun open(context: Context, groupId: String, type: Int = DownloadManager.TYPE_VIDEO) {
-            context.startActivity(
-                Intent(context, DownloadSeasonActivity::class.java)
-                    .putExtra(EXTRA_GROUP_ID, groupId)
-                    .putExtra(EXTRA_TYPE, type)
-            )
-        }
+        const val EXTRA_MEDIA_TYPE = "media_type"
     }
 }

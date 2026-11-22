@@ -11,11 +11,18 @@ android {
         applicationId = "com.yuilittle.bili"
         minSdk = 23
         targetSdk = 34
-        versionCode = 41
-        versionName = "0.1.33"
+        versionCode = 10000
+        versionName = "1.0.0"
+        manifestPlaceholders["appLabel"] = "YuiBili"
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     signingConfigs {
+        getByName("debug") {
+            storeFile = rootProject.file("debug.keystore")
+        }
         create("release") {
             storeFile = file("../debug.keystore")
             storePassword = "android"
@@ -25,9 +32,19 @@ android {
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix = ".debug"
+            manifestPlaceholders["appLabel"] = "YuiBili Debug"
+            // 开发期跳过 PNG 压缩，减少资源处理耗时（不影响安装与运行）
+            isCrunchPngs = false
+        }
         release {
-            isMinifyEnabled = false
-            isShrinkResources = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
             signingConfig = signingConfigs.getByName("release")
         }
     }
@@ -48,6 +65,15 @@ android {
     }
 
     buildToolsVersion = "34.0.0"
+
+    lint {
+        // 开发期关闭 test/androidTest 源集的 Lint 分析与冗余报告输出，大幅缩减常驻构建耗时
+        checkTestSources = false
+        ignoreTestSources = true
+        xmlReport = false
+        htmlReport = false
+        textReport = true
+    }
 }
 
 dependencies {
@@ -58,6 +84,9 @@ dependencies {
     implementation("androidx.media3:media3-common:1.4.1")
     implementation("androidx.media3:media3-datasource:1.4.1")
     implementation("androidx.media3:media3-datasource-okhttp:1.4.1")
+    implementation("androidx.media3:media3-session:1.4.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.google.zxing:core:3.5.3")
+    implementation("androidx.dynamicanimation:dynamicanimation:1.1.0")
+    testImplementation("junit:junit:4.13.2")
 }
