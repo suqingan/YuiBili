@@ -51,7 +51,7 @@ class HistorySearchActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Theme.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        PlayerSettingsStore.applyHomeOrientation(this)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

@@ -122,7 +122,7 @@ class SearchActivity : Activity() {
         super.onCreate(savedInstanceState)
         configureTransitions()
         configureBars()
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        PlayerSettingsStore.applyHomeOrientation(this)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(COLOR_BACKGROUND)

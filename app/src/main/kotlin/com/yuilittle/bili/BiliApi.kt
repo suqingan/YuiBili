@@ -278,6 +278,7 @@ object BiliApi {
     private const val RECOMMEND_URL = "https://api.bilibili.com/x/web-interface/index/top/feed/rcmd?y_num=$PAGE_SIZE&fresh_type=3&feed_version=V8&ps=$PAGE_SIZE"
     private const val POPULAR_URL = "https://api.bilibili.com/x/web-interface/popular?ps=$PAGE_SIZE"
     private const val DETAIL_URL = "https://api.bilibili.com/x/web-interface/view?bvid="
+    private const val RELATED_URL = "https://api.bilibili.com/x/web-interface/archive/related?bvid="
     private const val SEARCH_URL = "https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword="
     private const val SUGGEST_URL = "https://s.search.bilibili.com/main/suggest?term="
     private const val FINGERPRINT_URL = "https://api.bilibili.com/x/frontend/finger/spi"
@@ -325,6 +326,49 @@ object BiliApi {
         return requestFeed("$RECOMMEND_URL&pn=$index&fresh_idx=$index&_=$token", callback) { root ->
             root.optJSONObject("data")?.optJSONArray("item")
         }
+    }
+
+    /**
+     * 播放页右侧「相关推荐」：B 站官方 related 接口，返回与当前视频相关的视频列表。
+     * 用 [BiliRequest] 便于切换视频时取消在途请求，避免旧列表覆盖新视频。
+     */
+    internal fun fetchRelated(bvid: String, callback: (List<VideoItem>?, String?) -> Unit): BiliRequest {
+        val request = BiliRequest()
+        if (bvid.isBlank()) {
+            mainHandler.post { callback(emptyList(), null) }
+            return request
+        }
+        val call = jsonCall(RELATED_URL + URLEncoder.encode(bvid, "UTF-8"))
+        if (!request.attach(call)) return request
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                request.detach(call)
+                mainHandler.post { if (!request.cancelled) callback(null, readableError(e)) }
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                val result = try {
+                    response.use {
+                        val root = BiliHttp.json(it)
+                        ensureSuccess(root)
+                        val array = root.optJSONArray("data") ?: error("未返回相关视频")
+                        val videos = ArrayList<VideoItem>(array.length())
+                        for (index in 0 until array.length()) {
+                            val entry = array.optJSONObject(index) ?: continue
+                            val video = videoFromJson(entry)
+                            if (video.bvid.isNotBlank()) videos.add(video)
+                        }
+                        videos
+                    }
+                } catch (error: Exception) {
+                    mainHandler.post { if (!request.cancelled) callback(null, readableError(error)) }
+                    return
+                }
+                request.detach(call)
+                mainHandler.post { if (!request.cancelled) callback(result, null) }
+            }
+        })
+        return request
     }
 
     fun fetchPopular(page: Int, token: Long, callback: (FeedPage?, String?) -> Unit): Call {

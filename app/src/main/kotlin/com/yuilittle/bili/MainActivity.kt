@@ -50,7 +50,7 @@ class MainActivity : Activity() {
         reducedMotion = MotionTokens.isReduced(this)
         Theme.init(this)
         builtAsTablet = LayoutMode.isTablet
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        PlayerSettingsStore.applyHomeOrientation(this)
         // Paint the window with the current theme colour BEFORE any content so
         // recreate() after night-mode toggle never flashes the light styles.xml
         // windowBackground (#FFFCFA) for one frame.
@@ -246,6 +246,8 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        // 从设置页改完主页方向返回时重新应用
+        PlayerSettingsStore.applyHomeOrientation(this)
         resumed = true
         updateActivePage()
     }

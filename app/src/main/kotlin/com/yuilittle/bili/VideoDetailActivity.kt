@@ -140,6 +140,14 @@ class VideoDetailActivity : Activity() {
     private var currentCid = 0L
     private var detailRequest: BiliRequest? = null
     private var detailGeneration = 0
+    /** 播放页右侧「相关推荐」：在途请求 + 代号，切视频时作废旧回调，避免叠加/串数据。 */
+    private var relatedRequest: BiliRequest? = null
+    private var relatedGeneration = 0
+    /** 缓存最近一次推荐列表与容器，横竖屏切换后按新宽度重排，避免卡片错位。 */
+    private var lastRelatedVideos: List<VideoItem>? = null
+    private var relatedGridRef: LinearLayout? = null
+    /** 单 Activity 内的「上一个视频」导航栈：点相关推荐原地刷新，一次返回回到上层。 */
+    private val videoBackStack = ArrayDeque<Triple<String, Long, Long>>()
     private var detailResponse: Pair<VideoItem, List<VideoPart>>? = null
     private var detailSession = ""
     /** 本地下载文件播放模式：支持音视频播放、离线合集分集列表、4 种播放模式。 */
@@ -169,6 +177,8 @@ class VideoDetailActivity : Activity() {
     /** 切集请求进行中 currentDetail 会置空，用该缓存保证抽屉仍可展开。 */
     private var cachedSeason: UgcSeason? = null
     private var isFullscreen = false
+    /** 横屏进入自动全屏只在进入播放页时判断一次，避免旋转/退出后反复触发。 */
+    private var autoFullscreenEntryChecked = false
     private var currentStream: BiliPlayUrl.DashStream? = null
     private var streamSession = ""
     private var streamLoadedAt = 0L
@@ -535,8 +545,41 @@ class VideoDetailActivity : Activity() {
             contentDescription = "返回"
             isClickable = true
             Ds.bindPressFeedback(this, 0.88f)
-            setOnClickListener { if (isFullscreen) toggleFullscreen() else finish() }
+            setOnClickListener { if (isFullscreen) toggleFullscreen() else navigateBackOnce() }
         }
+        // 左上角「主页」：直接回应用主界面，清掉其上所有播放页
+        val playerHome = object : View(this) {
+            private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE; style = Paint.Style.STROKE
+                strokeWidth = dpf(2f); strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
+            }
+            private val path = Path()
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                val w = width; val h = height
+                val left = w * 0.24f; val right = w * 0.76f
+                val top = h * 0.44f; val bottom = h * 0.74f
+                val peakX = w * 0.5f; val peakY = h * 0.27f
+                path.rewind()
+                path.moveTo(left, top)
+                path.lineTo(peakX, peakY)
+                path.lineTo(right, top)
+                path.lineTo(right, bottom)
+                path.lineTo(left, bottom)
+                path.close()
+                canvas.drawPath(path, paint)
+                canvas.drawRect(w * 0.43f, h * 0.56f, w * 0.57f, bottom, paint)
+            }
+        }.apply {
+            contentDescription = "主页"
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.88f)
+            setOnClickListener { goHome() }
+        }
+        topControlsBar.addView(playerHome, LinearLayout.LayoutParams(dp(38), dp(38)).apply {
+            leftMargin = dp(2)
+        })
+
         playerTopTitle = TextView(this).apply {
             textSize = 14.5f
             typeface = Ds.display(bold = true)
@@ -640,6 +683,7 @@ class VideoDetailActivity : Activity() {
             loadVideoAndPlayer()
             BiliSessionStore.refreshVipInfo()
         }
+        maybeAutoFullscreenOnEntry()
     }
 
     // ─────────────────────────────────────────────────
@@ -2691,6 +2735,184 @@ class VideoDetailActivity : Activity() {
         refreshSeasonDrawerSelection()
     }
 
+    // ─────────────────────────────────────────────────
+    //  相关推荐（播放页右侧信息区，单 Activity 内原地换视频）
+    // ─────────────────────────────────────────────────
+
+    /** 在简介卡片下方渲染「相关推荐」双列视频卡片，数据来自 B 站 related 接口。 */
+    private fun renderRelatedVideos(bvid: String) {
+        if (isFinishing || isDestroyed) return
+        val section = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(12), 0, dp(6))
+        }
+        infoContent.addView(section, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(6)
+        })
+        section.addView(View(this).apply { setBackgroundColor(COLOR_BORDER) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, Ds.hairline(this)))
+        val heading = TextView(this).apply {
+            text = "相关推荐"
+            textSize = 15f
+            typeface = Ds.display(bold = true)
+            setTextColor(COLOR_INK)
+            setPadding(0, dp(12), 0, dp(8))
+        }
+        section.addView(heading, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        section.addView(grid, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        val state = TextView(this).apply {
+            text = "正在加载相关视频…"
+            textSize = 13f
+            setTextColor(COLOR_MUTED)
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        grid.addView(state, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        if (bvid.isBlank()) {
+            state.text = "暂无相关推荐"
+            return
+        }
+        relatedRequest?.cancel()
+        val generation = ++relatedGeneration
+        relatedRequest = BiliApi.fetchRelated(bvid) { videos, error ->
+            if (isFinishing || isDestroyed || generation != relatedGeneration) return@fetchRelated
+            relatedRequest = null
+            grid.removeAllViews()
+            if (videos.isNullOrEmpty()) {
+                state.text = if (error != null) "相关推荐加载失败，点这里重试" else "暂无相关推荐"
+                if (error != null) {
+                    state.setOnClickListener {
+                        state.setOnClickListener(null)
+                        state.text = "正在加载相关视频…"
+                        renderRelatedVideosInto(bvid, grid, state, generation + 1)
+                    }
+                }
+                grid.addView(state, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                return@fetchRelated
+            }
+            bindRelatedGrid(grid, videos.take(20))
+        }
+    }
+
+    /** 失败重试：复用同一容器重新拉一次（代号自增保证旧请求作废）。 */
+    private fun renderRelatedVideosInto(
+        bvid: String, grid: LinearLayout, state: TextView, forcedGeneration: Int
+    ) {
+        relatedRequest?.cancel()
+        val generation = maxOf(forcedGeneration, ++relatedGeneration)
+        relatedGeneration = generation
+        relatedRequest = BiliApi.fetchRelated(bvid) { videos, _ ->
+            if (isFinishing || isDestroyed || generation != relatedGeneration) return@fetchRelated
+            relatedRequest = null
+            grid.removeAllViews()
+            if (videos.isNullOrEmpty()) {
+                state.text = "暂无相关推荐"
+                grid.addView(state, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            } else {
+                bindRelatedGrid(grid, videos.take(20))
+            }
+        }
+    }
+
+    /** 把相关视频按单列横条铺进列表；点击卡片在當前 Activity 内原地换视频，不新开页面。 */
+    private fun bindRelatedGrid(grid: LinearLayout, videos: List<VideoItem>) {
+        grid.removeAllViews()
+        relatedGridRef = grid
+        lastRelatedVideos = videos
+        videos.forEach { video ->
+            val row = VideoCardUi.createCompactRow(this)
+            val holder = row.tag as VideoCardUi.CompactHolder
+            VideoCardUi.bindCompactRow(row, holder, video)
+            row.setOnClickListener {
+                holder.boundVideo?.let(::playRecommendedVideo)
+            }
+            grid.addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(VideoCardUi.CARD_SPACING_DP)
+            })
+        }
+    }
+
+    /** 横竖屏切换后重新按新宽度摆放已有推荐项（不重新请求网络）。 */
+    private fun reflowRelatedVideos() {
+        val grid = relatedGridRef ?: return
+        val videos = lastRelatedVideos ?: return
+        if (videos.isEmpty()) return
+        grid.post { bindRelatedGrid(grid, videos) }
+    }
+
+    /**
+     * 点击相关推荐：把当前视频压入导航栈，复用切分集骨架原地刷新左右两侧，
+     * 全程不 startActivity、不叠加 Activity，内存里始终只有一个播放页。
+     */
+    private fun playRecommendedVideo(video: VideoItem) {
+        if (isFinishing || isDestroyed) return
+        if (video.bvid.isBlank() && video.aid <= 0L) return
+        reportPlayHistory(status = 2)
+        if (currentBvid.isNotBlank() || currentAid > 0L) {
+            videoBackStack.addLast(Triple(currentBvid, currentAid, currentCid))
+        }
+        currentBvid = video.bvid
+        currentAid = video.aid
+        currentCid = video.cid
+        detailGeneration++
+        detailRequest?.cancel()
+        detailRequest = null
+        currentDetail = null
+        detailResponse = null
+        resetComments()
+        clearPlaybackForMediaChange()
+        infoContent.removeAllViews()
+        infoContent.addView(infoState)
+        infoState.text = "正在加载简介…"
+        if (currentTab != 0) selectTab(0)
+        pendingResumePositionMs = 0L
+        startupAtMs = SystemClock.elapsedRealtime()
+        loadVideoAndPlayer()
+    }
+
+    /** 一次返回：有站内导航记录就回上一个视频，否则结束播放页回到上层界面。 */
+    private fun navigateBackOnce() {
+        val previous = videoBackStack.removeLastOrNull()
+        if (previous == null) {
+            finish()
+            return
+        }
+        reportPlayHistory(status = 2)
+        currentBvid = previous.first
+        currentAid = previous.second
+        currentCid = previous.third
+        detailGeneration++
+        detailRequest?.cancel()
+        detailRequest = null
+        currentDetail = null
+        detailResponse = null
+        resetComments()
+        clearPlaybackForMediaChange()
+        infoContent.removeAllViews()
+        infoContent.addView(infoState)
+        infoState.text = "正在加载简介…"
+        if (currentTab != 0) selectTab(0)
+        pendingResumePositionMs = 0L
+        startupAtMs = SystemClock.elapsedRealtime()
+        loadVideoAndPlayer()
+    }
+
+    /** 直接回应用主页，清掉其上所有播放页，避免多次返回。 */
+    private fun goHome() {
+        startActivity(Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        })
+        finish()
+    }
+
     private fun selectEpisode(episode: UgcEpisode) {
         reportPlayHistory(status = 2)
         val sameVideo = episode.bvid.isNotBlank() && episode.bvid == currentBvid ||
@@ -3028,6 +3250,9 @@ class VideoDetailActivity : Activity() {
 
         // 合集/多 P：视频属于官方合集或同 BV 的 pages 多 P 时展示。
         renderSeasonSection(item)
+
+        // 相关推荐：仿 B 站播放页，在简介信息下方展示「接下来播放」列表。
+        renderRelatedVideos(item.bvid)
 
         // Measure heights: title width excludes the 30dp chevron+margin so multi-line
         // measurement matches actual laid-out height accurately!
@@ -4888,6 +5113,18 @@ class VideoDetailActivity : Activity() {
         page.requestLayout()
     }
 
+    /** 横屏进入播放页自动全屏：只在首次进入时判断一次。 */
+    private fun maybeAutoFullscreenOnEntry() {
+        if (autoFullscreenEntryChecked || isFullscreen || fsTransitioning) return
+        if (!::fullscreenContainer.isInitialized || !::playerHost.isInitialized) return
+        if (!PlayerSettingsStore.landscapeAutoFullscreen(this)) return
+        if (resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE) return
+        autoFullscreenEntryChecked = true
+        // 必须走 toggleFullscreen 统一入口：它会同步 isFullscreen、全屏按钮图标、弹幕模式，
+        // 否则进入时视觉全屏但状态仍是 false，退出需要点两次。
+        toggleFullscreen()
+    }
+
     private fun enterFullscreen() {
         fsTransitioning = true
         (playerHost.parent as? ViewGroup)?.removeView(playerHost)
@@ -4991,6 +5228,8 @@ class VideoDetailActivity : Activity() {
             handler.post {
                 applyPageSplitLayout()
                 applyControlSizing()
+                reflowRelatedVideos()
+                maybeAutoFullscreenOnEntry()
             }
         }
         updateFullscreenStatusVisibility()
@@ -5992,7 +6231,7 @@ class VideoDetailActivity : Activity() {
             closeSeasonDrawer()
             return
         }
-        if (isFullscreen) toggleFullscreen() else super.onBackPressed()
+        if (isFullscreen) toggleFullscreen() else navigateBackOnce()
     }
 
     override fun onStart() {
@@ -6049,6 +6288,8 @@ class VideoDetailActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        // 从设置页改完方向返回时，重新应用锁定设置
+        if (!isFullscreen) PlayerSettingsStore.applyPlaybackOrientation(this)
         activityResumed = true
         backgroundSwitchLocked = false
         updateBackgroundPlayVisibility()
@@ -6061,6 +6302,8 @@ class VideoDetailActivity : Activity() {
             commentLoginHintShown = false
             loadComments(reset = true)
         }
+        // 横屏锁定后 configuration 可能延迟更新，下一帧再判断是否自动全屏
+        handler.post { maybeAutoFullscreenOnEntry() }
     }
 
     override fun onPause() {

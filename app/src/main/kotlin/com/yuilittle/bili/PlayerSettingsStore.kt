@@ -42,6 +42,8 @@ internal object PlayerSettingsStore {
 
     private const val PREFS = "yuibili_settings"
     private const val KEY_ORIENTATION = "play_orientation"
+    private const val KEY_HOME_ORIENTATION = "home_orientation"
+    private const val KEY_LANDSCAPE_AUTO_FULLSCREEN = "landscape_auto_fullscreen"
     private const val KEY_DEFAULT_QUALITY = "default_quality"
 
     private fun prefs(context: Context) =
@@ -52,6 +54,22 @@ internal object PlayerSettingsStore {
 
     fun setOrientation(context: Context, mode: OrientationMode) {
         prefs(context).edit().putString(KEY_ORIENTATION, mode.key).apply()
+    }
+
+    /** 主页（全局）方向，与播放页方向相互独立。 */
+    fun homeOrientation(context: Context): OrientationMode =
+        OrientationMode.fromKey(prefs(context).getString(KEY_HOME_ORIENTATION, null))
+
+    fun setHomeOrientation(context: Context, mode: OrientationMode) {
+        prefs(context).edit().putString(KEY_HOME_ORIENTATION, mode.key).apply()
+    }
+
+    /** 横屏进入播放页时是否自动进入全屏，默认关闭（避免覆盖平板分栏布局）。 */
+    fun landscapeAutoFullscreen(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_LANDSCAPE_AUTO_FULLSCREEN, false)
+
+    fun setLandscapeAutoFullscreen(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_LANDSCAPE_AUTO_FULLSCREEN, enabled).apply()
     }
 
     fun defaultQuality(context: Context): Int {
@@ -76,12 +94,19 @@ internal object PlayerSettingsStore {
      * 避免全屏按钮把「锁定横屏/竖屏」设置覆盖掉。
      */
     fun applyPlaybackOrientation(activity: Activity) {
-        activity.requestedOrientation = when (orientation(activity)) {
-            OrientationMode.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-            OrientationMode.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-            OrientationMode.FOLLOW_SYSTEM ->
-                if (LayoutMode.isTablet) ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
-                else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        }
+        activity.requestedOrientation = orientationValue(activity, orientation(activity))
+    }
+
+    /** 把主页方向设置应用到主页/全局页面，与播放页互不影响。 */
+    fun applyHomeOrientation(activity: Activity) {
+        activity.requestedOrientation = orientationValue(activity, homeOrientation(activity))
+    }
+
+    private fun orientationValue(activity: Activity, mode: OrientationMode): Int = when (mode) {
+        OrientationMode.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        OrientationMode.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        OrientationMode.FOLLOW_SYSTEM ->
+            if (LayoutMode.isTablet) ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+            else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     }
 }

@@ -119,7 +119,7 @@ class ProfileSubActivity : Activity() {
         Theme.init(this)
         mode = intent.getStringExtra(EXTRA_MODE) ?: MODE_HISTORY
         Theme.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        PlayerSettingsStore.applyHomeOrientation(this)
         window.setBackgroundDrawable(ColorDrawable(COLOR_BACKGROUND))
 
         val root = FrameLayout(this).apply { setBackgroundColor(COLOR_BACKGROUND) }
@@ -2211,48 +2211,161 @@ class ProfileSubActivity : Activity() {
             ))
         }
 
-        val currentOrientation = PlayerSettingsStore.orientation(this)
-        val orientationCard = newCard()
-        PlayerSettingsStore.OrientationMode.entries.forEachIndexed { index, mode ->
-            if (index > 0) cardDivider(orientationCard)
-            choiceRow(
-                orientationCard,
-                mode.label,
-                if (mode == currentOrientation) "已启用" else "点击启用",
-                mode == currentOrientation,
-                mode.summary
-            ) {
-                PlayerSettingsStore.setOrientation(this, mode)
-                Toast.makeText(this, "已切换为${mode.label}", Toast.LENGTH_SHORT).show()
-                renderSettings()
+        // 二级菜单：点击栏位后弹出单选列表
+        fun <T> showChoiceSheet(
+            title: String,
+            entries: List<Triple<T, String, String>>,
+            selected: T,
+            onPicked: (T) -> Unit
+        ) {
+            val dialog = Dialog(this)
+            val panel = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = Ds.card(
+                    this@ProfileSubActivity, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.card
+                )
+                setPadding(dp(6), dp(6), dp(6), dp(6))
             }
+            entries.forEach { (key, label, summary) ->
+                val isSelected = key == selected
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(12), 0, dp(12), 0)
+                    if (isSelected) {
+                        background = Ds.card(
+                            this@ProfileSubActivity, COLOR_ROSE_SOFT, null, Ds.Radius.control, 0
+                        )
+                    }
+                    isClickable = true
+                    isFocusable = true
+                    Ds.bindPressFeedback(this, 0.97f)
+                    addView(LinearLayout(this@ProfileSubActivity).apply {
+                        orientation = LinearLayout.VERTICAL
+                        addView(TextView(this@ProfileSubActivity).apply {
+                            text = label
+                            textSize = 14.5f
+                            typeface = Ds.body(isSelected)
+                            setTextColor(if (isSelected) COLOR_ROSE else COLOR_INK)
+                        })
+                        addView(TextView(this@ProfileSubActivity).apply {
+                            text = summary
+                            textSize = 11.5f
+                            typeface = Ds.body()
+                            setTextColor(COLOR_MUTED)
+                            setPadding(0, dp(2), 0, 0)
+                        })
+                    }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                    if (isSelected) {
+                        addView(
+                            Ds.checkIcon(this@ProfileSubActivity, COLOR_ROSE, 1.7f),
+                            LinearLayout.LayoutParams(dp(15), dp(15))
+                        )
+                    }
+                    setOnClickListener {
+                        onPicked(key)
+                        dialog.dismiss()
+                    }
+                }
+                panel.addView(row, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, dp(56)
+                ))
+            }
+            dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+            dialog.setContentView(ScrollView(this@ProfileSubActivity).apply {
+                addView(panel, FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT
+                ))
+            })
+            LayoutMode.applyDialogWidth(dialog, this, maxTabletDp = 420)
+            dialog.show()
         }
-        listBox.addView(sectionHeader("屏幕方向", 12))
-        listBox.addView(orientationCard)
-        listBox.addView(hint("设置对视频播放页生效；全屏按钮不会覆盖锁定方向。"))
 
+        // 一级栏位：点击进入二级菜单
+        val playbackOrientation = PlayerSettingsStore.orientation(this)
+        val homeOrientation = PlayerSettingsStore.homeOrientation(this)
         val currentQuality = PlayerSettingsStore.defaultQuality(this)
-        val qualityCard = newCard()
-        PlayerSettingsStore.QUALITY_OPTIONS.forEachIndexed { index, option ->
-            if (index > 0) cardDivider(qualityCard)
-            choiceRow(
-                qualityCard,
-                option.label,
-                if (option.qn == currentQuality) "已启用" else "点击启用",
-                option.qn == currentQuality,
-                option.summary
-            ) {
-                PlayerSettingsStore.setDefaultQuality(this, option.qn)
-                Toast.makeText(this, "默认画质：${option.label}", Toast.LENGTH_SHORT).show()
+        val autoFullscreen = PlayerSettingsStore.landscapeAutoFullscreen(this)
+
+        val orientationCard = newCard()
+        choiceRow(
+            orientationCard,
+            "播放页屏幕方向",
+            playbackOrientation.label,
+            true,
+            "进入播放页后的横竖屏锁定"
+        ) {
+            showChoiceSheet(
+                "播放页屏幕方向",
+                PlayerSettingsStore.OrientationMode.entries.map { Triple(it, it.label, it.summary) },
+                playbackOrientation
+            ) { mode ->
+                PlayerSettingsStore.setOrientation(this, mode)
+                Toast.makeText(this, "播放页：${mode.label}", Toast.LENGTH_SHORT).show()
                 renderSettings()
             }
         }
-        listBox.addView(sectionHeader("默认播放画质", 18))
-        listBox.addView(qualityCard)
-        listBox.addView(hint("实际可用画质取决于视频本身与账号权限；游客最高 480P。"))
+        cardDivider(orientationCard)
+        choiceRow(
+            orientationCard,
+            "默认播放画质",
+            PlayerSettingsStore.QUALITY_OPTIONS.firstOrNull { it.qn == currentQuality }?.label ?: "跟随上次选择",
+            true,
+            "新打开视频时使用的画质"
+        ) {
+            showChoiceSheet(
+                "默认播放画质",
+                PlayerSettingsStore.QUALITY_OPTIONS.map { Triple(it.qn, it.label, it.summary) },
+                currentQuality
+            ) { qn ->
+                PlayerSettingsStore.setDefaultQuality(this, qn)
+                val label = PlayerSettingsStore.QUALITY_OPTIONS.firstOrNull { it.qn == qn }?.label ?: "画质"
+                Toast.makeText(this, "默认画质：$label", Toast.LENGTH_SHORT).show()
+                renderSettings()
+            }
+        }
+        listBox.addView(sectionHeader("播放", 12))
+        listBox.addView(orientationCard)
+        listBox.addView(hint("播放页方向设置会覆盖系统方向；全屏按钮不会改变锁定方向。"))
+
+        val globalCard = newCard()
+        choiceRow(
+            globalCard,
+            "主页（全局）屏幕方向",
+            homeOrientation.label,
+            true,
+            "主页与列表页的横竖屏锁定"
+        ) {
+            showChoiceSheet(
+                "主页（全局）屏幕方向",
+                PlayerSettingsStore.OrientationMode.entries.map { Triple(it, it.label, it.summary) },
+                homeOrientation
+            ) { mode ->
+                PlayerSettingsStore.setHomeOrientation(this, mode)
+                Toast.makeText(this, "主页：${mode.label}", Toast.LENGTH_SHORT).show()
+                renderSettings()
+            }
+        }
+        cardDivider(globalCard)
+        choiceRow(
+            globalCard,
+            "横屏进入播放页自动全屏",
+            if (autoFullscreen) "已开启" else "已关闭",
+            autoFullscreen,
+            "横屏打开视频时直接进入全屏播放"
+        ) {
+            val next = !PlayerSettingsStore.landscapeAutoFullscreen(this)
+            PlayerSettingsStore.setLandscapeAutoFullscreen(this, next)
+            Toast.makeText(this, if (next) "已开启横屏自动全屏" else "已关闭横屏自动全屏", Toast.LENGTH_SHORT).show()
+            renderSettings()
+        }
+        listBox.addView(sectionHeader("主页与全局", 18))
+        listBox.addView(globalCard)
+        listBox.addView(hint("主页方向设置退出设置后生效；自动全屏仅对播放页横屏进入时生效。"))
 
         animateRowIn(orientationCard, 0)
-        animateRowIn(qualityCard, 1)
+        animateRowIn(globalCard, 1)
     }
 
     private fun showDisclaimerDialog() {
