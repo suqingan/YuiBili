@@ -47,6 +47,7 @@ import java.util.Locale
  * - MODE_FAVORITES：我的收藏（限流预览并发队列 + 收藏夹列表 + 夹内分页列表 + 长按移出收藏）
  * - MODE_SPONSOR：赞助开发（简洁微信扫码卡片 + 保存/长按保存）
  * - MODE_ABOUT：关于软件（紧凑卡片化信息 + 版本复制 + 免责声明弹窗）
+ * - MODE_SETTINGS：播放设置（屏幕方向锁定 + 默认播放画质）
  */
 class ProfileSubActivity : Activity() {
 
@@ -284,6 +285,7 @@ class ProfileSubActivity : Activity() {
             MODE_FAVORITES -> loadFavorites()
             MODE_DOWNLOADS -> renderDownloads()
             MODE_SPONSOR -> renderSponsor()
+            MODE_SETTINGS -> renderSettings()
             else -> renderAbout()
         }
     }
@@ -299,6 +301,7 @@ class ProfileSubActivity : Activity() {
         MODE_DOWNLOADS -> "下载管理"
         MODE_SPONSOR -> "赞助开发"
         MODE_ABOUT -> "关于软件"
+        MODE_SETTINGS -> "播放设置"
         else -> "历史记录"
     }
 
@@ -405,11 +408,22 @@ class ProfileSubActivity : Activity() {
                     cover = item.cover,
                     durationSec = item.duration,
                     progressSec = item.watchProgressSec,
+                    aid = item.aid,
+                    cid = item.cid,
+                    resumeMs = historyResumeMs(item.watchProgressSec, item.duration),
                     onLongClick = {
                         showActionSheet(
                             title = item.title,
                             actions = listOf(
-                                "立即播放" to { openVideo(item.bvid) },
+                                "立即播放" to {
+                                    VideoDetailActivity.open(
+                                        this@ProfileSubActivity,
+                                        item.bvid,
+                                        item.aid,
+                                        item.cid,
+                                        historyResumeMs(item.watchProgressSec, item.duration)
+                                    )
+                                },
                                 "删除此条记录" to {
                                     deleteRemoteHistoryItem(item, rowRef)
                                 }
@@ -2109,6 +2123,138 @@ class ProfileSubActivity : Activity() {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // 5. 播放设置（屏幕方向 / 默认画质，立即写入本机偏好）
+    // ═══════════════════════════════════════════════════════════════
+
+    private fun renderSettings() {
+        listBox.removeAllViews()
+
+        fun sectionHeader(text: String, topSpace: Int): TextView = TextView(this).apply {
+            this.text = text
+            textSize = 11.5f
+            typeface = Ds.body(true)
+            letterSpacing = 0.08f
+            setTextColor(Ds.colors.subtle)
+            setPadding(dp(2), dp(topSpace), 0, dp(8))
+        }
+
+        fun hint(text: String): TextView = TextView(this).apply {
+            this.text = text
+            textSize = 12f
+            typeface = Ds.body()
+            setTextColor(COLOR_MUTED)
+            setPadding(dp(4), dp(8), dp(4), 0)
+        }
+
+        fun newCard(): LinearLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Ds.card(this@ProfileSubActivity, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.card)
+            setPadding(0, dp(4), 0, dp(4))
+        }
+
+        fun cardDivider(card: LinearLayout) {
+            card.addView(
+                View(this).apply { setBackgroundColor(Ds.colors.lineSoft) },
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, Ds.hairline(this)).apply {
+                    leftMargin = dp(16)
+                    rightMargin = dp(16)
+                }
+            )
+        }
+
+        fun choiceRow(
+            card: LinearLayout,
+            label: String,
+            value: String,
+            selected: Boolean,
+            description: String,
+            onClick: () -> Unit
+        ) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(16), 0, dp(16), 0)
+                isClickable = true
+                isFocusable = true
+                Ds.bindPressFeedback(this, 0.985f)
+                setOnClickListener { onClick() }
+                addView(LinearLayout(this@ProfileSubActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(TextView(this@ProfileSubActivity).apply {
+                        text = label
+                        textSize = 14.5f
+                        typeface = Ds.body(true)
+                        setTextColor(COLOR_INK)
+                    })
+                    addView(TextView(this@ProfileSubActivity).apply {
+                        text = description
+                        textSize = 11.5f
+                        typeface = Ds.body()
+                        setTextColor(COLOR_MUTED)
+                        setPadding(0, dp(2), 0, 0)
+                    })
+                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                addView(TextView(this@ProfileSubActivity).apply {
+                    text = value
+                    textSize = 13f
+                    typeface = Ds.body()
+                    setTextColor(if (selected) COLOR_ROSE else COLOR_MUTED)
+                })
+                addView(
+                    Ds.chevronRightIcon(this@ProfileSubActivity, Ds.colors.subtle, 1.7f),
+                    LinearLayout.LayoutParams(dp(14), dp(14)).apply { leftMargin = dp(6) }
+                )
+            }
+            card.addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(64)
+            ))
+        }
+
+        val currentOrientation = PlayerSettingsStore.orientation(this)
+        val orientationCard = newCard()
+        PlayerSettingsStore.OrientationMode.entries.forEachIndexed { index, mode ->
+            if (index > 0) cardDivider(orientationCard)
+            choiceRow(
+                orientationCard,
+                mode.label,
+                if (mode == currentOrientation) "已启用" else "点击启用",
+                mode == currentOrientation,
+                mode.summary
+            ) {
+                PlayerSettingsStore.setOrientation(this, mode)
+                Toast.makeText(this, "已切换为${mode.label}", Toast.LENGTH_SHORT).show()
+                renderSettings()
+            }
+        }
+        listBox.addView(sectionHeader("屏幕方向", 12))
+        listBox.addView(orientationCard)
+        listBox.addView(hint("设置对视频播放页生效；全屏按钮不会覆盖锁定方向。"))
+
+        val currentQuality = PlayerSettingsStore.defaultQuality(this)
+        val qualityCard = newCard()
+        PlayerSettingsStore.QUALITY_OPTIONS.forEachIndexed { index, option ->
+            if (index > 0) cardDivider(qualityCard)
+            choiceRow(
+                qualityCard,
+                option.label,
+                if (option.qn == currentQuality) "已启用" else "点击启用",
+                option.qn == currentQuality,
+                option.summary
+            ) {
+                PlayerSettingsStore.setDefaultQuality(this, option.qn)
+                Toast.makeText(this, "默认画质：${option.label}", Toast.LENGTH_SHORT).show()
+                renderSettings()
+            }
+        }
+        listBox.addView(sectionHeader("默认播放画质", 18))
+        listBox.addView(qualityCard)
+        listBox.addView(hint("实际可用画质取决于视频本身与账号权限；游客最高 480P。"))
+
+        animateRowIn(orientationCard, 0)
+        animateRowIn(qualityCard, 1)
+    }
+
     private fun showDisclaimerDialog() {
         val dialog = Dialog(this)
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -2305,7 +2451,10 @@ class ProfileSubActivity : Activity() {
         cover: String,
         durationSec: Int,
         progressSec: Long?,
-        onLongClick: () -> Unit
+        onLongClick: () -> Unit,
+        aid: Long = 0L,
+        cid: Long = 0L,
+        resumeMs: Long = 0L
     ): View {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -2315,7 +2464,9 @@ class ProfileSubActivity : Activity() {
             isClickable = true
             isFocusable = true
             isLongClickable = true
-            setOnClickListener { openVideo(bvid) }
+            setOnClickListener {
+                VideoDetailActivity.open(this@ProfileSubActivity, bvid, aid, cid, resumeMs)
+            }
             setOnLongClickListener {
                 onLongClick()
                 true
@@ -2650,6 +2801,7 @@ class ProfileSubActivity : Activity() {
         const val MODE_DOWNLOADS = "downloads"
         const val MODE_SPONSOR = "sponsor"
         const val MODE_ABOUT = "about"
+        const val MODE_SETTINGS = "settings"
         private const val REQUEST_CREATE_FOLDER = 4101
     }
 }

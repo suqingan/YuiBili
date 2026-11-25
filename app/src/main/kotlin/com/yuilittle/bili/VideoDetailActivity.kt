@@ -12,7 +12,6 @@ import android.content.Context
 import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.BitmapShader
 import android.graphics.Canvas
@@ -375,7 +374,9 @@ class VideoDetailActivity : Activity() {
         currentBvid = savedInstanceState?.getString(EXTRA_BVID) ?: intent.getStringExtra(EXTRA_BVID).orEmpty()
         currentAid = savedInstanceState?.getLong(EXTRA_AID) ?: intent.getLongExtra(EXTRA_AID, 0L)
         currentCid = savedInstanceState?.getLong(EXTRA_CID) ?: intent.getLongExtra(EXTRA_CID, 0L)
-        pendingResumePositionMs = savedInstanceState?.getLong(STATE_PLAY_POSITION) ?: 0L
+        // 旋转重建优先用已保存位置；从历史记录进入时用 intent 带过来的观看进度续播
+        pendingResumePositionMs = savedInstanceState?.getLong(STATE_PLAY_POSITION)
+            ?: intent.getLongExtra(EXTRA_RESUME_MS, 0L).coerceAtLeast(0L)
         resumeSegmentIndex = savedInstanceState?.getInt(STATE_SEGMENT_INDEX) ?: 0
         userWantsPlayback = savedInstanceState?.getBoolean(STATE_PLAY_WHEN_READY, true) ?: true
         restoreEndedState = savedInstanceState?.getBoolean(STATE_PLAY_ENDED) ?: false
@@ -417,12 +418,7 @@ class VideoDetailActivity : Activity() {
         }
         // 视频播放页顶部紧邻黑色视频窗口，状态栏固定纯黑配白色图标，底栏跟随主题色
         applyPlayerSystemBars()
-        if (LayoutMode.isTablet) {
-            LayoutMode.applyTabletOrientationIfEnabled(this)
-        } else {
-            // Detail page is portrait-designed; fullscreen switches to landscape temporarily.
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        }
+        PlayerSettingsStore.applyPlaybackOrientation(this)
 
         activityRoot = FrameLayout(this).apply { setBackgroundColor(COLOR_BACKGROUND) }
         page = LinearLayout(this).apply {
@@ -4057,10 +4053,17 @@ class VideoDetailActivity : Activity() {
         showReplay(endedState)
         playerView.player = player
         playerView.setKeepContentOnPlayerReset(true)
-        val resume = if (segmentTimeline.durationMs > 0L) {
-            segmentTimeline.locate(pendingResumePositionMs)
+        val durationMs = segmentTimeline.durationMs
+        // 历史进度来自接口，可能与实际流时长略有出入；留出 1 秒余量，避免 seek 到结尾触发播放完成
+        val resumeMs = if (durationMs > 0L) {
+            pendingResumePositionMs.coerceAtMost((durationMs - 1_000L).coerceAtLeast(0L))
         } else {
-            PlaybackTimeline.Position(resumeSegmentIndex.coerceIn(0, sources.lastIndex), pendingResumePositionMs)
+            pendingResumePositionMs
+        }
+        val resume = if (durationMs > 0L) {
+            segmentTimeline.locate(resumeMs)
+        } else {
+            PlaybackTimeline.Position(resumeSegmentIndex.coerceIn(0, sources.lastIndex), resumeMs)
         }
         player.setMediaSources(sources, resume.index, resume.offsetMs)
         player.playbackParameters = PlaybackParameters(speeds[speedIndex])
@@ -4250,7 +4253,8 @@ class VideoDetailActivity : Activity() {
 
     private fun loadQualityPreference(): Int {
         val stored = qualityPrefs.getInt(KEY_LAST_QUALITY, 0)
-        return if (stored in SUPPORTED_QUALITIES) stored else BiliPlayUrl.QUALITY_720
+        val fallback = if (stored in SUPPORTED_QUALITIES) stored else BiliPlayUrl.QUALITY_720
+        return PlayerSettingsStore.resolveQuality(this, fallback)
     }
 
     private fun saveQualityPreference(quality: Int) {
@@ -4868,10 +4872,13 @@ class VideoDetailActivity : Activity() {
         } else {
             page.orientation = LinearLayout.VERTICAL
             val raw16x9 = dm.widthPixels * 9 / 16
-            val playerHeight = if (LayoutMode.isTablet) {
-                minOf(raw16x9, (dm.heightPixels * 0.45f).toInt())
-            } else {
-                raw16x9
+            // 锁定横屏（或用户跟随系统旋到横屏）时，手机竖屏设计的播放器会占满高度；
+            // 限制为屏幕高度的一部分，给下方详情/评论留出可用空间。
+            val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+            val playerHeight = when {
+                LayoutMode.isTablet -> minOf(raw16x9, (dm.heightPixels * 0.45f).toInt())
+                landscape -> minOf(raw16x9, (dm.heightPixels * 0.52f).toInt())
+                else -> raw16x9
             }
             playerHost.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, playerHeight)
             tabletSplitDivider?.visibility = View.GONE
@@ -4891,22 +4898,17 @@ class VideoDetailActivity : Activity() {
         page.visibility = View.GONE
         hideSystemBars()
         adjustIndicator.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
-        if (!LayoutMode.isTablet && !isPortraitVideo() &&
-            resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE) {
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-        }
+        PlayerSettingsStore.applyPlaybackOrientation(this)
         applyControlSizing()
         showControls()
         fsTransitioning = false
     }
 
     private fun exitFullscreen() {
-        if (LayoutMode.isTablet || resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT) {
-            movePlayerBackToPage()
-        } else {
-            exitingFullscreen = true
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        }
+        // 锁定方向时旋转不会触发 onConfigurationChanged，必须直接把播放器移回页面
+        exitingFullscreen = false
+        movePlayerBackToPage()
+        PlayerSettingsStore.applyPlaybackOrientation(this)
     }
 
     private fun movePlayerBackToPage() {
@@ -4985,7 +4987,7 @@ class VideoDetailActivity : Activity() {
         super.onConfigurationChanged(newConfig)
         if (exitingFullscreen && newConfig.orientation == Configuration.ORIENTATION_PORTRAIT) {
             handler.post { if (exitingFullscreen) movePlayerBackToPage() }
-        } else if (LayoutMode.isTablet && !isFullscreen) {
+        } else if (!isFullscreen) {
             handler.post {
                 applyPageSplitLayout()
                 applyControlSizing()
@@ -6175,6 +6177,8 @@ class VideoDetailActivity : Activity() {
         const val EXTRA_BVID = "bvid"
         const val EXTRA_AID = "aid"
         const val EXTRA_CID = "cid"
+        /** 历史记录续播位置（毫秒），0 表示从头播放。 */
+        const val EXTRA_RESUME_MS = "resume_ms"
         const val EXTRA_LOCAL_TASK_ID = "local_task_id"
         const val EXTRA_LOCAL_SORT_ORDER = "local_sort_order"
         private const val STATE_PLAY_POSITION = "play_position"
@@ -6204,12 +6208,19 @@ class VideoDetailActivity : Activity() {
         const val KIND_FAVORITE = 1
         const val KIND_DOWNLOAD = 2
         const val KIND_SHARE = 3
-        fun open(context: Context, bvid: String, aid: Long = 0L, cid: Long = 0L) {
+        fun open(
+            context: Context,
+            bvid: String,
+            aid: Long = 0L,
+            cid: Long = 0L,
+            resumeMs: Long = 0L
+        ) {
             if (bvid.isBlank() && aid <= 0L) return
             context.startActivity(Intent(context, VideoDetailActivity::class.java)
                 .putExtra(EXTRA_BVID, bvid)
                 .putExtra(EXTRA_AID, aid)
-                .putExtra(EXTRA_CID, cid))
+                .putExtra(EXTRA_CID, cid)
+                .putExtra(EXTRA_RESUME_MS, resumeMs.coerceAtLeast(0L)))
         }
 
         /** 播放本地下载任务（复用同一播放器，本地模式只显示标题/大小/时长）。 */

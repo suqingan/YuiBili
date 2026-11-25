@@ -613,6 +613,10 @@ class AccountPageView(context: Context) : LinearLayout(context) {
             DownloadManagerActivity.open(context)
         }
         addMenuDivider()
+        menuRow(MenuIconView.SETTINGS, "设置") {
+            openSubPage(ProfileSubActivity.MODE_SETTINGS)
+        }
+        addMenuDivider()
         menuRow(MenuIconView.SPONSOR, "赞助开发") {
             openSubPage(ProfileSubActivity.MODE_SPONSOR)
         }
@@ -1235,6 +1239,7 @@ class AccountPageView(context: Context) : LinearLayout(context) {
             const val ABOUT = 4
             const val DOWNLOADS = 5
             const val MOON = 6
+            const val SETTINGS = 7
         }
 
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -1316,6 +1321,22 @@ class AccountPageView(context: Context) : LinearLayout(context) {
                     path.quadTo(cx - dpf(1.5f), cy - dpf(0.5f), cx + r * 0.77f, cy + r * 0.64f)
                     path.close()
                     canvas.drawPath(path, paint)
+                }
+                SETTINGS -> {
+                    // 细齿轮：内圈 + 八颗齿，保持与其他菜单图标同样的线性风格
+                    val inner = dpf(4.2f)
+                    val outer = dpf(7.4f)
+                    paint.strokeWidth = dpf(2.4f)
+                    for (i in 0 until 8) {
+                        val a = Math.toRadians((i * 45).toDouble())
+                        val x1 = cx + (inner * Math.cos(a)).toFloat()
+                        val y1 = cy + (inner * Math.sin(a)).toFloat()
+                        val x2 = cx + (outer * Math.cos(a)).toFloat()
+                        val y2 = cy + (outer * Math.sin(a)).toFloat()
+                        canvas.drawLine(x1, y1, x2, y2, paint)
+                    }
+                    paint.strokeWidth = dpf(1.75f)
+                    canvas.drawCircle(cx, cy, inner, paint)
                 }
             }
         }

@@ -12,7 +12,6 @@ import android.content.Context
 import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.BitmapShader
 import android.graphics.Canvas
@@ -390,12 +389,7 @@ class PgcDetailActivity : Activity() {
         BiliPlayUrl.prewarm()
         // 视频播放页顶部紧邻黑色视频窗口，状态栏固定纯黑配白色图标，底栏跟随主题色
         applyPlayerSystemBars()
-        if (LayoutMode.isTablet) {
-            LayoutMode.applyTabletOrientationIfEnabled(this)
-        } else {
-            // Detail page is portrait-designed; fullscreen switches to landscape temporarily.
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        }
+        PlayerSettingsStore.applyPlaybackOrientation(this)
 
         activityRoot = FrameLayout(this).apply { setBackgroundColor(COLOR_BACKGROUND) }
         page = LinearLayout(this).apply {
@@ -3369,7 +3363,8 @@ class PgcDetailActivity : Activity() {
 
     private fun loadQualityPreference(): Int {
         val stored = qualityPrefs.getInt(KEY_LAST_QUALITY, 0)
-        return if (stored in SUPPORTED_QUALITIES) stored else BiliPlayUrl.QUALITY_720
+        val fallback = if (stored in SUPPORTED_QUALITIES) stored else BiliPlayUrl.QUALITY_720
+        return PlayerSettingsStore.resolveQuality(this, fallback)
     }
 
     private fun saveQualityPreference(quality: Int) {
@@ -3981,10 +3976,11 @@ class PgcDetailActivity : Activity() {
         } else {
             page.orientation = LinearLayout.VERTICAL
             val raw16x9 = dm.widthPixels * 9 / 16
-            val playerHeight = if (LayoutMode.isTablet) {
-                minOf(raw16x9, (dm.heightPixels * 0.45f).toInt())
-            } else {
-                raw16x9
+            val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+            val playerHeight = when {
+                LayoutMode.isTablet -> minOf(raw16x9, (dm.heightPixels * 0.45f).toInt())
+                landscape -> minOf(raw16x9, (dm.heightPixels * 0.52f).toInt())
+                else -> raw16x9
             }
             playerHost.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, playerHeight)
             tabletSplitDivider?.visibility = View.GONE
@@ -4004,22 +4000,17 @@ class PgcDetailActivity : Activity() {
         page.visibility = View.GONE
         hideSystemBars()
         adjustIndicator.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
-        if (!LayoutMode.isTablet && !isPortraitVideo() &&
-            resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE) {
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-        }
+        PlayerSettingsStore.applyPlaybackOrientation(this)
         applyControlSizing()
         showControls()
         fsTransitioning = false
     }
 
     private fun exitFullscreen() {
-        if (LayoutMode.isTablet || resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT) {
-            movePlayerBackToPage()
-        } else {
-            exitingFullscreen = true
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        }
+        // 锁定方向时旋转不会触发 onConfigurationChanged，必须直接把播放器移回页面
+        exitingFullscreen = false
+        movePlayerBackToPage()
+        PlayerSettingsStore.applyPlaybackOrientation(this)
     }
 
     private fun movePlayerBackToPage() {
@@ -4097,7 +4088,7 @@ class PgcDetailActivity : Activity() {
         super.onConfigurationChanged(newConfig)
         if (exitingFullscreen && newConfig.orientation == Configuration.ORIENTATION_PORTRAIT) {
             handler.post { if (exitingFullscreen) movePlayerBackToPage() }
-        } else if (LayoutMode.isTablet && !isFullscreen) {
+        } else if (!isFullscreen) {
             handler.post {
                 applyPageSplitLayout()
                 applyControlSizing()

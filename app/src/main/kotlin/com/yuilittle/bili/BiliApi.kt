@@ -56,6 +56,16 @@ data class VideoItem(
     val watchProgressSec: Long = 0L
 )
 
+/**
+ * 历史接口的观看进度（秒）转换为播放页起始位置（毫秒）。
+ * -1（已看完）、0 以及大于等于总时长的位置都不续播，避免从结尾或非法位置起播。
+ */
+internal fun historyResumeMs(progressSec: Long, durationSec: Int): Long {
+    if (progressSec <= 0L) return 0L
+    if (durationSec > 0 && progressSec >= durationSec.toLong()) return 0L
+    return (progressSec * 1000L).coerceAtMost(24L * 60 * 60 * 1000)
+}
+
 /** 判断评论/回复作者是否为视频 UP 主（服务端标记优先，其次按 mid 匹配）。 */
 internal fun isCommentFromUp(comment: VideoComment, videoOwnerMid: Long): Boolean {
     if (comment.isUp) return true
