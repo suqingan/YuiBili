@@ -21,6 +21,15 @@ internal data class LiveRoom(
     val online: Long
 )
 
+/** 主播开播状态（空间页「直播中」标签与「进入直播间」按钮使用）。 */
+internal data class LiveRoomStatus(
+    val live: Boolean,
+    val roomId: Long,
+    val title: String,
+    val cover: String,
+    val online: Long
+)
+
 /** 直播清晰度档位（qn + 展示名，来自接口的 quality_description）。 */
 internal data class LiveQuality(val qn: Int, val label: String)
 
@@ -69,6 +78,55 @@ internal object LiveApi {
     private const val PAGE_SIZE = 30
 
     private val mainHandler by lazy(LazyThreadSafetyMode.NONE) { Handler(Looper.getMainLooper()) }
+
+    /**
+     * 查询主播开播状态。
+     *
+     * 未开播的 UP 也可能返回 roomid（直播间存在但没推流），必须用 [LiveRoomStatus.live]
+     * 决定「进入直播间」按钮是否可点，不能只看 roomid。
+     */
+    fun fetchRoomStatus(mid: Long, callback: (LiveRoomStatus?, String?) -> Unit): BiliRequest {
+        val request = BiliRequest()
+        if (mid <= 0L) {
+            mainHandler.post { callback(null, "无效的用户") }
+            return request
+        }
+        val call = jsonCall("https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld?mid=$mid")
+        if (!request.attach(call)) return request
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                request.detach(call)
+                mainHandler.post { if (!request.cancelled) callback(null, readableError(e)) }
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                val result = try {
+                    response.use {
+                        val root = BiliHttp.json(it)
+                        ensureSuccess(root)
+                        parseRoomStatus(root)
+                    }
+                } catch (error: Exception) {
+                    mainHandler.post { if (!request.cancelled) callback(null, readableError(error)) }
+                    return
+                }
+                request.detach(call)
+                mainHandler.post { if (!request.cancelled) callback(result, null) }
+            }
+        })
+        return request
+    }
+
+    private fun parseRoomStatus(root: JSONObject): LiveRoomStatus {
+        val data = root.optJSONObject("data") ?: JSONObject()
+        return LiveRoomStatus(
+            live = data.optInt("liveStatus", 0) == 1,
+            roomId = data.optLong("roomid", 0L),
+            title = cleanHtml(data.optString("title")),
+            cover = normalizeUrl(data.optString("cover")),
+            online = data.optLong("online", 0L)
+        )
+    }
 
     /** 拉取人气直播间分页；返回空列表视为没有更多。 */
     fun fetchRooms(page: Int, callback: (List<LiveRoom>?, String?) -> Unit): BiliRequest {

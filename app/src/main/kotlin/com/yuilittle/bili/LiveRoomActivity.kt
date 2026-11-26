@@ -6,16 +6,23 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RectF
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.text.TextUtils
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
@@ -54,6 +61,11 @@ class LiveRoomActivity : Activity() {
         private const val EXTRA_ONLINE = "live_online"
         private const val EXTRA_COVER = "live_cover"
 
+        /** 手势模式：无 / 亮度（左半屏）/ 音量（右半屏）。 */
+        private const val GESTURE_NONE = 0
+        private const val GESTURE_BRIGHTNESS = 1
+        private const val GESTURE_VOLUME = 2
+
         internal fun open(context: Context, room: LiveRoom) {
             if (room.roomId <= 0L) return
             context.startActivity(
@@ -64,6 +76,24 @@ class LiveRoomActivity : Activity() {
                     .putExtra(EXTRA_AREA, room.areaName)
                     .putExtra(EXTRA_ONLINE, room.online)
                     .putExtra(EXTRA_COVER, room.cover)
+            )
+        }
+
+        /** 仅拿到房间号时的轻量入口（动态开播卡、空间页直播按钮使用）。 */
+        internal fun open(
+            context: Context,
+            roomId: Long,
+            title: String = "",
+            owner: String = "",
+            cover: String = ""
+        ) {
+            if (roomId <= 0L) return
+            context.startActivity(
+                Intent(context, LiveRoomActivity::class.java)
+                    .putExtra(EXTRA_ROOM_ID, roomId)
+                    .putExtra(EXTRA_TITLE, title)
+                    .putExtra(EXTRA_OWNER, owner)
+                    .putExtra(EXTRA_COVER, cover)
             )
         }
     }
@@ -120,6 +150,18 @@ class LiveRoomActivity : Activity() {
 
     private var isLandscape = false
     private var controlsVisible = true
+
+    // 播放区手势：左侧上下滑调亮度、右侧上下滑调音量
+    private lateinit var gestureHud: LiveSwipeHudView
+    private var gestureMode = GESTURE_NONE
+    private var gestureStartY = 0f
+    private var gestureStartValue = 0f
+    private var gesturePointerId = -1
+    private var gestureMoved = false
+
+    private val hideGestureHud = Runnable {
+        if (::gestureHud.isInitialized) gestureHud.visibility = View.GONE
+    }
 
     private val danmakuTicker = object : Runnable {
         override fun run() {
@@ -192,6 +234,7 @@ class LiveRoomActivity : Activity() {
             setBackgroundColor(Color.BLACK)
             isClickable = true
             setOnClickListener { toggleControls() }
+            setOnTouchListener { _, event -> handlePlayerGesture(event) }
         }
         playerArea.addView(playerView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
@@ -212,6 +255,18 @@ class LiveRoomActivity : Activity() {
             setLimit(DanmakuSettingsStore.snapshot().historyLimit)
             onSettingsClick = { showDanmakuSettings() }
         }
+
+        // 手势浮层放最上层，只在滑动时出现，不拦截点击。
+        gestureHud = LiveSwipeHudView(this).apply {
+            visibility = View.GONE
+            isClickable = false
+            isFocusable = false
+        }
+        playerArea.addView(gestureHud, FrameLayout.LayoutParams(
+            dp(58), dp(176), Gravity.START or Gravity.CENTER_VERTICAL).apply {
+            leftMargin = dp(14)
+            rightMargin = dp(14)
+        })
     }
 
     private fun buildTopBar() {
@@ -434,7 +489,7 @@ class LiveRoomActivity : Activity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         val hint = TextView(this).apply {
-            text = "直播画面存在延迟；卡顿时可点击画面中的刷新按钮重新连接。"
+            text = "直播画面存在延迟；卡顿时可点击画面中的刷新按钮重新连接。画面左侧上下滑调亮度、右侧上下滑调音量。"
             textSize = 11.5f
             typeface = Ds.body()
             setTextColor(0x59FFFFFF)
@@ -524,6 +579,8 @@ class LiveRoomActivity : Activity() {
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
+                // 直播播放期间保持屏幕常亮，避免跟随系统息屏时间被灭屏。
+                window.decorView.keepScreenOn = isPlaying
                 playPauseIcon.setPlaying(isPlaying)
                 playPauseIcon.contentDescription = if (isPlaying) "暂停" else "播放"
                 if (isPlaying) {
@@ -680,6 +737,122 @@ class LiveRoomActivity : Activity() {
     private fun scheduleHideControls() {
         handler.removeCallbacks(hideControlsTask)
         if (player?.isPlaying == true) handler.postDelayed(hideControlsTask, 3600L)
+    }
+
+    // ─────────────────────────────────────────────────
+    //  播放区手势：左亮度 / 右音量
+    // ─────────────────────────────────────────────────
+
+    /**
+     * 左半屏上下滑调亮度、右半屏上下滑调音量；轻点仍然切换控制栏。
+     * 垂直位移超过阈值才锁定方向，避免误触把点击吃掉。
+     */
+    private fun handlePlayerGesture(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                gestureStartY = event.y
+                gesturePointerId = event.getPointerId(event.actionIndex)
+                gestureMode = GESTURE_NONE
+                gestureMoved = false
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (event.getPointerId(event.actionIndex) != gesturePointerId) return true
+                val dy = event.y - gestureStartY
+                if (gestureMode == GESTURE_NONE) {
+                    if (kotlin.math.abs(dy) < dp(10)) return true
+                    gestureMode = if (event.x < playerView.width / 2f) {
+                        GESTURE_BRIGHTNESS
+                    } else {
+                        GESTURE_VOLUME
+                    }
+                    gestureStartValue = if (gestureMode == GESTURE_BRIGHTNESS) {
+                        currentBrightness()
+                    } else {
+                        currentVolumeFraction()
+                    }
+                    gestureMoved = true
+                    handler.removeCallbacks(hideControlsTask)
+                }
+                val span = playerView.height.coerceAtLeast(dp(180)) * 0.72f
+                val next = (gestureStartValue - dy / span).coerceIn(0f, 1f)
+                if (gestureMode == GESTURE_BRIGHTNESS) applyBrightness(next) else applyVolume(next)
+                showGestureHud(gestureMode, next)
+                return true
+            }
+
+            MotionEvent.ACTION_UP -> {
+                val wasGesture = gestureMode != GESTURE_NONE
+                gestureMode = GESTURE_NONE
+                gesturePointerId = -1
+                if (wasGesture) {
+                    dismissGestureHudSoon()
+                    scheduleHideControls()
+                } else if (!gestureMoved) {
+                    toggleControls()
+                }
+                gestureMoved = false
+                return true
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                gestureMode = GESTURE_NONE
+                gesturePointerId = -1
+                gestureMoved = false
+                dismissGestureHudSoon()
+                return true
+            }
+        }
+        return true
+    }
+
+    private fun showGestureHud(mode: Int, value: Float) {
+        gestureHud.show(mode, value)
+        val lp = gestureHud.layoutParams as FrameLayout.LayoutParams
+        val gravity = (if (mode == GESTURE_BRIGHTNESS) Gravity.START else Gravity.END) or
+            Gravity.CENTER_VERTICAL
+        if (lp.gravity != gravity) {
+            lp.gravity = gravity
+            gestureHud.layoutParams = lp
+        }
+        gestureHud.visibility = View.VISIBLE
+        handler.removeCallbacks(hideGestureHud)
+    }
+
+    private fun dismissGestureHudSoon() {
+        handler.removeCallbacks(hideGestureHud)
+        handler.postDelayed(hideGestureHud, 700L)
+    }
+
+    private fun currentBrightness(): Float {
+        val fromWindow = window.attributes.screenBrightness
+        if (fromWindow >= 0f) return fromWindow.coerceIn(0f, 1f)
+        val system = runCatching {
+            Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS)
+        }.getOrDefault(128)
+        return (system / 255f).coerceIn(0.02f, 1f)
+    }
+
+    private fun applyBrightness(value: Float) {
+        val lp = window.attributes
+        lp.screenBrightness = value.coerceIn(0.02f, 1f)
+        window.attributes = lp
+    }
+
+    private fun musicManager(): AudioManager? =
+        getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+
+    private fun currentVolumeFraction(): Float {
+        val am = musicManager() ?: return 0.5f
+        val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        return am.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() / max
+    }
+
+    private fun applyVolume(value: Float) {
+        val am = musicManager() ?: return
+        val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        val target = Math.round(value.coerceIn(0f, 1f) * max).coerceIn(0, max)
+        runCatching { am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0) }
     }
 
     private fun showStatus(text: String, actionVisible: Boolean) {
@@ -1028,6 +1201,7 @@ class LiveRoomActivity : Activity() {
 
     override fun onPause() {
         player?.pause()
+        window.decorView.keepScreenOn = false
         handler.removeCallbacks(danmakuTicker)
         handler.removeCallbacks(hideControlsTask)
         danmakuClient?.stop()
@@ -1086,5 +1260,94 @@ class LiveRoomActivity : Activity() {
         super.finish()
         @Suppress("DEPRECATION")
         overridePendingTransition(0, 0)
+    }
+}
+
+/**
+ * 亮度 / 音量手势的浮层：一根竖条 + 底部图标。
+ * mode 与 Activity 里的手势常量一致（1 亮度，2 音量）。
+ */
+private class LiveSwipeHudView(context: Context) : View(context) {
+
+    private val density = resources.displayMetrics.density
+    private val platePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x99000000.toInt() }
+    private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x3DFFFFFF }
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+    private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.8f * density
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        color = Color.WHITE
+    }
+    private val solidPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+    private val rect = RectF()
+    private val path = Path()
+
+    private var progress = 0.5f
+    private var mode = 1
+
+    fun show(mode: Int, progress: Float) {
+        this.mode = mode
+        this.progress = progress.coerceIn(0f, 1f)
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 0f || h <= 0f) return
+        rect.set(0f, 0f, w, h)
+        canvas.drawRoundRect(rect, 14f * density, 14f * density, platePaint)
+
+        val barWidth = 7f * density
+        val left = (w - barWidth) / 2f
+        val top = 20f * density
+        val bottom = h - 56f * density
+        val radius = barWidth / 2f
+        rect.set(left, top, left + barWidth, bottom)
+        canvas.drawRoundRect(rect, radius, radius, trackPaint)
+        if (progress > 0.002f) {
+            val fillTop = bottom - (bottom - top) * progress
+            rect.set(left, fillTop, left + barWidth, bottom)
+            canvas.drawRoundRect(rect, radius, radius, fillPaint)
+        }
+
+        val cx = w / 2f
+        val cy = h - 31f * density
+        if (mode == 1) drawSun(canvas, cx, cy) else drawSpeaker(canvas, cx, cy)
+    }
+
+    private fun drawSun(canvas: Canvas, cx: Float, cy: Float) {
+        val r = 5.5f * density
+        canvas.drawCircle(cx, cy, r, iconPaint)
+        for (i in 0 until 8) {
+            val angle = Math.toRadians((i * 45).toDouble())
+            val cos = kotlin.math.cos(angle).toFloat()
+            val sin = kotlin.math.sin(angle).toFloat()
+            canvas.drawLine(
+                cx + (r + 3f * density) * cos, cy + (r + 3f * density) * sin,
+                cx + (r + 6.5f * density) * cos, cy + (r + 6.5f * density) * sin,
+                iconPaint
+            )
+        }
+    }
+
+    private fun drawSpeaker(canvas: Canvas, cx: Float, cy: Float) {
+        val u = density
+        path.rewind()
+        path.moveTo(cx - 10f * u, cy - 2.5f * u)
+        path.lineTo(cx - 5f * u, cy - 2.5f * u)
+        path.lineTo(cx + 1f * u, cy - 7.5f * u)
+        path.lineTo(cx + 1f * u, cy + 7.5f * u)
+        path.lineTo(cx - 5f * u, cy + 2.5f * u)
+        path.lineTo(cx - 10f * u, cy + 2.5f * u)
+        path.close()
+        canvas.drawPath(path, solidPaint)
+        rect.set(cx + 2f * u, cy - 6f * u, cx + 12f * u, cy + 6f * u)
+        canvas.drawArc(rect, -55f, 110f, false, iconPaint)
+        rect.set(cx + 2f * u, cy - 10f * u, cx + 17f * u, cy + 10f * u)
+        canvas.drawArc(rect, -50f, 100f, false, iconPaint)
     }
 }

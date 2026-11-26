@@ -153,8 +153,10 @@ internal object SpaceDynamicCardUi {
 
         val isPureVideo = item.kind == DynamicKind.VIDEO && item.text.isBlank() &&
             item.title.isNullOrBlank() && item.images.isEmpty()
-        val supportsDetail = item.supportsDetail ||
-            (item.kind != DynamicKind.UNKNOWN && !isPureVideo && item.visible)
+        val supportsDetail = item.kind != DynamicKind.LIVE && (
+            item.supportsDetail ||
+                (item.kind != DynamicKind.UNKNOWN && !isPureVideo && item.visible)
+            )
         val openDetailAction: () -> Unit = {
             if (supportsDetail && onOpenDetail != null) {
                 onOpenDetail(item)
@@ -204,6 +206,7 @@ internal object SpaceDynamicCardUi {
         val timeText = formatDynamicTime(item.pubTs, item.pubTime)
         val kindTag = when (item.kind) {
             DynamicKind.VIDEO -> if (isPureVideo) "投稿了视频" else "发布了动态"
+            // 开播动态正文已经是「xxx 开启了直播」，这里不再重复
             else -> ""
         }
         val subtitleLine = listOf(timeText, kindTag).filter { it.isNotBlank() }.joinToString(" · ")
@@ -315,6 +318,21 @@ internal object SpaceDynamicCardUi {
             }
             DynamicKind.UNKNOWN -> {
                 addUnknownNoticeBlock(activity, body, item, onOpenVideo)
+            }
+            DynamicKind.LIVE -> {
+                val live = item.live
+                if (live != null) {
+                    addLiveCard(
+                        activity = activity,
+                        parent = body,
+                        item = item,
+                        live = live,
+                        topMarginDp = 10,
+                        contentWidthPx = effectiveContentW
+                    )
+                } else {
+                    addUnknownNoticeBlock(activity, body, item, onOpenVideo)
+                }
             }
         }
 
@@ -800,6 +818,135 @@ internal object SpaceDynamicCardUi {
         box.addView(infoCol, LinearLayout.LayoutParams(0, coverH, 1f))
 
         parent.addView(box, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = activity.dp(topMarginDp) })
+    }
+
+    /**
+     * 开播动态卡：封面 +「直播中」角标 + 直播间标题 + 一键进入直播间。
+     * 这类动态原先落到「该动态类型暂不支持展示」，现在改为可直接进入直播间。
+     */
+    private fun addLiveCard(
+        activity: Activity,
+        parent: LinearLayout,
+        item: SpaceDynamic,
+        live: DynamicLive,
+        topMarginDp: Int,
+        contentWidthPx: Int
+    ) {
+        val openLive: () -> Unit = {
+            LiveRoomActivity.open(
+                activity,
+                live.roomId,
+                live.title,
+                item.authorName.orEmpty(),
+                live.cover
+            )
+        }
+        val wrap = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Ds.card(activity, COLOR_SURFACE, Ds.colors.lineSoft, Ds.Radius.control)
+            Ds.clipRounded(this, Ds.Radius.control)
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.985f)
+            setOnClickListener { openLive() }
+        }
+
+        val coverFrame = FrameLayout(activity).apply { setBackgroundColor(COLOR_COVER) }
+        val cover = ImageView(activity).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setBackgroundColor(COLOR_COVER)
+        }
+        if (live.cover.isNotBlank()) {
+            CoverLoader.load(cover, live.cover, cropThumb = false, animate = false)
+        }
+        coverFrame.addView(cover, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        ))
+        // 左上角「直播中」角标，与直播页保持同一套视觉
+        coverFrame.addView(TextView(activity).apply {
+            text = "直播中"
+            textSize = 10f
+            typeface = Ds.body(bold = true)
+            setTextColor(0xFFFFFFFF.toInt())
+            background = rounded(COLOR_ROSE, activity.dp(6))
+            setPadding(activity.dp(7), activity.dp(2), activity.dp(7), activity.dp(2))
+            includeFontPadding = false
+        }, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.START
+        ).apply {
+            leftMargin = activity.dp(9)
+            topMargin = activity.dp(9)
+        })
+        val coverH = (contentWidthPx * 9 / 16).coerceIn(activity.dp(150), activity.dp(260))
+        wrap.addView(coverFrame, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            coverH
+        ))
+
+        val infoRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(activity.dp(11), activity.dp(10), activity.dp(11), activity.dp(10))
+        }
+        val textCol = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        textCol.addView(TextView(activity).apply {
+            text = live.title.ifBlank { "${item.authorName.orEmpty()} 的直播间" }
+            textSize = 14f
+            typeface = Ds.body(bold = true)
+            setTextColor(COLOR_INK)
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+            setLineSpacing(activity.dp(2).toFloat(), 1f)
+            includeFontPadding = false
+        })
+        val metaParts = ArrayList<String>(2)
+        if (live.areaName.isNotBlank()) metaParts += live.areaName
+        if (live.onlineText.isNotBlank()) metaParts += live.onlineText
+        textCol.addView(TextView(activity).apply {
+            text = if (metaParts.isNotEmpty()) metaParts.joinToString(" · ") else "正在直播"
+            textSize = 11f
+            typeface = Ds.body()
+            fontFeatureSettings = "tnum"
+            setTextColor(Ds.colors.subtle)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            includeFontPadding = false
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = activity.dp(4) })
+        infoRow.addView(textCol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        infoRow.addView(TextView(activity).apply {
+            text = "进入直播间"
+            textSize = 12f
+            typeface = Ds.body(bold = true)
+            gravity = Gravity.CENTER
+            setTextColor(0xFFFFFFFF.toInt())
+            background = Ds.pill(activity, COLOR_ROSE)
+            setPadding(activity.dp(14), activity.dp(7), activity.dp(14), activity.dp(7))
+            includeFontPadding = false
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.94f)
+            setOnClickListener { openLive() }
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { leftMargin = activity.dp(10) })
+
+        wrap.addView(infoRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+
+        parent.addView(wrap, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = activity.dp(topMarginDp) })

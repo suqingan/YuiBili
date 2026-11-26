@@ -3488,6 +3488,8 @@ class PgcDetailActivity : Activity() {
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 if (!canUsePlayback(generation) || player !== exoPlayer) return
+                // 播放期间保持屏幕常亮，避免跟随系统息屏时间被灭屏。
+                window.decorView.keepScreenOn = isPlaying
                 handler.removeCallbacks(historyTick)
                 if (isPlaying) {
                     reportPlayHistory(status = 3)
@@ -5428,6 +5430,7 @@ class PgcDetailActivity : Activity() {
         handler.removeCallbacks(progressUpdater)
         controlsHideRunnable?.let(handler::removeCallbacks)
         cancelLongPressBoost()
+        window.decorView.keepScreenOn = false
         unregisterStatusReceiver()
         closeSeasonDrawer(immediate = true)
         danmakuSettingsDrawer?.close(immediate = true)

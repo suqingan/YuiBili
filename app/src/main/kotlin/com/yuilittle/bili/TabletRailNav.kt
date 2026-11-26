@@ -32,8 +32,9 @@ internal class TabletRailNav(
         const val DEST_DOWNLOADS = 3
         const val DEST_FAVORITES = 4
         const val DEST_HISTORY = 5
-        const val DEST_PROFILE = 6
-        const val DEST_COUNT = 7
+        const val DEST_MESSAGE = 6
+        const val DEST_PROFILE = 7
+        const val DEST_COUNT = 8
     }
 
     private var selectedDest = DEST_HOME
@@ -74,10 +75,11 @@ internal class TabletRailNav(
         addNavItem(DEST_FAVORITES, RailItemView.KIND_FAVORITE, "收藏")
         addNavItem(DEST_HISTORY, RailItemView.KIND_HISTORY, "历史")
 
-        // 弹性留白：将「我的」置于「夜间模式」正上方
+        // 弹性留白：将「消息 / 我的」置于「夜间模式」正上方
         addView(View(context), LayoutParams(0, 0, 1f))
 
-        addNavItem(DEST_PROFILE, RailItemView.KIND_PROFILE, "我的", topDp = 0)
+        addNavItem(DEST_MESSAGE, RailItemView.KIND_MESSAGE, "消息", topDp = 0)
+        addNavItem(DEST_PROFILE, RailItemView.KIND_PROFILE, "我的")
 
         val themeBtn = FrameLayout(context).apply {
             background = Ds.card(context, c.surfaceRaised, c.lineSoft, Ds.Radius.control, Ds.hairline(context))
@@ -116,6 +118,7 @@ internal class TabletRailNav(
             const val KIND_HISTORY = 4
             const val KIND_PROFILE = 5
             const val KIND_DYNAMIC = 6
+            const val KIND_MESSAGE = 7
         }
 
         private val iconView: RailIconCanvas
@@ -267,6 +270,31 @@ internal class TabletRailNav(
                         cx + 5.4f * d, cy + 1.2f * d,
                         cx + 6.0f * d, cy + 6.2f * d
                     )
+                    canvas.drawPath(path, paint)
+                }
+                RailItemView.KIND_MESSAGE -> {
+                    // 信封轮廓 + 封口折线
+                    val left = cx - 6.4f * d
+                    val right = cx + 6.4f * d
+                    val top = cy - 4.6f * d
+                    val bottom = cy + 4.6f * d
+                    val corner = 1.4f * d
+                    path.rewind()
+                    path.moveTo(left + corner, top)
+                    path.lineTo(right - corner, top)
+                    path.quadTo(right, top, right, top + corner)
+                    path.lineTo(right, bottom - corner)
+                    path.quadTo(right, bottom, right - corner, bottom)
+                    path.lineTo(left + corner, bottom)
+                    path.quadTo(left, bottom, left, bottom - corner)
+                    path.lineTo(left, top + corner)
+                    path.quadTo(left, top, left + corner, top)
+                    path.close()
+                    canvas.drawPath(path, paint)
+                    path.rewind()
+                    path.moveTo(left + 0.4f * d, top + 0.9f * d)
+                    path.lineTo(cx, cy + 1.2f * d)
+                    path.lineTo(right - 0.4f * d, top + 0.9f * d)
                     canvas.drawPath(path, paint)
                 }
             }

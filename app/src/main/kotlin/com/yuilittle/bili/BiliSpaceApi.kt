@@ -19,7 +19,16 @@ import java.util.concurrent.atomic.AtomicInteger
 
 enum class FollowState { FOLLOWED, NOT_FOLLOWED, UNKNOWN, SELF }
 
-enum class DynamicKind { TEXT, IMAGE, VIDEO, UNKNOWN }
+enum class DynamicKind { TEXT, IMAGE, VIDEO, LIVE, UNKNOWN }
+
+/** 动态里的直播开播信息（MAJOR_TYPE_LIVE_RCMD / LIVE）。 */
+data class DynamicLive(
+    val roomId: Long,
+    val title: String,
+    val cover: String,
+    val areaName: String,
+    val onlineText: String
+)
 
 data class SpaceHeader(
     val mid: Long,
@@ -85,7 +94,9 @@ data class SpaceDynamic(
     val title: String? = null,
     val commentOid: String? = null,
     val commentType: Int? = null,
-    val supportsDetail: Boolean = false
+    val supportsDetail: Boolean = false,
+    /** 直播开播动态的直播间信息，kind == LIVE 时非空。 */
+    val live: DynamicLive? = null
 )
 
 data class DynamicSearchCheckpoint(
@@ -1157,6 +1168,7 @@ object BiliSpaceApi {
         var video: SpaceVideo? = null
         var jumpUrl: String? = null
         var opusTitle: String? = null
+        var live: DynamicLive? = null
 
         val kind: DynamicKind
         when {
@@ -1232,6 +1244,14 @@ object BiliSpaceApi {
                 }
                 kind = if (video != null) DynamicKind.VIDEO else DynamicKind.UNKNOWN
             }
+            majorType == "MAJOR_TYPE_LIVE_RCMD" || majorType == "MAJOR_TYPE_LIVE" -> {
+                // 开播动态：解析直播间信息，卡片改为「xxx 开启了直播」并给一键进入直播间入口
+                live = major?.let { parseDynamicLive(it) }
+                kind = if (live != null) DynamicKind.LIVE else DynamicKind.UNKNOWN
+                if (live != null && text.isBlank()) {
+                    text = "${authorName ?: "TA"} 开启了直播"
+                }
+            }
             typeStr == "DYNAMIC_TYPE_WORD" || major == null -> {
                 kind = DynamicKind.TEXT
             }
@@ -1293,7 +1313,43 @@ object BiliSpaceApi {
             title = opusTitle,
             commentOid = resolvedCommentOid,
             commentType = resolvedCommentType,
-            supportsDetail = supportsDynamicDetail
+            supportsDetail = supportsDynamicDetail,
+            live = live
+        )
+    }
+
+    /** 解析开播动态里的直播间信息；兼容 live_rcmd 的 JSON 字符串与 live 对象两种下发。 */
+    private fun parseDynamicLive(major: JSONObject): DynamicLive? {
+        val holder = major.optJSONObject("live_rcmd") ?: major.optJSONObject("live")
+        val raw = holder?.optSafeString("content").orEmpty()
+        val payload = if (raw.startsWith("{")) {
+            runCatching { JSONObject(raw) }.getOrNull()
+        } else {
+            null
+        }
+        val info = payload?.optJSONObject("live_play_info") ?: payload ?: holder
+        val roomId = info?.optNullableLong("room_id")
+            ?: info?.optNullableLong("roomid")
+            ?: holder?.optNullableLong("room_id")
+            ?: 0L
+        if (roomId <= 0L) return null
+        val title = cleanHtml(info?.optSafeString("title").orEmpty())
+        val cover = normalizeUrl(
+            info?.optSafeString("cover").orEmpty().ifBlank {
+                info?.optSafeString("cover_from_user").orEmpty()
+            }
+        )
+        val area = cleanHtml(info?.optSafeString("area_name").orEmpty())
+        val watched = info?.optJSONObject("watched_show")
+        val online = watched?.optSafeString("text_large").orEmpty()
+            .ifBlank { watched?.optSafeString("text_small").orEmpty() }
+            .ifBlank { info?.optNullableLong("online")?.let(::formatNullableCount).orEmpty() }
+        return DynamicLive(
+            roomId = roomId,
+            title = title,
+            cover = cover,
+            areaName = area,
+            onlineText = online
         )
     }
 

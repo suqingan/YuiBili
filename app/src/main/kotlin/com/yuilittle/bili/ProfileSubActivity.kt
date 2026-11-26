@@ -2095,7 +2095,7 @@ class ProfileSubActivity : Activity() {
             Toast.makeText(this, "已复制版本信息", Toast.LENGTH_SHORT).show()
         }
         infoDivider()
-        infoRow("作者", "xiaoyuili")
+        infoRow("作者", "xiaoyuili（二改作者 suqingan）")
         infoDivider()
         infoRow("隐私与存储", "凭证仅存本机")
         infoDivider()

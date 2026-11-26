@@ -4368,6 +4368,9 @@ class VideoDetailActivity : Activity() {
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 if (!canUsePlayback(generation) || player !== exoPlayer) return
+                // 播放期间保持屏幕常亮：跟随系统的息屏时间会让正在看的视频被灭屏。
+                // 暂停或缓冲结束时释放，交回系统息屏策略。
+                window.decorView.keepScreenOn = isPlaying
                 handler.removeCallbacks(historyTick)
                 if (isPlaying) {
                     if (!isLocalMode) {
@@ -6326,6 +6329,7 @@ class VideoDetailActivity : Activity() {
         handler.removeCallbacks(progressUpdater)
         controlsHideRunnable?.let(handler::removeCallbacks)
         cancelLongPressBoost()
+        window.decorView.keepScreenOn = false
         unregisterStatusReceiver()
         closeSeasonDrawer(immediate = true)
         danmakuSettingsDrawer?.close(immediate = true)

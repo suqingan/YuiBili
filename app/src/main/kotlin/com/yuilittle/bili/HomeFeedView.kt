@@ -18,7 +18,10 @@ import android.widget.GridView
 import android.widget.LinearLayout
 import android.widget.TextView
 import okhttp3.Call
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.drawable.GradientDrawable
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -178,6 +181,19 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
             rightMargin = dp(Ds.Space.md)
         })
         addView(createSearchBar(), LayoutParams(0, dp(SEARCH_BOX_HEIGHT_DP), 1f))
+        addView(createMessageEntry(), LayoutParams(dp(40), dp(40)).apply {
+            leftMargin = dp(6)
+        })
+    }
+
+    /** 右上角消息入口：信封图标，点击进入消息中心。 */
+    private fun createMessageEntry(): View = FrameLayout(context).apply {
+        isClickable = true
+        isFocusable = true
+        contentDescription = "消息"
+        Ds.bindPressFeedback(this, 0.92f)
+        addView(MessageEnvelopeIcon(context, COLOR_MUTED), FrameLayout.LayoutParams(dp(21), dp(21), Gravity.CENTER))
+        setOnClickListener { MessageCenterActivity.open(context) }
     }
 
     private fun createSearchBar(): View = LinearLayout(context).apply {
@@ -1498,4 +1514,44 @@ private val publishedDateFormat = object : ThreadLocal<SimpleDateFormat>() {
 internal fun formatPublishedDate(epochSeconds: Long): String {
     if (epochSeconds <= 0L) return "日期未知"
     return requireNotNull(publishedDateFormat.get()).format(Date(epochSeconds * 1_000L))
+}
+
+/** 顶栏消息入口的信封图标（描边风格，与侧栏图标保持同一套线条语言）。 */
+private class MessageEnvelopeIcon(context: Context, private val tint: Int) : View(context) {
+    private val d = resources.displayMetrics.density
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.7f * d
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val path = Path()
+
+    override fun onDraw(canvas: Canvas) {
+        paint.color = tint
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val l = 1.6f * d
+        val t = 3.2f * d
+        val r = w - 1.6f * d
+        val b = h - 3.2f * d
+        val rad = 2.4f * d
+        path.rewind()
+        path.moveTo(l + rad, t)
+        path.lineTo(r - rad, t)
+        path.quadTo(r, t, r, t + rad)
+        path.lineTo(r, b - rad)
+        path.quadTo(r, b, r - rad, b)
+        path.lineTo(l + rad, b)
+        path.quadTo(l, b, l, b - rad)
+        path.lineTo(l, t + rad)
+        path.quadTo(l, t, l + rad, t)
+        path.close()
+        canvas.drawPath(path, paint)
+        path.rewind()
+        path.moveTo(l + 0.9f * d, t + 0.9f * d)
+        path.lineTo(w * 0.5f, t + (b - t) * 0.62f)
+        path.lineTo(r - 0.9f * d, t + 0.9f * d)
+        canvas.drawPath(path, paint)
+    }
 }
