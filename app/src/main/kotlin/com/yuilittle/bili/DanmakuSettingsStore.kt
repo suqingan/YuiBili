@@ -21,6 +21,10 @@ internal object DanmakuSettingsStore {
     private const val KEY_BLOCK_TOP = "block_top"
     private const val KEY_BLOCK_BOTTOM = "block_bottom"
     private const val KEY_BLOCK_COLOR = "block_color"
+    private const val KEY_HISTORY_LIMIT = "live_history_limit"
+
+    /** 「只显示后 N 条」的可选档位（直播弹幕面板与叠加层共用）。 */
+    val HISTORY_LIMIT_OPTIONS = listOf(20, 50, 100, 200)
 
     private const val PERSIST_DEBOUNCE_MS = 200L
 
@@ -33,13 +37,15 @@ internal object DanmakuSettingsStore {
         val blockScroll: Boolean = false,
         val blockTop: Boolean = false,
         val blockBottom: Boolean = false,
-        val blockColor: Boolean = false
+        val blockColor: Boolean = false,
+        val historyLimit: Int = 50
     ) {
         fun sanitized(): Snapshot = copy(
             opacity = sanitizeFloat(opacity, 0.85f, 0.15f, 1.0f),
             textScale = sanitizeFloat(textScale, 1.0f, 0.6f, 1.6f),
             speedScale = sanitizeFloat(speedScale, 1.0f, 0.6f, 1.6f),
-            areaFraction = snapAreaFraction(areaFraction)
+            areaFraction = snapAreaFraction(areaFraction),
+            historyLimit = snapHistoryLimit(historyLimit)
         )
     }
 
@@ -65,6 +71,7 @@ internal object DanmakuSettingsStore {
             .putBoolean(KEY_BLOCK_TOP, s.blockTop)
             .putBoolean(KEY_BLOCK_BOTTOM, s.blockBottom)
             .putBoolean(KEY_BLOCK_COLOR, s.blockColor)
+            .putInt(KEY_HISTORY_LIMIT, s.historyLimit)
             .apply()
     }
 
@@ -83,7 +90,8 @@ internal object DanmakuSettingsStore {
             blockScroll = prefs.getBoolean(KEY_BLOCK_SCROLL, false),
             blockTop = prefs.getBoolean(KEY_BLOCK_TOP, false),
             blockBottom = prefs.getBoolean(KEY_BLOCK_BOTTOM, false),
-            blockColor = prefs.getBoolean(KEY_BLOCK_COLOR, false)
+            blockColor = prefs.getBoolean(KEY_BLOCK_COLOR, false),
+            historyLimit = prefs.getInt(KEY_HISTORY_LIMIT, 50)
         ).sanitized()
     }
 
@@ -108,6 +116,11 @@ internal object DanmakuSettingsStore {
 
     fun resetToDefault(): Snapshot = update(debouncePersist = false) {
         Snapshot(enabled = it.enabled)
+    }
+
+    /** 直播弹幕「只显示后 N 条」：N 越大越吃内存，档位限制在 20~200。 */
+    fun setHistoryLimit(limit: Int): Snapshot = update(debouncePersist = false) {
+        it.copy(historyLimit = limit)
     }
 
     fun flushPersist() {
@@ -154,5 +167,11 @@ internal object DanmakuSettingsStore {
             raw < 0.875f -> 0.75f
             else -> 1.00f
         }
+    }
+
+    internal fun snapHistoryLimit(raw: Int): Int {
+        if (raw in HISTORY_LIMIT_OPTIONS) return raw
+        // 非法值按最近的合法档位收敛，避免出现 0 条或超大值。
+        return HISTORY_LIMIT_OPTIONS.minByOrNull { kotlin.math.abs(it - raw) } ?: 50
     }
 }

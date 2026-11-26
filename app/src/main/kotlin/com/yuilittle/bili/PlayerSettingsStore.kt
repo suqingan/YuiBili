@@ -3,6 +3,7 @@ package com.yuilittle.bili
 import android.app.Activity
 import android.content.Context
 import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 
 /**
  * 播放相关全局设置：屏幕方向与默认画质。
@@ -44,7 +45,9 @@ internal object PlayerSettingsStore {
     private const val KEY_ORIENTATION = "play_orientation"
     private const val KEY_HOME_ORIENTATION = "home_orientation"
     private const val KEY_LANDSCAPE_AUTO_FULLSCREEN = "landscape_auto_fullscreen"
+    private const val KEY_SMART_FULLSCREEN = "smart_fullscreen_by_video_ratio"
     private const val KEY_DEFAULT_QUALITY = "default_quality"
+    private const val KEY_LIVE_QUALITY = "live_quality"
 
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -72,6 +75,32 @@ internal object PlayerSettingsStore {
         prefs(context).edit().putBoolean(KEY_LANDSCAPE_AUTO_FULLSCREEN, enabled).apply()
     }
 
+    /** 竖屏点全屏时是否按视频宽高比智能决定全屏方向，默认开启。 */
+    fun smartFullscreenByVideoRatio(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_SMART_FULLSCREEN, true)
+
+    fun setSmartFullscreenByVideoRatio(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_SMART_FULLSCREEN, enabled).apply()
+    }
+
+    /**
+     * 计算进入全屏时应请求的屏幕方向。
+     *
+     * 仅当「播放页屏幕方向 = 跟随系统」、当前处于竖屏且智能全屏开关开启时按视频比例切换：
+     * 竖屏视频保持竖屏全屏，横屏视频旋转为横屏全屏；其余情况尊重用户锁定设置。
+     */
+    fun resolveFullscreenOrientation(activity: Activity, portraitVideo: Boolean): Int {
+        val mode = orientation(activity)
+        if (mode != OrientationMode.FOLLOW_SYSTEM) return orientationValue(activity, mode)
+        val portraitNow = activity.resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE
+        if (!portraitNow || !smartFullscreenByVideoRatio(activity)) return orientationValue(activity, mode)
+        return if (portraitVideo) {
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
+    }
+
     fun defaultQuality(context: Context): Int {
         val qn = prefs(context).getInt(KEY_DEFAULT_QUALITY, 0)
         return if (qn == 0 || QUALITY_OPTIONS.any { it.qn == qn }) qn else 0
@@ -87,6 +116,16 @@ internal object PlayerSettingsStore {
     fun resolveQuality(context: Context, fallback: Int): Int {
         val preset = defaultQuality(context)
         return if (preset > 0) preset else fallback
+    }
+
+    /** 直播画质（qn），默认 10000 = 原画；实际可用档位以直播间接口返回为准。 */
+    fun liveQuality(context: Context): Int {
+        val qn = prefs(context).getInt(KEY_LIVE_QUALITY, 10000)
+        return if (qn > 0) qn else 10000
+    }
+
+    fun setLiveQuality(context: Context, qn: Int) {
+        if (qn > 0) prefs(context).edit().putInt(KEY_LIVE_QUALITY, qn).apply()
     }
 
     /**

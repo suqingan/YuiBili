@@ -28,11 +28,12 @@ internal class TabletRailNav(
         const val RAIL_WIDTH_DP = 78
         const val DEST_HOME = 0
         const val DEST_SEARCH = 1
-        const val DEST_DOWNLOADS = 2
-        const val DEST_FAVORITES = 3
-        const val DEST_HISTORY = 4
-        const val DEST_PROFILE = 5
-        const val DEST_COUNT = 6
+        const val DEST_DYNAMIC = 2
+        const val DEST_DOWNLOADS = 3
+        const val DEST_FAVORITES = 4
+        const val DEST_HISTORY = 5
+        const val DEST_PROFILE = 6
+        const val DEST_COUNT = 7
     }
 
     private var selectedDest = DEST_HOME
@@ -68,6 +69,7 @@ internal class TabletRailNav(
 
         addNavItem(DEST_HOME, RailItemView.KIND_HOME, "首页", topDp = 0)
         addNavItem(DEST_SEARCH, RailItemView.KIND_SEARCH, "搜索")
+        addNavItem(DEST_DYNAMIC, RailItemView.KIND_DYNAMIC, "动态")
         addNavItem(DEST_DOWNLOADS, RailItemView.KIND_DOWNLOAD, "下载")
         addNavItem(DEST_FAVORITES, RailItemView.KIND_FAVORITE, "收藏")
         addNavItem(DEST_HISTORY, RailItemView.KIND_HISTORY, "历史")
@@ -113,6 +115,7 @@ internal class TabletRailNav(
             const val KIND_FAVORITE = 3
             const val KIND_HISTORY = 4
             const val KIND_PROFILE = 5
+            const val KIND_DYNAMIC = 6
         }
 
         private val iconView: RailIconCanvas
@@ -241,6 +244,18 @@ internal class TabletRailNav(
                     path.moveTo(cx, cy - 3.4f * d)
                     path.lineTo(cx, cy + 0.2f * d)
                     path.lineTo(cx + 2.8f * d, cy + 1.8f * d)
+                    canvas.drawPath(path, paint)
+                }
+                RailItemView.KIND_DYNAMIC -> {
+                    // 闪电轮廓：与手机底栏「动态」图标保持一致
+                    path.rewind()
+                    path.moveTo(cx + 1.6f * d, cy - 6.6f * d)
+                    path.lineTo(cx - 4.2f * d, cy + 1.2f * d)
+                    path.lineTo(cx - 0.6f * d, cy + 1.2f * d)
+                    path.lineTo(cx - 1.6f * d, cy + 6.6f * d)
+                    path.lineTo(cx + 4.2f * d, cy - 1.2f * d)
+                    path.lineTo(cx + 0.6f * d, cy - 1.2f * d)
+                    path.close()
                     canvas.drawPath(path, paint)
                 }
                 RailItemView.KIND_PROFILE -> {

@@ -387,6 +387,56 @@ object BiliSpaceApi {
         return req
     }
 
+    /** 拉取「关注」动态流（需登录）。游标 offset 由上一页返回，空串表示首页。 */
+    internal fun fetchFollowingDynamics(
+        offset: String = "",
+        callback: (CursorPage<SpaceDynamic>?, String?) -> Unit
+    ): BiliRequest {
+        val req = BiliRequest()
+        if (!BiliSessionStore.isLoggedIn()) {
+            mainHandler.post { if (!req.cancelled) callback(null, "登录后可查看关注动态") }
+            return req
+        }
+        checkRiskCooldown()?.let { msg ->
+            mainHandler.post { if (!req.cancelled) callback(null, msg) }
+            return req
+        }
+        val cleanOffset = offset.trim()
+        executeSpace(req, onRejected = { callback(null, "请求过于频繁，请稍后再试") }) {
+            try {
+                val page = fetchFollowingDynamicPageBlocking(cleanOffset, req)
+                if (req.cancelled) return@executeSpace
+                mainHandler.post { if (!req.cancelled) callback(page, null) }
+            } catch (error: Exception) {
+                if (!req.cancelled) {
+                    mainHandler.post { if (!req.cancelled) callback(null, readableSpaceError(error)) }
+                }
+            }
+        }
+        return req
+    }
+
+    private fun fetchFollowingDynamicPageBlocking(offset: String, req: BiliRequest): CursorPage<SpaceDynamic> {
+        val params = LinkedHashMap<String, String>().apply {
+            put("type", "all")
+            put("page", "1")
+            if (offset.isNotEmpty()) put("offset", offset)
+            put("timezone_offset", "-480")
+            put("platform", "web")
+            put("features", DYNAMIC_FEATURES)
+            put("web_location", "333.999")
+        }
+        // feed/all 对部分账号会校验 WBI；签名失败时退回普通查询，避免整页不可用。
+        val query = runCatching { BiliWbiSign.signParams(params) }.getOrElse { encodeQuery(params) }
+        val url = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all?$query"
+        val root = getSpaceJson(url, "https://t.bilibili.com/", req)
+        val code = root.optInt("code", -1)
+        if (code != 0) {
+            throw BiliCodeException(code, readableBiliCode(code, root.optString("message")))
+        }
+        return parseDynamicFeedPage(root)
+    }
+
     /** 拉取单条动态详情（/x/polymer/web-dynamic/v1/detail），用于详情页补齐全文、title 与 comment_id_str / comment_type。 */
     internal fun fetchDynamicDetail(
         dynamicId: String,

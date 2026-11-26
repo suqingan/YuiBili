@@ -202,6 +202,9 @@ class PgcDetailActivity : Activity() {
     private var segmentTimeline = PlaybackTimeline(emptyList())
     /** The single-track stream actually fed to ExoPlayer (after stable selection). */
     private var playingStream: BiliPlayUrl.DashStream? = null
+    /** ExoPlayer 实际解码出的画面尺寸，DASH track 缺宽高时作为竖屏视频判断的兜底。 */
+    @Volatile private var sampledVideoWidth = 0
+    @Volatile private var sampledVideoHeight = 0
     private val failedCodecTracks = HashSet<Pair<Int, String>>()
     private val qualityPrefs by lazy { getSharedPreferences("bili_player", MODE_PRIVATE) }
     private val localPlaybackPrefs by lazy { getSharedPreferences("bili_local_playback", MODE_PRIVATE) }
@@ -3523,6 +3526,8 @@ class PgcDetailActivity : Activity() {
 
             override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
                 if (canUsePlayback(generation) && player === exoPlayer && videoSize.width > 0) {
+                    sampledVideoWidth = videoSize.width
+                    sampledVideoHeight = videoSize.height
                     Log.i(
                         "YuiBiliPlayer",
                         "video-size ${videoSize.width}x${videoSize.height} playingQuality=${playingStream?.actualQuality}"
@@ -4165,9 +4170,13 @@ class PgcDetailActivity : Activity() {
     //  Landscape videos rotate to landscape; portrait videos stay portrait.
     // ─────────────────────────────────────────────────
 
+    /** 竖屏视频判断：优先用 DASH 元数据，缺失时回退到 ExoPlayer 实际解码尺寸。 */
     private fun isPortraitVideo(): Boolean {
-        val track = playingStream?.videoTracks?.firstOrNull() ?: return false
-        return track.width > 0 && track.height > 0 && track.height > track.width
+        val track = playingStream?.videoTracks?.firstOrNull()
+        if (track != null && track.width > 0 && track.height > 0) {
+            return track.height > track.width
+        }
+        return sampledVideoWidth > 0 && sampledVideoHeight > 0 && sampledVideoHeight > sampledVideoWidth
     }
 
     private fun toggleFullscreen() {
@@ -4242,7 +4251,8 @@ class PgcDetailActivity : Activity() {
         page.visibility = View.GONE
         hideSystemBars()
         adjustIndicator.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
-        PlayerSettingsStore.applyPlaybackOrientation(this)
+        // 竖屏点全屏时按视频比例决定方向：竖屏视频保持竖屏全屏，横屏视频自动转横屏。
+        requestedOrientation = PlayerSettingsStore.resolveFullscreenOrientation(this, isPortraitVideo())
         applyControlSizing()
         showControls()
         fsTransitioning = false
@@ -4330,7 +4340,10 @@ class PgcDetailActivity : Activity() {
         super.onConfigurationChanged(newConfig)
         if (exitingFullscreen && newConfig.orientation == Configuration.ORIENTATION_PORTRAIT) {
             handler.post { if (exitingFullscreen) movePlayerBackToPage() }
-        } else if (!isFullscreen) {
+        } else if (isFullscreen) {
+            // 智能全屏会主动旋转屏幕，旋转后系统栏可能重新出现，补一次隐藏保证沉浸式。
+            handler.post { if (isFullscreen) hideSystemBars() }
+        } else {
             handler.post {
                 applyPageSplitLayout()
                 applyControlSizing()

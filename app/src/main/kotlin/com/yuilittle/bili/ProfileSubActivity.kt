@@ -2287,6 +2287,7 @@ class ProfileSubActivity : Activity() {
         val homeOrientation = PlayerSettingsStore.homeOrientation(this)
         val currentQuality = PlayerSettingsStore.defaultQuality(this)
         val autoFullscreen = PlayerSettingsStore.landscapeAutoFullscreen(this)
+        val smartFullscreen = PlayerSettingsStore.smartFullscreenByVideoRatio(this)
 
         val orientationCard = newCard()
         choiceRow(
@@ -2325,9 +2326,22 @@ class ProfileSubActivity : Activity() {
                 renderSettings()
             }
         }
+        cardDivider(orientationCard)
+        choiceRow(
+            orientationCard,
+            "按视频比例智能全屏",
+            if (smartFullscreen) "已开启" else "已关闭",
+            smartFullscreen,
+            "竖屏视频全屏不旋转，横屏视频自动横屏全屏"
+        ) {
+            val next = !PlayerSettingsStore.smartFullscreenByVideoRatio(this)
+            PlayerSettingsStore.setSmartFullscreenByVideoRatio(this, next)
+            Toast.makeText(this, if (next) "已开启智能全屏" else "已关闭智能全屏", Toast.LENGTH_SHORT).show()
+            renderSettings()
+        }
         listBox.addView(sectionHeader("播放", 12))
         listBox.addView(orientationCard)
-        listBox.addView(hint("播放页方向设置会覆盖系统方向；全屏按钮不会改变锁定方向。"))
+        listBox.addView(hint("播放页方向设置会覆盖系统方向；智能全屏仅在「跟随系统」且竖屏时按视频比例生效。"))
 
         val globalCard = newCard()
         choiceRow(
