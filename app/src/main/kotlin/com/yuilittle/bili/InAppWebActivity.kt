@@ -41,6 +41,8 @@ class InAppWebActivity : Activity() {
     private var currentUrl: String = ""
     private var desktopUa = false
     private var withBiliLogin = false
+    private var replyAnchor = ""
+    private val replyAnchorTask = Runnable { scrollToReplyAnchor() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -57,6 +59,7 @@ class InAppWebActivity : Activity() {
         }
         desktopUa = intent.getBooleanExtra(EXTRA_DESKTOP_UA, false)
         withBiliLogin = intent.getBooleanExtra(EXTRA_BILI_LOGIN, false)
+        replyAnchor = Regex("#reply(\\d+)").find(target)?.groupValues?.getOrNull(1).orEmpty()
         currentUrl = target
         setContentView(buildUi())
         applyWebPreferences(target)
@@ -190,6 +193,11 @@ class InAppWebActivity : Activity() {
                 override fun onPageFinished(view: WebView, url: String?) {
                     super.onPageFinished(view, url)
                     if (!url.isNullOrBlank()) updateUrl(url)
+                    if (replyAnchor.isNotBlank()) {
+                        webView.removeCallbacks(replyAnchorTask)
+                        // B 站评论区是异步渲染的，等 DOM 落地后再定位一次。
+                        webView.postDelayed(replyAnchorTask, 1200L)
+                    }
                 }
 
                 override fun onReceivedError(
@@ -262,6 +270,30 @@ class InAppWebActivity : Activity() {
         return root
     }
 
+    /** 评论锚点兜底：SPA 异步渲染时 #reply 未必自动滚到目标，用 JS 找到对应楼层并高亮。 */
+    private fun scrollToReplyAnchor() {
+        if (replyAnchor.isBlank()) return
+        val js = """
+            (function(){
+              var id='$replyAnchor';
+              if(!id) return false;
+              var nodes=document.querySelectorAll('[data-rpid="'+id+'"],[data-reply-id="'+id+'"],[id="reply-'+id+'"]');
+              for (var i=0;i<nodes.length;i++){
+                var n=nodes[i];
+                if(!n.getBoundingClientRect) continue;
+                n.scrollIntoView({block:'center'});
+                n.style.outline='2px solid #fb7299';
+                n.style.outlineOffset='2px';
+                return true;
+              }
+              var reply=document.getElementById('comment')||document.querySelector('.reply-area,.comment-area');
+              if(reply) reply.scrollIntoView({block:'start'});
+              return false;
+            })()
+        """.trimIndent()
+        runCatching { webView.evaluateJavascript(js, null) }
+    }
+
     private fun updateUrl(url: String) {
         currentUrl = url
         urlText.text = url
@@ -293,6 +325,7 @@ class InAppWebActivity : Activity() {
 
     override fun onDestroy() {
         (webView.parent as? ViewGroup)?.removeView(webView)
+        webView.removeCallbacks(replyAnchorTask)
         webView.stopLoading()
         webView.webChromeClient = null
         webView.webViewClient = WebViewClient()

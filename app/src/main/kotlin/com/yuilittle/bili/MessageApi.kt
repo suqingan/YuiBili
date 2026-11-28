@@ -32,7 +32,9 @@ internal data class MessageItem(
     /** 毫秒时间戳，用于统一排序（0 表示接口未给时间）。 */
     val ts: Long = 0L,
     /** 系统消息会话（无用户名片时用「系统通知」兜底）。 */
-    val system: Boolean = false
+    val system: Boolean = false,
+    /** 通知对应的评论 rpid（网页版 #reply 锚点，用于跳到具体回复/@ 位置）。 */
+    val replyId: Long = 0L
 )
 
 /**
@@ -372,6 +374,11 @@ internal object MessageApi {
                 else -> source.ifBlank { title }.ifBlank { "回复了你的评论" }
             }
             val time = feedTime(entry, item, timeKey)
+            // msgfeed 的 target_id / root_id / source_id 分别对应回复、根评论、来源评论，
+            // 网页版只要在内容页后面拼 #reply{rpid} 就能滚到那条评论。
+            val replyId = (item?.optLong("target_id", 0L) ?: 0L).takeIf { it > 0L }
+                ?: (item?.optLong("root_id", 0L) ?: 0L).takeIf { it > 0L }
+                ?: item?.optLong("source_id", 0L) ?: 0L
             out += MessageItem(
                 id = "${kind.name}_${entry.optLong("id", 0L)}_$i",
                 kind = kind,
@@ -382,7 +389,8 @@ internal object MessageApi {
                 cover = cover,
                 uri = uri,
                 mid = user?.optLong("mid", 0L) ?: 0L,
-                ts = normalizeTs(time)
+                ts = normalizeTs(time),
+                replyId = replyId
             )
         }
         // 接口给的是「按类型分页」的混合顺序，统一按时间倒序排一遍。

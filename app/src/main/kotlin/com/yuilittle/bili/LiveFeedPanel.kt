@@ -2,8 +2,10 @@ package com.yuilittle.bili
 
 import android.content.Context
 import android.graphics.drawable.GradientDrawable
+import android.os.SystemClock
 import android.text.TextUtils
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.AbsListView
@@ -13,6 +15,7 @@ import android.widget.GridView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import kotlin.math.abs
 
 /**
  * 首页「直播」面板：人气直播间网格。
@@ -41,6 +44,13 @@ internal class LiveFeedPanel(context: Context) : FrameLayout(context) {
     private var itemWidth = 0
     private var coverHeight = 0
 
+    // 首张卡片在少数布局下不会生成可点击子 View，用坐标兜底补发打开动作。
+    private var downX = 0f
+    private var downY = 0f
+    private var downAt = 0L
+    private var lastOpenAt = 0L
+    private var lastOpenPosition = -1
+
     private val columns: Int
         get() = if (LayoutMode.isTablet) 4 else 2
 
@@ -55,6 +65,10 @@ internal class LiveFeedPanel(context: Context) : FrameLayout(context) {
             clipToPadding = false
             isVerticalScrollBarEnabled = false
             adapter = this@LiveFeedPanel.adapter
+            // 兜底：即使卡片内部某个子 View 抢走触摸，GridView 也能把点击派发到直播间。
+            setOnItemClickListener { _, _, position, _ ->
+                openRoom(position)
+            }
             setOnScrollListener(object : AbsListView.OnScrollListener {
                 override fun onScrollStateChanged(view: AbsListView?, scrollState: Int) = Unit
                 override fun onScroll(view: AbsListView?, firstVisibleItem: Int, visibleItemCount: Int, totalItemCount: Int) {
@@ -70,6 +84,47 @@ internal class LiveFeedPanel(context: Context) : FrameLayout(context) {
             rightMargin = dp(24)
         })
         setOnClickListener { if (rooms.isEmpty() && !loading) reload() }
+    }
+
+    /**
+     * 首张卡片在部分布局下不会生成可点击子 View（封面未加载时尤其明显），
+     * 点封面/标题都没反应。这里只在「按下到抬起没有移动 + 落在第 0 项」时补发一次打开，
+     * 并用 [lastOpenAt] 与正常点击链路去重；不消费事件，GridView 滚动与其它卡片点击不受影响。
+     */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = ev.x
+                downY = ev.y
+                downAt = SystemClock.uptimeMillis()
+            }
+            MotionEvent.ACTION_UP -> {
+                val now = SystemClock.uptimeMillis()
+                val isTap = abs(ev.x - downX) <= dp(10) &&
+                    abs(ev.y - downY) <= dp(10) &&
+                    now - downAt < 700L
+                if (isTap && rooms.isNotEmpty()) {
+                    val gx = ev.x - grid.left
+                    val gy = ev.y - grid.top
+                    if (gx >= 0 && gy >= 0 && gx <= grid.width && gy <= grid.height &&
+                        grid.pointToPosition(gx.toInt(), gy.toInt()) == 0
+                    ) {
+                        openRoom(0)
+                    }
+                }
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    /** 统一入口：无论来自子 View 点击还是坐标兜底，同一项短时间内只打开一次直播间。 */
+    private fun openRoom(position: Int) {
+        val room = rooms.getOrNull(position) ?: return
+        val now = SystemClock.uptimeMillis()
+        if (position == lastOpenPosition && now - lastOpenAt < 900L) return
+        lastOpenAt = now
+        lastOpenPosition = position
+        LiveRoomActivity.open(context, room)
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -176,8 +231,15 @@ internal class LiveFeedPanel(context: Context) : FrameLayout(context) {
             } else {
                 holder.cover.setImageDrawable(null)
             }
-            card.setOnClickListener { LiveRoomActivity.open(context, room) }
+            // 封面加载与否都不影响点击：整卡透明热区 + 各子层都挂同一个入口。
+            card.setOnClickListener { openRoom(position) }
             val wrap = card.getChildAt(0) as FrameLayout
+            wrap.isClickable = true
+            wrap.setOnClickListener { openRoom(position) }
+            holder.cover.isClickable = true
+            holder.cover.setOnClickListener { openRoom(position) }
+            holder.hit.isClickable = true
+            holder.hit.setOnClickListener { openRoom(position) }
             wrap.layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, coverHeight)
             card.layoutParams = AbsListView.LayoutParams(itemWidth, coverHeight + dp(70))
@@ -192,6 +254,7 @@ internal class LiveFeedPanel(context: Context) : FrameLayout(context) {
         }
         val title: TextView = root.getChildAt(1) as TextView
         val owner: TextView = root.getChildAt(2) as TextView
+        val hit: View = root.getChildAt(0).let { (it as FrameLayout).getChildAt(3) }
     }
 
     private fun buildCard(): LinearLayout {
@@ -250,6 +313,16 @@ internal class LiveFeedPanel(context: Context) : FrameLayout(context) {
             FrameLayout.LayoutParams.MATCH_PARENT,
             dp(22),
             Gravity.BOTTOM
+        ))
+
+        // 透明热区盖在封面上层：缩略图尚未加载/加载失败时，点击仍由它接住。
+        val hit = View(context).apply {
+            isClickable = true
+            isFocusable = true
+        }
+        coverWrap.addView(hit, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
         ))
 
         card.addView(coverWrap, LinearLayout.LayoutParams(

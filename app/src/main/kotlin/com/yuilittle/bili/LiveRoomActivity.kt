@@ -120,6 +120,7 @@ class LiveRoomActivity : Activity() {
     private lateinit var playPauseIcon: LivePlayPauseIcon
     private lateinit var danmakuToggle: DanmakuUi.ToggleIconView
     private lateinit var qualityBtn: TextView
+    private lateinit var danmakuListBtn: TextView
     private lateinit var fullscreenIcon: LiveFullscreenIcon
     private lateinit var infoBlock: LinearLayout
     private lateinit var infoTitle: TextView
@@ -150,6 +151,8 @@ class LiveRoomActivity : Activity() {
 
     private var isLandscape = false
     private var controlsVisible = true
+    /** 横屏时是否在画面右侧 1/3 显示半透明弹幕列表。 */
+    private var chatListVisible = false
 
     // 播放区手势：左侧上下滑调亮度、右侧上下滑调音量
     private lateinit var gestureHud: LiveSwipeHudView
@@ -179,8 +182,6 @@ class LiveRoomActivity : Activity() {
     private val danmakuSettingsListener: (DanmakuSettingsStore.Snapshot) -> Unit = { snapshot ->
         danmakuOverlay.applySettings(snapshot)
         danmakuToggle.setDanmakuEnabled(snapshot.enabled)
-        chatPanel.setLimit(snapshot.historyLimit)
-        while (danmakuHistory.size > snapshot.historyLimit) danmakuHistory.removeFirst()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -252,8 +253,11 @@ class LiveRoomActivity : Activity() {
         buildInfoBlock()
 
         chatPanel = LiveDanmakuPanelView(this).apply {
-            setLimit(DanmakuSettingsStore.snapshot().historyLimit)
-            onSettingsClick = { showDanmakuSettings() }
+            onCloseClick = {
+                chatListVisible = false
+                applyLayout()
+                showControlsBriefly()
+            }
         }
 
         // 手势浮层放最上层，只在滑动时出现，不拦截点击。
@@ -384,6 +388,27 @@ class LiveRoomActivity : Activity() {
         })
 
         bottomBar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+
+        // 原画左侧：横屏开关半透明弹幕列表（占画面右侧约 1/3）
+        danmakuListBtn = TextView(this).apply {
+            text = "弹幕列表"
+            textSize = 11f
+            typeface = Ds.body(true)
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            setTextColor(Color.WHITE)
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            background = Ds.pill(this@LiveRoomActivity, 0x33000000, 0x2EFFFFFF)
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.90f)
+            setOnClickListener {
+                chatListVisible = !chatListVisible
+                applyLayout()
+                showControlsBriefly()
+            }
+        }
+        bottomBar.addView(danmakuListBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, dp(26)).apply { rightMargin = dp(8) })
 
         qualityBtn = TextView(this).apply {
             text = "画质"
@@ -519,10 +544,22 @@ class LiveRoomActivity : Activity() {
         root.removeAllViews()
 
         if (nextLandscape) {
-            // 全屏 = 整屏直播画面：不保留右侧历史弹幕面板，也不留信息区；
-            // 弹幕只以叠加层形式浮在画面上。
+            // 全屏默认是纯直播画面；打开「弹幕列表」后才在右侧 1/3 叠半透明弹幕面板。
             root.addView(playerArea, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            if (chatListVisible) {
+                chatPanel.setTranslucent(true)
+                root.addView(chatPanel, FrameLayout.LayoutParams(
+                    (screenW / 3f).toInt().coerceAtLeast(dp(200)),
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    Gravity.END
+                ).apply {
+                    // 底部留出控制条高度，避免「隐藏弹幕」/画质按钮被面板盖住。
+                    bottomMargin = dp(58)
+                })
+            } else {
+                chatPanel.setTranslucent(false)
+            }
             danmakuOverlay.setFullscreenMode(true)
             hideSystemBars()
         } else {
@@ -538,7 +575,7 @@ class LiveRoomActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT, playerHeight))
             column.addView(infoBlock, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-            chatPanel.setBackgroundColor(0xFF0E0F13.toInt())
+            chatPanel.setTranslucent(false)
             column.addView(chatPanel, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
             root.addView(column, FrameLayout.LayoutParams(
@@ -548,6 +585,8 @@ class LiveRoomActivity : Activity() {
         }
 
         fullscreenIcon.setFullscreen(nextLandscape)
+        danmakuListBtn.visibility = if (nextLandscape) View.VISIBLE else View.GONE
+        danmakuListBtn.text = if (chatListVisible) "隐藏弹幕" else "弹幕列表"
         // 竖屏时标题在播放区下方展示，顶部栏不再重复，只保留返回与人气。
         barTitle.text = if (nextLandscape) roomTitle else ""
         danmakuOverlay.syncClock(liveNowMs(), player?.isPlaying == true, 1f)
@@ -679,7 +718,6 @@ class LiveRoomActivity : Activity() {
             flags = 0
         )
         danmakuHistory.addLast(model)
-        while (danmakuHistory.size > snapshot.historyLimit) danmakuHistory.removeFirst()
         danmakuOverlay.setSegmentData(0, danmakuHistory.toList(), nowMs)
     }
 
@@ -1017,7 +1055,6 @@ class LiveRoomActivity : Activity() {
 
         val areaChips = ArrayList<Pair<Float, TextView>>()
         val sizeChips = ArrayList<Pair<Float, TextView>>()
-        val limitChips = ArrayList<Pair<Int, TextView>>()
 
         fun styleChip(chip: TextView, active: Boolean) {
             if (active) {
@@ -1041,7 +1078,6 @@ class LiveRoomActivity : Activity() {
             sizeChips.forEach { (scale, chip) ->
                 styleChip(chip, kotlin.math.abs(snapshot.textScale - scale) < 0.01f)
             }
-            limitChips.forEach { (limit, chip) -> styleChip(chip, snapshot.historyLimit == limit) }
         }
 
         fun chip(label: String, onClick: () -> Unit): TextView = TextView(this).apply {
@@ -1100,14 +1136,6 @@ class LiveRoomActivity : Activity() {
             chip(label) {
                 DanmakuSettingsStore.update { it.copy(textScale = scale) }
             }.also { sizeChips += scale to it }
-        })
-
-        // 只显示后 N 条
-        addSection("显示条数（只保留最近 N 条）")
-        addChipRow(DanmakuSettingsStore.HISTORY_LIMIT_OPTIONS.map { limit ->
-            chip("$limit 条") {
-                DanmakuSettingsStore.setHistoryLimit(limit)
-            }.also { limitChips += limit to it }
         })
 
         sheet.addView(TextView(this).apply {

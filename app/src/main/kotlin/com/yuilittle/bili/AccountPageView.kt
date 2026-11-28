@@ -516,9 +516,10 @@ class AccountPageView(context: Context) : LinearLayout(context) {
 
         // ── 外观卡片（夜间模式 + 外观适配下拉切换） & 内容与工具卡片 ──
         val appearanceCard = buildAppearanceCard()
-        val menuCard = buildMenuCard(includeFavorites = true)
+        val wide = LayoutMode.isWideScreen(context)
+        val menuCard = buildMenuCard(includeFavorites = true, includeSettings = !wide)
 
-        if (LayoutMode.isWideScreen(context)) {
+        if (wide) {
             // 平板宽屏双栏仪表盘：直接 MATCH_PARENT 占满右侧主舞台，彻底修复左侧头像/图标被裁切的问题
             profilePage.removeAllViews()
             profilePage.setPadding(dp(24), dp(22), dp(24), dp(32))
@@ -532,6 +533,8 @@ class AccountPageView(context: Context) : LinearLayout(context) {
             leftCol.addView(appearanceCard, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
                 topMargin = dp(Ds.Space.sm)
             })
+            // 平板双栏：设置收进左侧「外观」卡片，紧跟在外观适配下面。
+            addSettingsRow(appearanceCard)
 
             val rightCol = LinearLayout(context).apply { orientation = VERTICAL }
             rightCol.addView(sectionLabel("内容与工具"), sectionParams(0))
@@ -557,7 +560,42 @@ class AccountPageView(context: Context) : LinearLayout(context) {
         }
     }
 
-    private fun buildMenuCard(includeFavorites: Boolean): LinearLayout {
+    /** 平板双栏布局下把「设置」并进左侧外观卡片，与「外观适配」同一张卡片。 */
+    private fun addSettingsRow(card: LinearLayout) {
+        card.addView(
+            View(context).apply { setBackgroundColor(Ds.colors.lineSoft) },
+            LayoutParams(LayoutParams.MATCH_PARENT, Ds.hairline(context)).apply {
+                leftMargin = dp(Ds.Space.lg + 34 + Ds.Space.md)
+                rightMargin = dp(Ds.Space.lg)
+            }
+        )
+        val row = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(Ds.Space.lg), 0, dp(Ds.Space.lg), 0)
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { openSubPage(ProfileSubActivity.MODE_SETTINGS) }
+            addView(
+                iconChip(MenuIconView.SETTINGS),
+                LayoutParams(dp(34), dp(34)).apply { rightMargin = dp(Ds.Space.md) }
+            )
+            addView(TextView(context).apply {
+                text = "设置"
+                textSize = 15f
+                typeface = Ds.body(true)
+                setTextColor(COLOR_INK)
+            }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+            addView(
+                Ds.chevronRightIcon(context, Ds.colors.subtle, 1.7f),
+                LayoutParams(dp(14), dp(14))
+            )
+        }
+        bindRowPress(row)
+        card.addView(row, LayoutParams(LayoutParams.MATCH_PARENT, dp(56)))
+    }
+
+    private fun buildMenuCard(includeFavorites: Boolean, includeSettings: Boolean = true): LinearLayout {
         val menuCard = LinearLayout(context).apply {
             orientation = VERTICAL
             background = Ds.card(context, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.card)
@@ -612,9 +650,11 @@ class AccountPageView(context: Context) : LinearLayout(context) {
         menuRow(MenuIconView.DOWNLOADS, "下载管理") {
             DownloadManagerActivity.open(context)
         }
-        addMenuDivider()
-        menuRow(MenuIconView.SETTINGS, "设置") {
-            openSubPage(ProfileSubActivity.MODE_SETTINGS)
+        if (includeSettings) {
+            addMenuDivider()
+            menuRow(MenuIconView.SETTINGS, "设置") {
+                openSubPage(ProfileSubActivity.MODE_SETTINGS)
+            }
         }
         addMenuDivider()
         menuRow(MenuIconView.SPONSOR, "赞助开发") {

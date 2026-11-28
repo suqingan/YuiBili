@@ -452,8 +452,8 @@ internal object SpaceDynamicCardUi {
             val ih = img.height ?: 0
             val ratio = if (iw > 0 && ih > 0) ih.toFloat() / iw.toFloat() else 0.72f
             val isLong = ratio >= 2.0f
-            val targetW: Int
-            val targetH: Int
+            var targetW: Int
+            var targetH: Int
             when {
                 isLong -> {
                     targetW = (contentWidth * 0.54f).toInt().coerceAtLeast(activity.dp(150))
@@ -466,6 +466,15 @@ internal object SpaceDynamicCardUi {
                 else -> {
                     targetW = contentWidth
                     targetH = (targetW * ratio.coerceIn(0.46f, 0.92f)).toInt().coerceAtLeast(activity.dp(135))
+                }
+            }
+            // 平板横屏：单图最多占内容区 1/3，避免一张图横贯整屏。
+            if (LayoutMode.isWideScreen(activity)) {
+                val maxW = (contentWidth / 3f).toInt().coerceAtLeast(activity.dp(150))
+                if (targetW > maxW) {
+                    val scale = maxW.toFloat() / targetW
+                    targetW = maxW
+                    targetH = (targetH * scale).toInt().coerceAtLeast(activity.dp(110))
                 }
             }
 
@@ -597,7 +606,11 @@ internal object SpaceDynamicCardUi {
         } else {
             (activity.resources.displayMetrics.widthPixels - activity.dp(32)).coerceAtLeast(activity.dp(200))
         }
-        val coverH = (contentWidth * 9f / 16f).toInt().coerceIn(activity.dp(116), activity.dp(260))
+        // 平板横屏用正常大小的 16:9 缩略图（内容区 1/3 宽），不再把封面拉满整行。
+        val coverW = if (LayoutMode.isWideScreen(activity)) {
+            (contentWidth / 3f).toInt().coerceAtLeast(activity.dp(180))
+        } else contentWidth
+        val coverH = (coverW * 9f / 16f).toInt().coerceIn(activity.dp(116), activity.dp(260))
 
         val coverFrame = FrameLayout(activity).apply {
             setBackgroundColor(COLOR_COVER)
@@ -681,10 +694,7 @@ internal object SpaceDynamicCardUi {
             })
         }
 
-        wrap.addView(coverFrame, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            coverH
-        ))
+        wrap.addView(coverFrame, LinearLayout.LayoutParams(coverW, coverH))
 
         wrap.addView(TextView(activity).apply {
             text = applyKeywordHighlight(video.title, highlightKeyword)

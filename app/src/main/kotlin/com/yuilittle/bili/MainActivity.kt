@@ -209,12 +209,6 @@ class MainActivity : Activity() {
 
     private fun showTabletDestination(dest: Int, animate: Boolean) {
         val stage = tabletStage ?: return
-        // 消息中心是独立页面，不占用侧栏页索引；点完把选中态还原到当前页
-        if (dest == TabletRailNav.DEST_MESSAGE) {
-            MessageCenterActivity.open(this)
-            tabletRail?.setSelectedDestination(currentTabletDest)
-            return
-        }
         currentTabletDest = dest.coerceIn(0, TabletRailNav.DEST_COUNT - 1)
         tabletRail?.setSelectedDestination(currentTabletDest)
         stage.showPage(currentTabletDest, { createTabletPage(currentTabletDest) }, animate = animate)
@@ -233,6 +227,7 @@ class MainActivity : Activity() {
         TabletRailNav.DEST_DOWNLOADS -> DownloadPageView(this, initialTab = DownloadPageView.TAB_VIDEO, onClose = null)
         TabletRailNav.DEST_FAVORITES -> TabletFavoritesPageView(this)
         TabletRailNav.DEST_HISTORY -> TabletHistoryPageView(this)
+        TabletRailNav.DEST_MESSAGE -> MessageCenterPageView(this, showBack = false)
         else -> AccountPageView(this).also { pages[PROFILE] = it }
     }
 
@@ -306,6 +301,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         (tabletStage?.getPage(TabletRailNav.DEST_SEARCH) as? TabletSearchPageView)?.destroy()
+        (tabletStage?.getPage(TabletRailNav.DEST_MESSAGE) as? MessageCenterPageView)?.destroy()
         super.onDestroy()
     }
 
@@ -332,6 +328,9 @@ class MainActivity : Activity() {
                         (tabletStage?.getPage(TabletRailNav.DEST_FAVORITES) as? TabletFavoritesPageView)?.onPageActivated()
                     TabletRailNav.DEST_HISTORY ->
                         (tabletStage?.getPage(TabletRailNav.DEST_HISTORY) as? TabletHistoryPageView)?.onPageActivated()
+                    TabletRailNav.DEST_MESSAGE ->
+                        (tabletStage?.getPage(TabletRailNav.DEST_MESSAGE) as? MessageCenterPageView)
+                            ?.setActive(true)
                 }
             }
             return

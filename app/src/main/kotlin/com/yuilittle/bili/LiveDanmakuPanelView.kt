@@ -15,22 +15,24 @@ import android.widget.TextView
 /**
  * 直播弹幕历史面板（手机横屏放播放器右侧，竖屏放播放区下方）。
  *
- * 只保留最近 [limit] 条，超出后从顶部移除；用户停留在底部时自动跟随新弹幕，
- * 手动上滑浏览历史时不会被强制拉回底部。
+ * 不再按条数截断（仅保留 2000 条内存保护）；用户停留在底部时自动跟随新弹幕，
+ * 手动上滑浏览历史时不会被强制拉回底部。横屏时可作为半透明浮层贴在画面右侧。
  */
 internal class LiveDanmakuPanelView(context: Context) : LinearLayout(context) {
 
     private val scrollView: ScrollView
     private val listBox: LinearLayout
     private val emptyHint: TextView
-    private val countText: TextView
     private val titleText: TextView
-    private val settingsButton: TextView
 
-    private var limit = DanmakuSettingsStore.snapshot().historyLimit
-    private var totalReceived = 0
+    /** 仅作为内存保护上限，不再提供「只显示后 N 条」这类数量限制设置。 */
+    private val safetyCap = 2000
+    /** 横屏浮层模式：半透明背景，能透出后面的直播画面。 */
+    private var translucent = false
 
-    var onSettingsClick: (() -> Unit)? = null
+    /** 横屏浮层下由面板自身提供关闭入口（控制条右端会被本面板遮住）。 */
+    var onCloseClick: (() -> Unit)? = null
+    private lateinit var closeButton: TextView
 
     init {
         orientation = VERTICAL
@@ -51,29 +53,22 @@ internal class LiveDanmakuPanelView(context: Context) : LinearLayout(context) {
         }
         header.addView(titleText, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
 
-        countText = TextView(context).apply {
-            textSize = 10.5f
-            typeface = Ds.body()
-            setTextColor(0x80FFFFFF.toInt())
-            includeFontPadding = false
-            setPadding(dp(6), dp(1), 0, 0)
-        }
-        header.addView(countText, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
         header.addView(View(context), LayoutParams(0, 1, 1f))
 
-        settingsButton = TextView(context).apply {
-            text = "设置"
-            textSize = 11f
+        closeButton = TextView(context).apply {
+            text = "×"
+            textSize = 22f
             typeface = Ds.body(true)
             gravity = Gravity.CENTER
-            setTextColor(0xCCFFFFFF.toInt())
-            setPadding(dp(10), dp(4), dp(10), dp(4))
-            background = Ds.pill(context, 0x1FFFFFFF, 0x24FFFFFF)
+            setTextColor(Color.WHITE)
+            includeFontPadding = false
+            setPadding(dp(8), 0, dp(8), dp(4))
             isClickable = true
-            Ds.bindPressFeedback(this, 0.92f)
-            setOnClickListener { onSettingsClick?.invoke() }
+            Ds.bindPressFeedback(this, 0.88f)
+            setOnClickListener { onCloseClick?.invoke() }
+            visibility = View.GONE
         }
-        header.addView(settingsButton, LayoutParams(LayoutParams.WRAP_CONTENT, dp(26)))
+        header.addView(closeButton, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
         addView(header, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         addView(View(context).apply { setBackgroundColor(0x14FFFFFF) },
             LayoutParams(LayoutParams.MATCH_PARENT, Ds.hairline(context)))
@@ -112,24 +107,25 @@ internal class LiveDanmakuPanelView(context: Context) : LinearLayout(context) {
         addView(scrollHost, LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f))
 
         scrollView.setOnScrollChangeListener { _, _, _, _, _ -> updateEmptyState() }
-        updateCount()
+        updateEmptyState()
     }
 
     fun setTitle(title: String) {
         titleText.text = title
     }
 
-    fun setLimit(nextLimit: Int) {
-        limit = nextLimit.coerceAtLeast(1)
-        while (listBox.childCount > limit) listBox.removeViewAt(0)
-        updateCount()
-        updateEmptyState()
+    /** 横屏 1/3 浮层：整块背景半透明，标题分隔线同步弱化。 */
+    fun setTranslucent(enabled: Boolean) {
+        if (translucent == enabled) return
+        translucent = enabled
+        setBackgroundColor(if (enabled) 0x99000000.toInt() else 0xFF0E0F13.toInt())
+        setPadding(if (enabled) dp(4) else 0, 0, if (enabled) dp(4) else 0, 0)
+        // 浮层会盖住底部控制条，必须由面板自己提供关闭按钮。
+        if (::closeButton.isInitialized) closeButton.visibility = if (enabled) View.VISIBLE else View.GONE
     }
 
     fun clear() {
         listBox.removeAllViews()
-        totalReceived = 0
-        updateCount()
         updateEmptyState()
     }
 
@@ -171,9 +167,7 @@ internal class LiveDanmakuPanelView(context: Context) : LinearLayout(context) {
             ellipsize = TextUtils.TruncateAt.END
         }
         listBox.addView(row, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
-        while (listBox.childCount > limit) listBox.removeViewAt(0)
-        totalReceived++
-        updateCount()
+        while (listBox.childCount > safetyCap) listBox.removeViewAt(0)
         updateEmptyState()
         if (atBottom) scrollToBottom()
     }
@@ -186,11 +180,6 @@ internal class LiveDanmakuPanelView(context: Context) : LinearLayout(context) {
         val child = scrollView.getChildAt(0) ?: return true
         val distance = child.bottom - (scrollView.height + scrollView.scrollY)
         return distance <= dp(72)
-    }
-
-    private fun updateCount() {
-        val shown = listBox.childCount
-        countText.text = if (shown > 0) "· $shown 条" else ""
     }
 
     private fun updateEmptyState() {
