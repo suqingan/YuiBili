@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="app/src/main/res/drawable-xxxhdpi/ic_logo.png" width="104" height="104" alt="YuiBili Logo"/>
+  <img src="https://github.com/suqingan/YuiBili/releases/download/v1.0.1beta5/ic_logo.png" width="104" height="104" alt="YuiBili Logo"/>
 </p>
 
 <h1 align="center">YuiBili</h1>
